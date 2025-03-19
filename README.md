@@ -1,6 +1,4 @@
-# Beacon Indexer
-
-![Beacon-Indexer Header](img/header-beacon_indexer.png)
+[Beacon-Indexer Header](img/header-beacon_indexer.png)
 
 A comprehensive scraper for Beacon Chain that extracts and stores data in a ClickHouse database for analysis.
 
