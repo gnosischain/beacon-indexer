@@ -1,4 +1,5 @@
-[Beacon-Indexer Header](img/header-beacon_indexer.png)
+
+![Beacon-Indexer Header](img/header-beacon_indexer.png)
 
 A comprehensive scraper for Beacon Chain that extracts and stores data in a ClickHouse database for analysis.
 
@@ -356,4 +357,4 @@ If you encounter errors with the migration script:
 
 ## License
 
-This project is licensed under the MIT License.
+This project is licensed under the [MIT License](LICENSE).
