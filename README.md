@@ -2,7 +2,7 @@
 
 ![Beacon-Indexer Header](img/header-beacon_indexer.png)
 
-A scraper for Beacon Chain that extracts and stores data in a ClickHouse database for analysis.
+A comprehensive scraper for Beacon Chain that extracts and stores data in a ClickHouse database for analysis.
 
 ## Overview
 
@@ -18,46 +18,86 @@ Key features:
 ## Requirements
 
 - Python 3.8+
-- ClickHouse database server (version 21.3+)
-- Access to an beacon chain node (Lighthouse, Prysm, Teku, Nimbus, or others)
+- ClickHouse database (local or ClickHouse Cloud)
+- Access to a beacon chain node (Lighthouse, Prysm, Teku, Nimbus, or others)
+- Docker and Docker Compose (for containerized deployment)
 
 ## Installation
 
-### 1. Clone the repository
+### Option 1: Local Installation
+
+#### 1. Clone the repository
 
 ```bash
-git clone https://github.com/yourusername/beacon-chain-scraper.git
-cd beacon-chain-scraper
+git clone https://github.com/yourusername/beacon-indexer.git
+cd beacon-indexer
 ```
 
-### 2. Set up a virtual environment
+#### 2. Set up a virtual environment
 
 ```bash
 python -m venv venv
 source venv/bin/activate  # On Windows, use: venv\Scripts\activate
 ```
 
-### 3. Install dependencies
+#### 3. Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 4. Setup ClickHouse
+### Option 2: Docker Installation
 
-If you don't have ClickHouse installed, follow the [official ClickHouse installation guide](https://clickhouse.com/docs/en/getting-started/install).
+#### 1. Clone the repository
 
-Once installed, create the database and schema:
+```bash
+git clone https://github.com/yourusername/beacon-indexer.git
+cd beacon-indexer
+```
+
+#### 2. Configure environment
+
+Create a `.env` file by copying the example:
+
+```bash
+cp .env.example .env
+```
+
+Edit the `.env` file with your configuration (see Configuration section below).
+
+#### 3. Build and start the Docker containers
+
+```bash
+docker-compose build
+```
+
+## Configuration
+
+### Local ClickHouse Setup
+
+If you're using a local ClickHouse instance, you can set it up with:
 
 ```bash
 # Using the provided script
 ./scripts/setup_clickhouse.sh
 
 # Or manually run migrations
-python scripts/run_migrations.py
+./run_migrations.sh
 ```
 
-### 5. Configure environment
+### ClickHouse Cloud Setup
+
+For ClickHouse Cloud, you'll need to:
+
+1. Create a ClickHouse Cloud account and instance
+2. Configure your `.env` file with your ClickHouse Cloud credentials
+3. Run migrations using the provided script:
+
+```bash
+./run_migrations.sh
+```
+
+### Environment Configuration
 
 Create a `.env` file by copying the example:
 
@@ -67,15 +107,15 @@ cp .env.example .env
 
 Edit the `.env` file with your configuration:
 
-```
+```ini
 # Beacon Node configuration
-BEACON_NODE_URL=http://localhost:5052
+BEACON_NODE_URL=http://your-beacon-node:5052
 
 # ClickHouse configuration
-CLICKHOUSE_HOST=localhost
-CLICKHOUSE_PORT=9000
+CLICKHOUSE_HOST=your-instance.cloud.clickhouse.com  # For ClickHouse Cloud
+CLICKHOUSE_PORT=443  # Use 443 for ClickHouse Cloud or 9000 for local
 CLICKHOUSE_USER=default
-CLICKHOUSE_PASSWORD=
+CLICKHOUSE_PASSWORD=your_password
 CLICKHOUSE_DATABASE=beacon_chain
 
 # Scraper configuration
@@ -86,9 +126,28 @@ BATCH_SIZE=100
 MAX_CONCURRENT_REQUESTS=5
 ```
 
-## Usage
+## Running the Indexer
 
-### Running the Scraper
+### Using Docker (Recommended)
+
+First, run migrations to prepare the database:
+
+```bash
+# Run migrations
+docker-compose run --rm migrate
+```
+
+Then start the indexer:
+
+```bash
+# Start in detached mode
+docker-compose up -d beacon-scraper
+
+# View logs
+docker-compose logs -f beacon-scraper
+```
+
+### Using Python Directly
 
 The scraper can be run in two modes:
 
@@ -121,10 +180,14 @@ If you don't specify an end slot, it will use the latest slot on the beacon chai
 ## Project Structure
 
 ```
-beacon-chain-scraper/
+beacon-indexer/
 ├── README.md                   # Project documentation
+├── docker-compose.yml          # Docker Compose configuration
+├── Dockerfile                  # Docker image definition
 ├── requirements.txt            # Python dependencies
-├── pyproject.toml              # Project metadata and tool configurations
+├── pyproject.toml              # Project metadata
+├── run_clickhouse_migrations.py # Database migration script
+├── run_migrations.sh           # Migration helper script
 ├── setup.py                    # Package installation script
 ├── .env.example                # Example environment variables
 ├── migrations/                 # Database migrations
@@ -132,6 +195,8 @@ beacon-chain-scraper/
 │   ├── 001_initial_schema.down.sql
 │   ├── 002_add_indices.up.sql
 │   └── 002_add_indices.down.sql
+├── scripts/                    # Utility scripts
+│   └── docker-entrypoint.sh    # Docker entrypoint
 ├── src/                        # Source code
 │   ├── __init__.py
 │   ├── config.py               # Configuration management
@@ -177,32 +242,120 @@ Database access layer with specialized repositories for each data type:
 - `BeaconBlockRepository`, `AttestationRepository`, `ValidatorRepository`, etc.
 - Provides CRUD operations and specialized queries
 
-## Database Schema
+## Database Migration Details
 
-The schema is designed for efficient querying of beacon chain data:
+The migration system is designed to work with both local ClickHouse instances and ClickHouse Cloud.
 
-- Optimized for time-series analysis
-- Support for chain reorgs
-- Indices for common query patterns
-- Efficient storage using ClickHouse-specific features
+### File Structure for Migrations
 
-Major tables include:
-- `blocks`: Beacon chain blocks
-- `validators`: Validator information
-- `attestations`: Attestation data
-- `execution_payloads`: Execution layer payloads
-- `blob_sidecars`: Blob sidecar data (Deneb+)
-- `rewards`: Block and attestation rewards
-- And many more specialized tables
+```
+beacon-indexer/
+├── docker-compose.yml           # Configuration for Docker services
+├── Dockerfile                   # Instructions to build the Docker image
+├── run_clickhouse_migrations.py # The migration script that can be run directly or via Docker
+├── run_migrations.sh            # Helper script to run migrations in various environments
+└── migrations/                  # Directory containing SQL migration files
+    ├── 001_initial_schema.up.sql
+    └── 002_add_indices.up.sql
+```
 
-## Configuration and Specs Management
+### Running Migrations
 
-The scraper maintains a database of chain specifications retrieved from the beacon node. These specs are used for various calculations including slot timestamps and epoch boundaries.
+You can run migrations in several ways:
 
-### Automatic Specs Updates
+1. **Using Docker Compose**:
+   ```bash
+   docker-compose run --rm migrate
+   ```
 
-The scraper automatically updates specs from the beacon node when starting. It will only insert changed parameters to avoid unnecessary database writes.
+2. **Using the helper script** (which will choose the best method automatically):
+   ```bash
+   ./run_migrations.sh
+   ```
+
+3. **Directly with the Python script** (if running outside Docker):
+   ```bash
+   ./run_clickhouse_migrations.py \
+     host=your-instance.cloud.clickhouse.com \
+     port=443 \
+     user=default \
+     password=your_password \
+     db=beacon_chain \
+     dir=./migrations \
+     direction=up \
+     secure=True \
+     verify=False
+   ```
+
+### Advanced Migration Usage
+
+#### Running Migrations Down
+
+To revert migrations (rarely needed):
+
+```bash
+# Using Docker Compose with custom direction
+docker-compose run --rm -e CH_DIRECTION=down migrate
+
+# Using the Python script directly
+./run_clickhouse_migrations.py \
+  host=your-instance.cloud.clickhouse.com \
+  port=443 \
+  user=default \
+  password=your_password \
+  db=beacon_chain \
+  dir=./migrations \
+  direction=down \
+  secure=True \
+  verify=False
+```
+
+#### Custom Migration Directory
+
+If your migrations are in a different location:
+
+```bash
+# With Docker Compose
+docker-compose run --rm -e CH_MIGRATIONS_DIR=/custom/path migrate
+
+# With Python script
+./run_clickhouse_migrations.py dir=/custom/path
+```
+
+## Troubleshooting
+
+### Checking Migration Status
+
+To check which migrations have been applied:
+
+```sql
+SELECT * FROM beacon_chain.migrations ORDER BY executed_at;
+```
+
+### Connection Issues
+
+If you have trouble connecting to ClickHouse Cloud:
+
+1. Verify your connection details in `.env`
+2. Make sure `secure=True` for ClickHouse Cloud
+3. Check for any firewalls blocking outbound connections on port 443
+4. Try connecting with the ClickHouse client directly:
+   ```bash
+   clickhouse-client --host=your-instance.cloud.clickhouse.com \
+     --port=443 \
+     --user=default \
+     --password=your_password \
+     --secure
+   ```
+
+### Migration Script Errors
+
+If you encounter errors with the migration script:
+
+1. Check the error message for specific SQL issues
+2. Verify that your migrations directory contains valid SQL files
+3. Run with more detailed logging to see specifics of the error
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+This project is licensed under the MIT License.

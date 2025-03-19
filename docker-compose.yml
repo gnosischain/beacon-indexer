@@ -1,0 +1,67 @@
+x-common-env: &common-env
+  # ClickHouse connection settings
+  CLICKHOUSE_HOST: ${CLICKHOUSE_HOST}
+  CLICKHOUSE_PORT: ${CLICKHOUSE_PORT:-443}
+  CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+  CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+  CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-beacon_chain}
+  
+  # Migration settings
+  CH_MIGRATIONS_DIR: /app/migrations
+  CH_SECURE: "True"
+  CH_VERIFY: "False"
+
+services:
+  # Migration service to run separately if needed
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: beacon-migrate
+    volumes:
+      - ./migrations:/app/migrations
+      - ./scripts/run_clickhouse_migrations.py:/app/scripts/run_clickhouse_migrations.py
+    environment:
+      <<: *common-env
+      CH_DIRECTION: up
+    command: >
+      python /app/scripts/run_clickhouse_migrations.py
+      host=${CLICKHOUSE_HOST}
+      port=${CLICKHOUSE_PORT:-443}
+      user=${CLICKHOUSE_USER:-default}
+      password=${CLICKHOUSE_PASSWORD}
+      db=${CLICKHOUSE_DATABASE:-beacon_chain}
+      dir=/app/migrations
+      direction=up
+      secure=True
+      verify=False
+
+  # Main service that will run the beacon chain scraper
+  beacon-scraper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: beacon-scraper
+    environment:
+      <<: *common-env
+      BEACON_NODE_URL: ${BEACON_NODE_URL}
+      SCRAPER_MODE: ${SCRAPER_MODE:-realtime}
+      HISTORICAL_START_SLOT: ${HISTORICAL_START_SLOT:-0}
+      HISTORICAL_END_SLOT: ${HISTORICAL_END_SLOT:-}
+      BATCH_SIZE: ${BATCH_SIZE:-100}
+      MAX_CONCURRENT_REQUESTS: ${MAX_CONCURRENT_REQUESTS:-5}
+    volumes:
+      - ./migrations:/app/migrations
+      - ./scripts/run_clickhouse_migrations.py:/app/scripts/run_clickhouse_migrations.py
+    command: >
+      python -m src.main 
+      --mode ${SCRAPER_MODE:-realtime}
+      ${HISTORICAL_START_SLOT:+--start-slot ${HISTORICAL_START_SLOT}} 
+      ${HISTORICAL_END_SLOT:+--end-slot ${HISTORICAL_END_SLOT}} 
+      ${BATCH_SIZE:+--batch-size ${BATCH_SIZE}}
+    restart: unless-stopped
+    networks:
+      - beacon-network
+
+networks:
+  beacon-network:
