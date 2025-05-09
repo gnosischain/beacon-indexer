@@ -47,10 +47,9 @@ CREATE TABLE IF NOT EXISTS blocks (
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    ),
-    month String MATERIALIZED formatDateTime(slot_timestamp, '%Y-%m', 'UTC')
+    )
 ) ENGINE = ReplacingMergeTree()
-PARTITION BY month
+PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, block_root);
 
 -- Raw blocks table for storing complete block data
@@ -63,10 +62,9 @@ CREATE TABLE IF NOT EXISTS raw_blocks (
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    ),
-    month String MATERIALIZED formatDateTime(slot_timestamp, '%Y-%m', 'UTC')
+    )
 ) ENGINE = ReplacingMergeTree()
-PARTITION BY month
+PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, block_root);
 
 -- Attestations table
@@ -87,10 +85,9 @@ CREATE TABLE IF NOT EXISTS attestations (
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    ),
-    month String MATERIALIZED formatDateTime(slot_timestamp, '%Y-%m', 'UTC')
+    )
 ) ENGINE = ReplacingMergeTree()
-PARTITION BY month
+PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, attestation_index);
 
 -- Committees table
@@ -103,10 +100,9 @@ CREATE TABLE IF NOT EXISTS committees (
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    ),
-    month String MATERIALIZED formatDateTime(slot_timestamp, '%Y-%m', 'UTC')
+    )
 ) ENGINE = ReplacingMergeTree()
-PARTITION BY month
+PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, committee_index);
 
 -- Sync committees table
@@ -117,10 +113,9 @@ CREATE TABLE IF NOT EXISTS sync_committees (
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    ),
-    month String MATERIALIZED formatDateTime(slot_timestamp, '%Y-%m', 'UTC')
+    )
 ) ENGINE = ReplacingMergeTree()
-PARTITION BY month
+PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, epoch);
 
 -- Sync aggregates table (Altair+)
@@ -132,10 +127,9 @@ CREATE TABLE IF NOT EXISTS sync_aggregates (
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    ),
-    month String MATERIALIZED formatDateTime(slot_timestamp, '%Y-%m', 'UTC')
+    )
 ) ENGINE = ReplacingMergeTree()
-PARTITION BY month
+PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, block_root);
 
 -- Validators table
@@ -157,10 +151,9 @@ CREATE TABLE IF NOT EXISTS validators (
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    ),
-    month String MATERIALIZED formatDateTime(slot_timestamp, '%Y-%m', 'UTC')
+    )
 ) ENGINE = ReplacingMergeTree()
-PARTITION BY month
+PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, validator_index);
 
 
@@ -189,10 +182,9 @@ CREATE TABLE IF NOT EXISTS execution_payloads (
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    ),
-    month String MATERIALIZED formatDateTime(slot_timestamp, '%Y-%m', 'UTC')
+    )
 ) ENGINE = ReplacingMergeTree()
-PARTITION BY month
+PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, block_root);
 
 -- Transactions table
@@ -204,10 +196,9 @@ CREATE TABLE IF NOT EXISTS transactions (
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    ),
-    month String MATERIALIZED formatDateTime(slot_timestamp, '%Y-%m', 'UTC')
+    )
 ) ENGINE = ReplacingMergeTree()
-PARTITION BY month
+PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, tx_index);
 
 -- Withdrawals table
@@ -221,10 +212,9 @@ CREATE TABLE IF NOT EXISTS withdrawals (
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    ),
-    month String MATERIALIZED formatDateTime(slot_timestamp, '%Y-%m', 'UTC')
+    )
 ) ENGINE = ReplacingMergeTree()
-PARTITION BY month
+PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, withdrawal_index);
 
 -- BLS to execution changes table (Capella+)
@@ -239,10 +229,9 @@ CREATE TABLE IF NOT EXISTS bls_to_execution_changes (
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    ),
-    month String MATERIALIZED formatDateTime(slot_timestamp, '%Y-%m', 'UTC')
+    )
 ) ENGINE = ReplacingMergeTree()
-PARTITION BY month
+PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, change_index);
 
 -- Deposits table
@@ -257,10 +246,9 @@ CREATE TABLE IF NOT EXISTS deposits (
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    ),
-    month String MATERIALIZED formatDateTime(slot_timestamp, '%Y-%m', 'UTC')
+    )
 ) ENGINE = ReplacingMergeTree()
-PARTITION BY month
+PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, deposit_index);
 
 -- Blob sidecars table
@@ -275,9 +263,8 @@ CREATE TABLE IF NOT EXISTS blob_sidecars (
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
     ),
-    month String MATERIALIZED formatDateTime(slot_timestamp, '%Y-%m', 'UTC')
 ) ENGINE = ReplacingMergeTree()
-PARTITION BY month
+PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, blob_index);
 
 -- KZG commitments table (Deneb+)
@@ -289,10 +276,9 @@ CREATE TABLE IF NOT EXISTS kzg_commitments (
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    ),
-    month String MATERIALIZED formatDateTime(slot_timestamp, '%Y-%m', 'UTC')
+    )
 ) ENGINE = ReplacingMergeTree()
-PARTITION BY month
+PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, commitment_index);
 
 -- Block rewards table
@@ -309,9 +295,8 @@ CREATE TABLE IF NOT EXISTS block_rewards (
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
     ),
-    month String MATERIALIZED formatDateTime(slot_timestamp, '%Y-%m', 'UTC')
 ) ENGINE = ReplacingMergeTree()
-PARTITION BY month
+PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, proposer_index);
 
 -- Attestation rewards table
@@ -326,10 +311,9 @@ CREATE TABLE IF NOT EXISTS attestation_rewards (
     epoch_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         epoch * (SELECT slots_per_epoch FROM time_helpers LIMIT 1) * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    ),
-    month String MATERIALIZED formatDateTime(epoch_timestamp, '%Y-%m')
+    )
 ) ENGINE = ReplacingMergeTree()
-PARTITION BY month
+PARTITION BY toStartOfMonth(epoch_timestamp)
 ORDER BY (epoch, validator_index);
 
 -- Sync committee rewards table
@@ -341,10 +325,9 @@ CREATE TABLE IF NOT EXISTS sync_committee_rewards (
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    ),
-    month String MATERIALIZED formatDateTime(slot_timestamp, '%Y-%m', 'UTC')
+    )
 ) ENGINE = ReplacingMergeTree()
-PARTITION BY month
+PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, validator_index);
 
 -- Voluntary exits table
@@ -357,10 +340,9 @@ CREATE TABLE IF NOT EXISTS voluntary_exits (
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    ),
-    month String MATERIALIZED formatDateTime(slot_timestamp, '%Y-%m', 'UTC')
+    )
 ) ENGINE = ReplacingMergeTree()
-PARTITION BY month
+PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, validator_index);
 
 -- Proposer slashings table
@@ -379,10 +361,9 @@ CREATE TABLE IF NOT EXISTS proposer_slashings (
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    ),
-    month String MATERIALIZED formatDateTime(slot_timestamp, '%Y-%m', 'UTC')
+    )
 ) ENGINE = ReplacingMergeTree()
-PARTITION BY month
+PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, proposer_index);
 
 -- Attester slashings table
@@ -403,10 +384,9 @@ CREATE TABLE IF NOT EXISTS attester_slashings (
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    ),
-    month String MATERIALIZED formatDateTime(slot_timestamp, '%Y-%m', 'UTC')
+    )
 ) ENGINE = ReplacingMergeTree()
-PARTITION BY month
+PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, slashing_index);
 
 -- Scraper state table to track progress

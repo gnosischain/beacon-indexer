@@ -13,7 +13,6 @@ class Deposit(BaseModel):
     amount: int
     signature: str
     slot_timestamp: Optional[datetime] = None
-    month: Optional[str] = None
 
     @classmethod
     def from_api_response(cls, slot: int, block_root: str, deposit_index: int, deposit_data: Dict[str, Any]) -> "Deposit":
@@ -37,4 +36,4 @@ class Deposit(BaseModel):
 
     def to_db_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for database insertion."""
-        return self.dict(exclude={"slot_timestamp", "month"})
+        return self.dict(exclude={"slot_timestamp"})

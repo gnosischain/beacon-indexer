@@ -122,12 +122,14 @@ async def setup_genesis(beacon_api: BeaconAPIService, clickhouse: ClickHouseServ
 
 async def main():
     # Ensure our logger is properly set up
-    debug_logger = setup_logger("beacon_scraper", log_level=10)  # DEBUG level
+    debug_logger = setup_logger("beacon_scraper", log_level=config.scraper.log_level)  # 10: DEBUG 20: INFO level
     debug_logger.debug("Starting beacon chain scraper")
     
     parser = argparse.ArgumentParser(description="Beacon Chain Scraper")
     parser.add_argument("--mode", choices=["historical", "realtime"], default=config.scraper.mode,
                       help="Scraper mode: historical or realtime")
+    parser.add_argument("--scrapers", type=str, default=config.scraper.enabled_scrapers,
+                  help="Comma-separated list of scrapers to enable (block,validator,reward,blob,specs)")
     parser.add_argument("--start-slot", type=int, default=config.scraper.historical_start_slot,
                       help="Starting slot for historical mode")
     parser.add_argument("--end-slot", type=int, default=config.scraper.historical_end_slot,
@@ -137,9 +139,13 @@ async def main():
     parser.add_argument("--bulk-insert", action="store_true", 
                       help="Use bulk insert mode for better performance")
     
+
     args = parser.parse_args()
     debug_logger.debug(f"Parsed arguments: {args}")
     
+    # Parse enabled scrapers
+    enabled_scrapers = [s.strip() for s in args.scrapers.split(',')]
+    debug_logger.info(f"Enabled scrapers: {enabled_scrapers}")
     try:
         # Initialize services
         debug_logger.debug(f"Initializing services with config: {config}")
@@ -167,15 +173,36 @@ async def main():
         specs_manager = SpecsManager(clickhouse)
         debug_logger.debug(f"Refreshed specs cache, found {len(specs_manager.get_all_specs())} parameters")
         
-        # Initialize all scrapers
+        # Initialize only selected scrapers
         debug_logger.debug("Initializing scrapers")
-        scrapers = [
-            BlockScraper(beacon_api, clickhouse),          # Core block data
-            ValidatorScraper(beacon_api, clickhouse),      # Daily validator data
-            RewardScraper(beacon_api, clickhouse),         # Block and sync committee rewards
-            BlobSidecarScraper(beacon_api, clickhouse),    # Blob sidecars for Deneb+
-            SpecsScraper(beacon_api, clickhouse)           # Chain specifications
-        ]
+        scrapers = []
+        
+        if "block" in enabled_scrapers:
+            scrapers.append(BlockScraper(beacon_api, clickhouse))
+            debug_logger.debug("Added BlockScraper")
+            
+        if "validator" in enabled_scrapers:
+            scrapers.append(ValidatorScraper(beacon_api, clickhouse))
+            debug_logger.debug("Added ValidatorScraper")
+            
+        if "reward" in enabled_scrapers:
+            scrapers.append(RewardScraper(beacon_api, clickhouse))
+            debug_logger.debug("Added RewardScraper")
+            
+        if "blob" in enabled_scrapers:
+            scrapers.append(BlobSidecarScraper(beacon_api, clickhouse))
+            debug_logger.debug("Added BlobSidecarScraper")
+        
+        # Always include SpecsScraper if specs is enabled
+        specs_scraper_instance = None
+        if "specs" in enabled_scrapers:
+            specs_scraper_instance = SpecsScraper(beacon_api, clickhouse)
+            scrapers.append(specs_scraper_instance)
+            debug_logger.debug("Added SpecsScraper")
+        
+        if not scrapers:
+            debug_logger.warning("No scrapers enabled. Please enable at least one scraper.")
+            return
         
         # Set specs_manager for all scrapers
         for scraper in scrapers:

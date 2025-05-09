@@ -20,7 +20,6 @@ class BeaconBlock(BaseModel):
     is_canonical: bool = True
     fork_version: str
     slot_timestamp: Optional[datetime] = None
-    month: Optional[str] = None
 
     @classmethod
     def from_api_response(cls, block_data: Dict[str, Any], block_root: str) -> "BeaconBlock":
@@ -75,7 +74,7 @@ class BeaconBlock(BaseModel):
 
     def to_db_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for database insertion."""
-        result = self.dict(exclude={"slot_timestamp", "month"})
+        result = self.dict(exclude={"slot_timestamp"})
         # Convert datetime to timestamp if present
         if self.timestamp:
             result["timestamp"] = self.timestamp

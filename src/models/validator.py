@@ -18,7 +18,6 @@ class Validator(BaseModel):
     status: str
     balance: int
     slot_timestamp: Optional[datetime] = None
-    month: Optional[str] = None
 
     @classmethod
     def from_api_response(cls, slot: int, validator_data: Dict[str, Any]) -> "Validator":
@@ -54,7 +53,7 @@ class Validator(BaseModel):
 
     def to_db_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for database insertion."""
-        result = self.dict(exclude={"slot_timestamp", "month"})
+        result = self.dict(exclude={"slot_timestamp"})
         # Convert bool to int for database
         result["slashed"] = 1 if self.slashed else 0
         return result

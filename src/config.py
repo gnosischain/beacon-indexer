@@ -23,6 +23,8 @@ class ScraperConfig(BaseModel):
     )
     batch_size: int = Field(default=int(os.getenv("BATCH_SIZE", "100")))
     max_concurrent_requests: int = Field(default=int(os.getenv("MAX_CONCURRENT_REQUESTS", "5")))
+    log_level: int = Field(default=int(os.getenv("LOG_LEVEL", "20")))  # Default to INFO level (20)
+    enabled_scrapers: str = Field(default=os.getenv("ENABLED_SCRAPERS", "block,validator,reward,blob,specs"))
 
 class Config(BaseModel):
     beacon_node: BeaconNodeConfig = Field(default_factory=BeaconNodeConfig)

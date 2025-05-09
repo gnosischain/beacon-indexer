@@ -1,4 +1,3 @@
-
 ![Beacon-Indexer Header](img/header-beacon_indexer.png)
 
 A comprehensive scraper for Beacon Chain that extracts and stores data in a ClickHouse database for analysis.
@@ -12,6 +11,7 @@ Key features:
 - Store data in an optimized ClickHouse database schema
 - Support for all consensus layer forks (Phase 0, Altair, Bellatrix, Capella, Deneb, Electra)
 - Realtime and historical processing modes
+- Configurable scrapers - run only what you need
 - Comprehensive data model for all beacon chain components
 
 ## Requirements
@@ -67,7 +67,7 @@ Edit the `.env` file with your configuration (see Configuration section below).
 #### 3. Build and start the Docker containers
 
 ```bash
-docker-compose build
+docker compose build
 ```
 
 ## Configuration
@@ -123,6 +123,8 @@ HISTORICAL_START_SLOT=0
 HISTORICAL_END_SLOT=  # Leave empty to use latest slot
 BATCH_SIZE=100
 MAX_CONCURRENT_REQUESTS=5
+LOG_LEVEL=20  # 10=DEBUG, 20=INFO, 30=WARNING, 40=ERROR, 50=CRITICAL
+ENABLED_SCRAPERS=block,validator,reward,blob,specs  # Comma-separated list of scrapers to enable
 ```
 
 ## Running the Indexer
@@ -133,29 +135,36 @@ First, run migrations to prepare the database:
 
 ```bash
 # Run migrations
-docker-compose run --rm migrate
+docker compose run --rm migrate
 ```
 
-Then start the indexer:
+Then start the indexer in realtime mode:
 
 ```bash
 # Start in detached mode
-docker-compose up -d beacon-scraper
+docker compose up -d beacon-scraper
 
 # View logs
-docker-compose logs -f beacon-scraper
+docker compose logs -f beacon-scraper
+```
+
+Or run in historical mode to backfill data:
+
+```bash
+# Run historical backfill
+docker compose up historical-scraper
 ```
 
 ### Using Python Directly
 
-The scraper can be run in two modes:
+The scraper can be run in two modes with configurable components:
 
 #### Real-time Mode
 
 This mode continuously processes new blocks as they are produced on the chain:
 
 ```bash
-python -m src.main --mode realtime
+python -m src.main --mode realtime --scrapers block,validator,reward,blob,specs
 ```
 
 #### Historical Mode
@@ -163,14 +172,34 @@ python -m src.main --mode realtime
 This mode backfills data from a specified slot range:
 
 ```bash
-python -m src.main --mode historical --start-slot 0 --end-slot 1000000 --batch-size 100
+python -m src.main --mode historical --scrapers block,validator,reward,blob,specs --start-slot 0 --end-slot 1000000 --batch-size 100
 ```
 
 If you don't specify an end slot, it will use the latest slot on the beacon chain.
 
+#### Selective Component Execution
+
+You can choose which scrapers to enable by using the `--scrapers` parameter or the `ENABLED_SCRAPERS` environment variable:
+
+```bash
+# Run only block and validator scrapers in realtime mode
+python -m src.main --mode realtime --scrapers block,validator
+
+# Run only block data backfill in historical mode
+python -m src.main --mode historical --scrapers block --start-slot 1000000 --end-slot 2000000
+```
+
+Available scrapers:
+- `block`: Basic block data and components (attestations, deposits, etc.)
+- `validator`: Validator information (daily snapshots)
+- `reward`: Block rewards and attestation rewards
+- `blob`: Blob sidecars for data availability (Deneb+ only)
+- `specs`: Chain specifications
+
 ### Command Line Arguments
 
 - `--mode`: Scraper mode (historical or realtime)
+- `--scrapers`: Comma-separated list of scrapers to enable (block,validator,reward,blob,specs)
 - `--start-slot`: Starting slot for historical mode
 - `--end-slot`: Ending slot for historical mode
 - `--batch-size`: Number of slots to process in each batch
@@ -241,6 +270,30 @@ Database access layer with specialized repositories for each data type:
 - `BeaconBlockRepository`, `AttestationRepository`, `ValidatorRepository`, etc.
 - Provides CRUD operations and specialized queries
 
+## Running Modes
+
+### Realtime Mode
+
+Realtime mode continuously processes new blocks as they are produced on the beacon chain:
+
+- Polls the beacon node at regular intervals
+- Processes one block at a time as they are created
+- Maintains state to track the last processed slot
+- Runs as a daemon process
+
+This mode is ideal for keeping a database continuously updated with the current state of the chain.
+
+### Historical Mode
+
+Historical mode backfills data by processing past blocks in bulk:
+
+- Processes a defined range of slots from a start to end point
+- Uses larger batch sizes for efficiency
+- May use more concurrent processing to speed up data acquisition
+- Terminates when the specified range is completed
+
+This mode is ideal for initial database population or filling gaps in data.
+
 ## Database Migration Details
 
 The migration system is designed to work with both local ClickHouse instances and ClickHouse Cloud.
@@ -264,7 +317,7 @@ You can run migrations in several ways:
 
 1. **Using Docker Compose**:
    ```bash
-   docker-compose run --rm migrate
+   docker compose run --rm migrate
    ```
 
 2. **Using the helper script** (which will choose the best method automatically):
@@ -294,7 +347,7 @@ To revert migrations (rarely needed):
 
 ```bash
 # Using Docker Compose with custom direction
-docker-compose run --rm -e CH_DIRECTION=down migrate
+docker compose run --rm -e CH_DIRECTION=down migrate
 
 # Using the Python script directly
 ./run_clickhouse_migrations.py \
@@ -315,7 +368,7 @@ If your migrations are in a different location:
 
 ```bash
 # With Docker Compose
-docker-compose run --rm -e CH_MIGRATIONS_DIR=/custom/path migrate
+docker compose run --rm -e CH_MIGRATIONS_DIR=/custom/path migrate
 
 # With Python script
 ./run_clickhouse_migrations.py dir=/custom/path
@@ -346,6 +399,41 @@ If you have trouble connecting to ClickHouse Cloud:
      --password=your_password \
      --secure
    ```
+
+### Docker Issues
+
+If you encounter issues with Docker:
+
+1. Make sure all containers are properly stopped and removed:
+   ```bash
+   docker compose down --rmi all --volumes --remove-orphans
+   ```
+
+2. Rebuild from scratch:
+   ```bash
+   docker compose build --no-cache
+   ```
+
+3. Check if the changes to your code are being properly included in the built images by examining the container:
+   ```bash
+   docker compose run --rm --entrypoint bash beacon-scraper
+   cat /app/src/main.py | grep "scrapers"
+   ```
+
+### Log Level Configuration
+
+You can adjust the verbosity of logging by setting the `LOG_LEVEL` environment variable:
+
+```bash
+# Set to DEBUG level for maximum verbosity
+LOG_LEVEL=10 docker compose up beacon-scraper
+
+# Set to INFO level (default)
+LOG_LEVEL=20 docker compose up beacon-scraper
+
+# Set to WARNING level for minimal logs
+LOG_LEVEL=30 docker compose up beacon-scraper
+```
 
 ### Migration Script Errors
 

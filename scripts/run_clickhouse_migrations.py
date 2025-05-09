@@ -2,7 +2,7 @@
 import os
 import sys
 import logging
-from typing import Optional, Set
+from typing import Dict, List, Tuple
 
 import clickhouse_connect
 from clickhouse_connect.driver.client import Client
@@ -44,7 +44,66 @@ def connect_clickhouse(
         logger.error(f"Error connecting to ClickHouse: {e}")
         raise
 
+def get_applied_migrations(client: Client, database: str) -> Dict[str, Dict[str, int]]:
+    """
+    Retrieves the latest migration state for each migration name and direction.
+    
+    Returns a dictionary where:
+    - Key is the migration name (e.g., "001_initial_schema")
+    - Value is a dict with keys "up" and "down", each containing the highest ID for that direction
+      (or 0 if no migrations of that direction exist)
+    """
+    query = f"""
+    SELECT 
+        name,
+        direction,
+        max(id) as max_id
+    FROM {database}.migrations
+    GROUP BY name, direction
+    """
+    
+    migration_state = {}
+    
+    try:
+        result = client.query(query)
+        for row in result.result_rows:
+            name, direction, max_id = row
+            
+            if name not in migration_state:
+                migration_state[name] = {"up": 0, "down": 0}
+                
+            migration_state[name][direction] = max_id
+            
+        return migration_state
+    except Exception as e:
+        logger.warning(f"Failed to get migration state: {e}")
+        return {}
 
+def get_next_migration_id(client: Client, database: str) -> int:
+    """Get the next available migration ID"""
+    query = f"SELECT max(id) FROM {database}.migrations"
+    
+    try:
+        result = client.query(query)
+        max_id = result.result_rows[0][0]
+        return (max_id or 0) + 1
+    except Exception:
+        return 1
+
+def ensure_migrations_table(client: Client, database: str) -> None:
+    """Create the migrations table if it doesn't exist"""
+    create_table_sql = f"""
+        CREATE TABLE IF NOT EXISTS {database}.migrations (
+            id UInt32,
+            name String,
+            direction String,
+            executed_at DateTime DEFAULT now()
+        )
+        ENGINE = MergeTree()
+        ORDER BY (id, name, direction)
+    """
+    client.command(create_table_sql)
+    
 def run_migrations(client: Client, database: str, migrations_dir: str, direction: str):
     """
     Create the 'migrations' table if not exists, then apply .up.sql or .down.sql files.
@@ -55,28 +114,19 @@ def run_migrations(client: Client, database: str, migrations_dir: str, direction
     """
     # Make sure the migrations tracking table exists
     logger.debug("Ensuring 'migrations' tracking table exists if it doesn't already...")
-    create_table_sql = f"""
-        CREATE TABLE IF NOT EXISTS {database}.migrations (
-            name String,
-            executed_at DateTime DEFAULT now(),
-            success UInt8 DEFAULT 1
-        )
-        ENGINE = MergeTree()
-        ORDER BY (name)
-    """
-    client.command(create_table_sql)
+    ensure_migrations_table(client, database)
 
-    logger.debug("Retrieving already-applied migrations...")
-    existing_migrations = client.query(f"SELECT name FROM {database}.migrations")
-    applied: Set[str] = {row[0] for row in existing_migrations.result_rows}
+    # Get the current state of migrations
+    migration_state = get_applied_migrations(client, database)
+    logger.debug(f"Current migration state: {migration_state}")
 
     # 1) Decide which pattern to look for, and how to order them
     if direction.lower() == "down":
         file_pattern = ".down.sql"
         # Usually we run .down.sql in reverse alphabetical order
-        # so the most recent "up" is undone first
         sort_reverse = True
     else:
+        direction = "up"  # Normalize the direction
         file_pattern = ".up.sql"
         sort_reverse = False
 
@@ -101,12 +151,38 @@ def run_migrations(client: Client, database: str, migrations_dir: str, direction
 
     logger.info(f"Found {len(all_files)} migration file(s) matching '{file_pattern}'.")
 
-    # 3) Apply each new migration in order
+    # 3) Apply each migration based on its state
+    migrations_to_run = []
+    
     for filename in all_files:
-        if filename in applied:
-            logger.info(f"Skipping {filename}, already applied.")
-            continue
-
+        # Get base name without the direction suffix
+        base_name = filename.replace(file_pattern, "")
+        
+        # Check if this migration should be applied
+        if base_name in migration_state:
+            up_id = migration_state[base_name].get("up", 0)
+            down_id = migration_state[base_name].get("down", 0)
+            
+            if direction == "up" and up_id <= down_id:
+                # For "up", we apply if the latest "up" is older than or equal to the latest "down"
+                migrations_to_run.append(filename)
+            elif direction == "down" and down_id < up_id:
+                # For "down", we apply if the latest "down" is older than the latest "up"
+                migrations_to_run.append(filename)
+        else:
+            # Migration not seen before, apply it if going "up"
+            if direction == "up":
+                migrations_to_run.append(filename)
+    
+    if not migrations_to_run:
+        logger.info(f"No migrations to run in direction '{direction}'.")
+        return
+        
+    logger.info(f"Will run {len(migrations_to_run)} migrations: {migrations_to_run}")
+    
+    # Apply migrations
+    for filename in migrations_to_run:
+        base_name = filename.replace(file_pattern, "")
         filepath = os.path.join(migrations_dir, filename)
         logger.info(f"Applying migration: {filename}")
 
@@ -123,8 +199,12 @@ def run_migrations(client: Client, database: str, migrations_dir: str, direction
                     client.command(stmt)
 
             # Record success in the migrations table
-            client.command(f"INSERT INTO {database}.migrations (name) VALUES ('{filename}')")
-            logger.info(f"[DONE] {filename} applied successfully.")
+            next_id = get_next_migration_id(client, database)
+            client.command(
+                f"INSERT INTO {database}.migrations (id, name, direction) VALUES " +
+                f"({next_id}, '{base_name}', '{direction}')"
+            )
+            logger.info(f"[DONE] {filename} applied successfully with ID {next_id}.")
 
         except ClickHouseError as che:
             logger.error(f"Migration {filename} failed with ClickHouse error: {che}")

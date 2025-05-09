@@ -24,7 +24,6 @@ class ExecutionPayload(BaseModel):
     transactions_count: int
     withdrawals_count: int
     slot_timestamp: Optional[datetime] = None
-    month: Optional[str] = None
 
     @classmethod
     def from_api_response(cls, slot: int, block_root: str, payload_data: Dict[str, Any], version: str) -> "ExecutionPayload":
@@ -81,7 +80,7 @@ class ExecutionPayload(BaseModel):
 
     def to_db_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for database insertion."""
-        return self.dict(exclude={"slot_timestamp", "month"})
+        return self.dict(exclude={"slot_timestamp"})
 
 class Transaction(BaseModel):
     """Model representing an execution transaction."""
@@ -91,7 +90,6 @@ class Transaction(BaseModel):
     tx_index: int
     transaction_data: str
     slot_timestamp: Optional[datetime] = None
-    month: Optional[str] = None
 
     @classmethod
     def from_api_response(cls, slot: int, block_root: str, tx_index: int, tx_data: str) -> "Transaction":
@@ -105,7 +103,7 @@ class Transaction(BaseModel):
 
     def to_db_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for database insertion."""
-        return self.dict(exclude={"slot_timestamp", "month"})
+        return self.dict(exclude={"slot_timestamp"})
 
 class Withdrawal(BaseModel):
     """Model representing a withdrawal."""
@@ -117,7 +115,6 @@ class Withdrawal(BaseModel):
     address: str
     amount: int
     slot_timestamp: Optional[datetime] = None
-    month: Optional[str] = None
 
     @classmethod
     def from_api_response(cls, slot: int, block_root: str, withdrawal_data: Dict[str, Any]) -> "Withdrawal":
@@ -138,4 +135,4 @@ class Withdrawal(BaseModel):
 
     def to_db_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for database insertion."""
-        return self.dict(exclude={"slot_timestamp", "month"})
+        return self.dict(exclude={"slot_timestamp"})

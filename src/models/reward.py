@@ -14,7 +14,6 @@ class BlockReward(BaseModel):
     proposer_slashings: int
     attester_slashings: int
     slot_timestamp: Optional[datetime] = None
-    month: Optional[str] = None
 
     @classmethod
     def from_api_response(cls, slot: int, block_root: str, reward_data: Dict[str, Any]) -> "BlockReward":
@@ -39,7 +38,7 @@ class BlockReward(BaseModel):
 
     def to_db_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for database insertion."""
-        return self.dict(exclude={"slot_timestamp", "month"})
+        return self.dict(exclude={"slot_timestamp"})
 
 
 class AttestationReward(BaseModel):
@@ -53,7 +52,6 @@ class AttestationReward(BaseModel):
     inclusion_delay: Optional[int] = None
     inactivity: int
     epoch_timestamp: Optional[datetime] = None
-    month: Optional[str] = None
 
     @classmethod
     def from_api_response(cls, epoch: int, reward_data: Dict[str, Any]) -> "AttestationReward":
@@ -77,7 +75,7 @@ class AttestationReward(BaseModel):
 
     def to_db_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for database insertion."""
-        return self.dict(exclude={"epoch_timestamp", "month"})
+        return self.dict(exclude={"epoch_timestamp"})
 
 
 class SyncCommitteeReward(BaseModel):
@@ -88,7 +86,6 @@ class SyncCommitteeReward(BaseModel):
     validator_index: int
     reward: int
     slot_timestamp: Optional[datetime] = None
-    month: Optional[str] = None
 
     @classmethod
     def from_api_response(cls, slot: int, block_root: str, reward_data: Dict[str, Any]) -> "SyncCommitteeReward":
@@ -105,4 +102,4 @@ class SyncCommitteeReward(BaseModel):
 
     def to_db_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for database insertion."""
-        return self.dict(exclude={"slot_timestamp", "month"})
+        return self.dict(exclude={"slot_timestamp"})

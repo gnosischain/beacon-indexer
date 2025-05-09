@@ -19,7 +19,6 @@ class Attestation(BaseModel):
     signature: str
     validators: List[int] = Field(default_factory=list)
     slot_timestamp: Optional[datetime] = None
-    month: Optional[str] = None
 
     @classmethod
     def from_api_response(cls, slot: int, block_root: str, attestation_data: Dict[str, Any], version: str) -> "Attestation":
@@ -62,5 +61,5 @@ class Attestation(BaseModel):
 
     def to_db_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for database insertion."""
-        result = self.dict(exclude={"slot_timestamp", "month"})
+        result = self.dict(exclude={"slot_timestamp"})
         return result

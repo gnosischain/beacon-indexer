@@ -12,7 +12,6 @@ class BlobSidecar(BaseModel):
     kzg_proof: str
     blob_data: str
     slot_timestamp: Optional[datetime] = None
-    month: Optional[str] = None
 
     @classmethod
     def from_api_response(cls, slot: int, block_root: str, blob_data: Dict[str, Any]) -> "BlobSidecar":
@@ -33,4 +32,4 @@ class BlobSidecar(BaseModel):
 
     def to_db_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for database insertion."""
-        return self.dict(exclude={"slot_timestamp", "month"})
+        return self.dict(exclude={"slot_timestamp"})

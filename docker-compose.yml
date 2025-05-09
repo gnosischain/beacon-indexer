@@ -1,5 +1,21 @@
-x-common-env: &common-env
+# Base environment variables
+x-base-env: &base-env
   # ClickHouse connection settings
+  CLICKHOUSE_HOST: ${CLICKHOUSE_HOST}
+  CLICKHOUSE_PORT: ${CLICKHOUSE_PORT:-443}
+  CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+  CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+  CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-beacon_chain}
+  LOG_LEVEL: ${LOG_LEVEL:-20}
+  
+  # Migration settings
+  CH_MIGRATIONS_DIR: /app/migrations
+  CH_SECURE: "True"
+  CH_VERIFY: "False"
+
+# Complete environment for scrapers (includes base env)
+x-complete-env: &complete-env
+  # ClickHouse settings
   CLICKHOUSE_HOST: ${CLICKHOUSE_HOST}
   CLICKHOUSE_PORT: ${CLICKHOUSE_PORT:-443}
   CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
@@ -10,6 +26,16 @@ x-common-env: &common-env
   CH_MIGRATIONS_DIR: /app/migrations
   CH_SECURE: "True"
   CH_VERIFY: "False"
+  
+  # Beacon chain settings
+  BEACON_NODE_URL: ${BEACON_NODE_URL}
+  SCRAPER_MODE: ${SCRAPER_MODE:-realtime}
+  HISTORICAL_START_SLOT: ${HISTORICAL_START_SLOT:-0}
+  HISTORICAL_END_SLOT: ${HISTORICAL_END_SLOT:-}
+  BATCH_SIZE: ${BATCH_SIZE:-100}
+  MAX_CONCURRENT_REQUESTS: ${MAX_CONCURRENT_REQUESTS:-5}
+  LOG_LEVEL: ${LOG_LEVEL:-20}
+  ENABLED_SCRAPERS: ${ENABLED_SCRAPERS:-block,validator,reward,blob,specs}
 
 services:
   # Migration service to run separately if needed
@@ -18,12 +44,11 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: beacon-migrate
+    environment:
+      <<: *base-env
     volumes:
       - ./migrations:/app/migrations
       - ./scripts/run_clickhouse_migrations.py:/app/scripts/run_clickhouse_migrations.py
-    environment:
-      <<: *common-env
-      CH_DIRECTION: up
     command: >
       python /app/scripts/run_clickhouse_migrations.py
       host=${CLICKHOUSE_HOST}
@@ -33,35 +58,52 @@ services:
       db=${CLICKHOUSE_DATABASE:-beacon_chain}
       dir=/app/migrations
       direction=up
-      secure=True
-      verify=False
+      secure=${CH_SECURE:-True}
+      verify=${CH_VERIFY:-False}
 
-  # Main service that will run the beacon chain scraper
+  # Main service that will run the beacon chain scraper in realtime mode
   beacon-scraper:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: beacon-scraper
     environment:
-      <<: *common-env
-      BEACON_NODE_URL: ${BEACON_NODE_URL}
-      SCRAPER_MODE: ${SCRAPER_MODE:-realtime}
-      HISTORICAL_START_SLOT: ${HISTORICAL_START_SLOT:-0}
-      HISTORICAL_END_SLOT: ${HISTORICAL_END_SLOT:-}
-      BATCH_SIZE: ${BATCH_SIZE:-100}
-      MAX_CONCURRENT_REQUESTS: ${MAX_CONCURRENT_REQUESTS:-5}
+      <<: *complete-env
+      SCRAPER_MODE: realtime
     volumes:
       - ./migrations:/app/migrations
       - ./scripts/run_clickhouse_migrations.py:/app/scripts/run_clickhouse_migrations.py
     command: >
       python -m src.main 
       --mode ${SCRAPER_MODE:-realtime}
-      ${HISTORICAL_START_SLOT:+--start-slot ${HISTORICAL_START_SLOT}} 
-      ${HISTORICAL_END_SLOT:+--end-slot ${HISTORICAL_END_SLOT}} 
-      ${BATCH_SIZE:+--batch-size ${BATCH_SIZE}}
+      --scrapers ${ENABLED_SCRAPERS:-block,validator,reward,blob,specs}
     restart: unless-stopped
     networks:
       - beacon-network
+
+  # Service for historical backfilling (can be started manually when needed)
+  beacon-historical:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: beacon-historical
+    environment:
+      <<: *complete-env
+      SCRAPER_MODE: historical
+    volumes:
+      - ./migrations:/app/migrations
+      - ./scripts/run_clickhouse_migrations.py:/app/scripts/run_clickhouse_migrations.py
+    command: >
+      python -m src.main 
+      --mode ${SCRAPER_MODE:-historical}
+      --scrapers ${ENABLED_SCRAPERS:-block,validator,reward,blob,specs}
+      --start-slot ${HISTORICAL_START_SLOT:-0}
+      ${HISTORICAL_END_SLOT:+--end-slot ${HISTORICAL_END_SLOT}} 
+      --batch-size ${BATCH_SIZE:-1000}
+    networks:
+      - beacon-network
+    profiles:
+      - historical
 
 networks:
   beacon-network:

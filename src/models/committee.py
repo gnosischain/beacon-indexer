@@ -11,7 +11,6 @@ class Committee(BaseModel):
     committee_index: int
     validators: List[int]
     slot_timestamp: Optional[datetime] = None
-    month: Optional[str] = None
 
     @classmethod
     def from_api_response(cls, slot: int, epoch: int, committee_data: Dict[str, Any]) -> "Committee":
@@ -30,7 +29,7 @@ class Committee(BaseModel):
 
     def to_db_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for database insertion."""
-        return self.dict(exclude={"slot_timestamp", "month"})
+        return self.dict(exclude={"slot_timestamp"})
 
 class SyncCommittee(BaseModel):
     """Model representing a sync committee."""
@@ -39,7 +38,6 @@ class SyncCommittee(BaseModel):
     epoch: int
     validators: List[int]
     slot_timestamp: Optional[datetime] = None
-    month: Optional[str] = None
 
     @classmethod
     def from_api_response(cls, slot: int, epoch: int, committee_data: Dict[str, Any]) -> "SyncCommittee":
@@ -54,4 +52,4 @@ class SyncCommittee(BaseModel):
 
     def to_db_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for database insertion."""
-        return self.dict(exclude={"slot_timestamp", "month"})
+        return self.dict(exclude={"slot_timestamp"})

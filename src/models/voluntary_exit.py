@@ -11,7 +11,6 @@ class VoluntaryExit(BaseModel):
     epoch: int
     signature: str
     slot_timestamp: Optional[datetime] = None
-    month: Optional[str] = None
 
     @classmethod
     def from_api_response(cls, slot: int, block_root: str, exit_data: Dict[str, Any]) -> "VoluntaryExit":
@@ -31,7 +30,7 @@ class VoluntaryExit(BaseModel):
 
     def to_db_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for database insertion."""
-        return self.dict(exclude={"slot_timestamp", "month"})
+        return self.dict(exclude={"slot_timestamp"})
 
 
 class ProposerSlashing(BaseModel):
@@ -49,7 +48,6 @@ class ProposerSlashing(BaseModel):
     header_2_root: str
     header_2_signature: str
     slot_timestamp: Optional[datetime] = None
-    month: Optional[str] = None
 
     @classmethod
     def from_api_response(cls, slot: int, block_root: str, slashing_data: Dict[str, Any]) -> "ProposerSlashing":
@@ -87,7 +85,7 @@ class ProposerSlashing(BaseModel):
 
     def to_db_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for database insertion."""
-        return self.dict(exclude={"slot_timestamp", "month"})
+        return self.dict(exclude={"slot_timestamp"})
 
 
 class AttesterSlashing(BaseModel):
@@ -107,7 +105,6 @@ class AttesterSlashing(BaseModel):
     attestation_2_root: str
     attestation_2_sig: str
     slot_timestamp: Optional[datetime] = None
-    month: Optional[str] = None
 
     @classmethod
     def from_api_response(cls, slot: int, block_root: str, slashing_index: int, slashing_data: Dict[str, Any]) -> "AttesterSlashing":
@@ -146,4 +143,4 @@ class AttesterSlashing(BaseModel):
 
     def to_db_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for database insertion."""
-        return self.dict(exclude={"slot_timestamp", "month"})
+        return self.dict(exclude={"slot_timestamp"})
