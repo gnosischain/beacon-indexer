@@ -23,6 +23,7 @@ from src.scrapers.specs_scraper import SpecsScraper
 
 from src.services.historical_service import HistoricalService
 from src.services.realtime_service import RealtimeService
+from src.services.parallel_service import ParallelService
 
 def update_time_helpers(clickhouse: ClickHouseService, genesis_time: int, seconds_per_slot: int, slots_per_epoch: int) -> None:
     """Update the time helpers table with current values."""
@@ -126,8 +127,8 @@ async def main():
     debug_logger.debug("Starting beacon chain scraper")
     
     parser = argparse.ArgumentParser(description="Beacon Chain Scraper")
-    parser.add_argument("--mode", choices=["historical", "realtime"], default=config.scraper.mode,
-                      help="Scraper mode: historical or realtime")
+    parser.add_argument("--mode", choices=["historical", "realtime", "parallel"], default=config.scraper.mode,
+                  help="Scraper mode: historical, realtime, or parallel")
     parser.add_argument("--scrapers", type=str, default=config.scraper.enabled_scrapers,
                   help="Comma-separated list of scrapers to enable (block,validator,reward,blob,specs)")
     parser.add_argument("--start-slot", type=int, default=config.scraper.historical_start_slot,
@@ -138,6 +139,10 @@ async def main():
                       help="Batch size for processing slots")
     parser.add_argument("--bulk-insert", action="store_true", 
                       help="Use bulk insert mode for better performance")
+    parser.add_argument("--workers", type=int, default=4,
+                      help="Number of parallel workers (for parallel mode)")
+    parser.add_argument("--update-specs", action="store_true",
+                      help="Force update specs even if they have been processed before")
     
 
     args = parser.parse_args()
@@ -160,11 +165,24 @@ async def main():
         debug_logger.debug("Setting up genesis information")
         genesis_time = await setup_genesis(beacon_api, clickhouse)
         
-        # Initialize and run specs scraper first to get the chain specs
+        # Initialize specs scraper
         debug_logger.debug("Running specs scraper")
         specs_scraper = SpecsScraper(beacon_api, clickhouse)
-        seconds_per_slot, slots_per_epoch = await specs_scraper.process()
         
+        # If specs are already in database and scraper has run before, skip the API call
+        # unless --update-specs flag is set
+        has_specs = await specs_scraper.has_data()
+        already_ran = await specs_scraper.get_last_processed_slot() > 0
+        
+        if args.update_specs or not has_specs or not already_ran:
+            debug_logger.info("Updating specs from beacon node")
+            seconds_per_slot, slots_per_epoch = await specs_scraper.process()
+        else:
+            debug_logger.info("Using existing specs from database")
+            await specs_scraper._load_current_specs()
+            seconds_per_slot = int(specs_scraper.current_specs.get("SECONDS_PER_SLOT", 12))
+            slots_per_epoch = int(specs_scraper.current_specs.get("SLOTS_PER_EPOCH", 32))
+            
         # Update time helpers
         debug_logger.debug("Updating time helpers")
         update_time_helpers(clickhouse, genesis_time, seconds_per_slot, slots_per_epoch)
@@ -193,12 +211,13 @@ async def main():
             scrapers.append(BlobSidecarScraper(beacon_api, clickhouse))
             debug_logger.debug("Added BlobSidecarScraper")
         
-        # Always include SpecsScraper if specs is enabled
-        specs_scraper_instance = None
-        if "specs" in enabled_scrapers:
+        # Only include SpecsScraper in the regular scrapers list if:
+        # 1. It's explicitly enabled AND
+        # 2. Either the --update-specs flag is set OR the specs haven't been processed yet
+        if "specs" in enabled_scrapers and (args.update_specs or not already_ran):
             specs_scraper_instance = SpecsScraper(beacon_api, clickhouse)
             scrapers.append(specs_scraper_instance)
-            debug_logger.debug("Added SpecsScraper")
+            debug_logger.debug("Added SpecsScraper to regular scrapers")
         
         if not scrapers:
             debug_logger.warning("No scrapers enabled. Please enable at least one scraper.")
@@ -217,10 +236,23 @@ async def main():
                 beacon_api=beacon_api,
                 clickhouse=clickhouse,
                 scrapers=scrapers,
-                specs_manager=specs_manager,  # Pass the specs_manager
+                specs_manager=specs_manager,
                 start_slot=args.start_slot,
                 end_slot=args.end_slot,
                 batch_size=args.batch_size
+            )
+            await service.start()
+        elif args.mode == "parallel":
+            # Use the new parallel service
+            service = ParallelService(
+                beacon_api=beacon_api,
+                clickhouse=clickhouse,
+                scrapers=scrapers,
+                specs_manager=specs_manager,
+                start_slot=args.start_slot,
+                end_slot=args.end_slot,
+                num_workers=args.workers,
+                worker_batch_size=args.batch_size
             )
             await service.start()
         else:  # realtime
@@ -228,7 +260,7 @@ async def main():
                 beacon_api=beacon_api,
                 clickhouse=clickhouse,
                 scrapers=scrapers,
-                poll_interval=specs_manager.get_seconds_per_slot()  # Use dynamic poll interval
+                poll_interval=specs_manager.get_seconds_per_slot()
             )
             await service.start()
     except KeyboardInterrupt:

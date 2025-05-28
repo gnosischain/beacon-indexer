@@ -36,13 +36,12 @@ x-complete-env: &complete-env
   MAX_CONCURRENT_REQUESTS: ${MAX_CONCURRENT_REQUESTS:-5}
   LOG_LEVEL: ${LOG_LEVEL:-20}
   ENABLED_SCRAPERS: ${ENABLED_SCRAPERS:-block,validator,reward,blob,specs}
+  PARALLEL_WORKERS: ${PARALLEL_WORKERS:-4}
 
 services:
   # Migration service to run separately if needed
-  migrate:
-    build:
-      context: .
-      dockerfile: Dockerfile
+  beacon-migrate:
+    image: beacon-indexer:latest
     container_name: beacon-migrate
     environment:
       <<: *base-env
@@ -60,6 +59,21 @@ services:
       direction=up
       secure=${CH_SECURE:-True}
       verify=${CH_VERIFY:-False}
+
+  specs-updater:
+    image: beacon-indexer:latest
+    container_name: beacon-specs-updater
+    environment:
+      <<: *complete-env
+    volumes:
+      - ./migrations:/app/migrations
+      - ./scripts/update_specs.py:/app/scripts/update_specs.py
+    command: >
+      python -m scripts.update_specs
+    networks:
+      - beacon-network
+    profiles:
+      - specs
 
   # Main service that will run the beacon chain scraper in realtime mode
   beacon-scraper:
@@ -83,9 +97,7 @@ services:
 
   # Service for historical backfilling (can be started manually when needed)
   beacon-historical:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: beacon-indexer:latest
     container_name: beacon-historical
     environment:
       <<: *complete-env
@@ -104,6 +116,29 @@ services:
       - beacon-network
     profiles:
       - historical
+
+  beacon-parallel:
+    image: beacon-indexer:latest
+    container_name: beacon-parallel
+    environment:
+      <<: *complete-env
+      SCRAPER_MODE: parallel
+      PARALLEL_WORKERS: ${PARALLEL_WORKERS:-4}  # Ensure this is explicitly set
+    volumes:
+      - ./migrations:/app/migrations
+      - ./scripts/run_clickhouse_migrations.py:/app/scripts/run_clickhouse_migrations.py
+    command: >
+      python -m src.main 
+      --mode parallel
+      --scrapers ${ENABLED_SCRAPERS:-block,validator,reward,blob,specs}
+      --start-slot ${HISTORICAL_START_SLOT:-0}
+      ${HISTORICAL_END_SLOT:+--end-slot ${HISTORICAL_END_SLOT}} 
+      --batch-size ${BATCH_SIZE:-100}
+      --workers ${PARALLEL_WORKERS:-4}
+    networks:
+      - beacon-network
+    profiles:
+      - parallel
 
 networks:
   beacon-network:

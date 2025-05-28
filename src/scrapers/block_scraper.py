@@ -4,15 +4,47 @@ from datetime import datetime, timezone
 from src.scrapers.base_scraper import BaseScraper
 from src.utils.block_utils import extract_block_info, parse_timestamp, ensure_list
 from src.utils.logger import logger
+from src.services.bulk_insertion_service import BulkInsertionService
 
 class BlockScraper(BaseScraper):
     """
     Processes all data directly available within a block response.
     Does not make additional API calls beyond the initial block fetch.
+    Optimized for high throughput with bulk insertions.
     """
     
     def __init__(self, beacon_api, clickhouse):
         super().__init__("block_scraper", beacon_api, clickhouse)
+        # Flag to detect if we're in a parallel worker context
+        self._bulk_inserter = None
+    
+    def get_bulk_inserter(self) -> Optional[BulkInsertionService]:
+        """Get the bulk inserter from the parent worker if available."""
+        if not self._bulk_inserter:
+            # Try to find it in the global context
+            import inspect
+            frame = inspect.currentframe()
+            try:
+                while frame:
+                    if 'self' in frame.f_locals and hasattr(frame.f_locals['self'], 'bulk_inserter'):
+                        self._bulk_inserter = frame.f_locals['self'].bulk_inserter
+                        break
+                    frame = frame.f_back
+            finally:
+                del frame
+        return self._bulk_inserter
+    
+    async def _insert_with_bulk(self, table_name: str, data: Dict[str, Any]) -> bool:
+        """Insert data either using bulk inserter or direct method."""
+        bulk_inserter = self.get_bulk_inserter()
+        if bulk_inserter:
+            bulk_inserter.queue_for_insertion(table_name, data)
+            return True
+        else:
+            # Fall back to direct insertion
+            query = f"INSERT INTO {table_name} VALUES"
+            self.clickhouse.execute(query, data)
+            return True
     
     async def process(self, block_data: Dict) -> None:
         """Process all components available directly in the block data."""
@@ -129,20 +161,7 @@ class BlockScraper(BaseScraper):
                 if timestamp_val > 0:
                     timestamp = datetime.fromtimestamp(timestamp_val, tz=timezone.utc)
         
-        # Insert the block into the database
-        query = """
-        INSERT INTO blocks (
-            slot, block_root, parent_root, state_root, proposer_index,
-            eth1_block_hash, eth1_deposit_root, eth1_deposit_count,
-            graffiti, signature, randao_reveal, timestamp, is_canonical, fork_version
-        ) VALUES (
-            %(slot)s, %(block_root)s, %(parent_root)s, %(state_root)s, %(proposer_index)s,
-            %(eth1_block_hash)s, %(eth1_deposit_root)s, %(eth1_deposit_count)s,
-            %(graffiti)s, %(signature)s, %(randao_reveal)s, %(timestamp)s, %(is_canonical)s, %(fork_version)s
-        )
-        """
-        
-        self.clickhouse.execute(query, {
+        block_data = {
             "slot": slot,
             "block_root": block_root,
             "parent_root": parent_root,
@@ -157,27 +176,52 @@ class BlockScraper(BaseScraper):
             "timestamp": timestamp,
             "is_canonical": 1 if is_canonical else 0,
             "fork_version": version
-        })
+        }
+        
+        # Insert block using bulk inserter if available
+        bulk_inserter = self.get_bulk_inserter()
+        if bulk_inserter:
+            bulk_inserter.queue_for_insertion("blocks", block_data)
+        else:
+            # Fall back to direct insertion
+            query = """
+            INSERT INTO blocks (
+                slot, block_root, parent_root, state_root, proposer_index,
+                eth1_block_hash, eth1_deposit_root, eth1_deposit_count,
+                graffiti, signature, randao_reveal, timestamp, is_canonical, fork_version
+            ) VALUES (
+                %(slot)s, %(block_root)s, %(parent_root)s, %(state_root)s, %(proposer_index)s,
+                %(eth1_block_hash)s, %(eth1_deposit_root)s, %(eth1_deposit_count)s,
+                %(graffiti)s, %(signature)s, %(randao_reveal)s, %(timestamp)s, %(is_canonical)s, %(fork_version)s
+            )
+            """
+            
+            self.clickhouse.execute(query, block_data)
         
         # Also store raw block data for reprocessing if needed
-        raw_query = """
-        INSERT INTO raw_blocks (
-            slot, block_root, version, block_data, is_canonical
-        ) VALUES (
-            %(slot)s, %(block_root)s, %(version)s, %(block_data)s, %(is_canonical)s
-        )
-        """
-        
         import json
         block_json = json.dumps(info["data"])
         
-        self.clickhouse.execute(raw_query, {
+        raw_block_data = {
             "slot": slot,
             "block_root": block_root,
             "version": version,
             "block_data": block_json,
             "is_canonical": 1 if is_canonical else 0
-        })
+        }
+        
+        if bulk_inserter:
+            bulk_inserter.queue_for_insertion("raw_blocks", raw_block_data)
+        else:
+            raw_query = """
+            INSERT INTO raw_blocks (
+                slot, block_root, version, block_data, is_canonical
+            ) VALUES (
+                %(slot)s, %(block_root)s, %(version)s, %(block_data)s, %(is_canonical)s
+            )
+            """
+            
+            self.clickhouse.execute(raw_query, raw_block_data)
         
         logger.info(f"Processed beacon block at slot {slot} with root {block_root}")
     
@@ -229,17 +273,22 @@ class BlockScraper(BaseScraper):
         
         # Insert attestations in batches
         if params:
-            query = """
-            INSERT INTO attestations (
-                slot, block_root, attestation_slot, attestation_index, aggregation_bits,
-                committee_bits, beacon_block_root, source_epoch, source_root, target_epoch,
-                target_root, signature, validators
-            ) VALUES
-            """
-            
-            self.clickhouse.execute_many(query, params)
-            
-            logger.info(f"Processed {len(params)} attestations for block at slot {slot}")
+            bulk_inserter = self.get_bulk_inserter()
+            if bulk_inserter:
+                for param in params:
+                    bulk_inserter.queue_for_insertion("attestations", param)
+                logger.info(f"Queued {len(params)} attestations for block at slot {slot}")
+            else:
+                query = """
+                INSERT INTO attestations (
+                    slot, block_root, attestation_slot, attestation_index, aggregation_bits,
+                    committee_bits, beacon_block_root, source_epoch, source_root, target_epoch,
+                    target_root, signature, validators
+                ) VALUES
+                """
+                
+                self.clickhouse.execute_many(query, params)
+                logger.info(f"Processed {len(params)} attestations for block at slot {slot}")
     
     async def _process_execution_payload(self, info: Dict, execution_payload: Dict) -> None:
         """Process and store execution payload, transactions, and withdrawals."""
@@ -280,22 +329,8 @@ class BlockScraper(BaseScraper):
             withdrawals = execution_payload.get("withdrawals", [])
             withdrawals_count = len(withdrawals)
         
-        # Insert the execution payload
-        query = """
-        INSERT INTO execution_payloads (
-            slot, block_root, parent_hash, fee_recipient, state_root,
-            receipts_root, logs_bloom, prev_randao, block_number, gas_limit,
-            gas_used, timestamp, extra_data, base_fee_per_gas, block_hash,
-            excess_blob_gas, blob_gas_used, transactions_count, withdrawals_count
-        ) VALUES (
-            %(slot)s, %(block_root)s, %(parent_hash)s, %(fee_recipient)s, %(state_root)s,
-            %(receipts_root)s, %(logs_bloom)s, %(prev_randao)s, %(block_number)s, %(gas_limit)s,
-            %(gas_used)s, %(timestamp)s, %(extra_data)s, %(base_fee_per_gas)s, %(block_hash)s,
-            %(excess_blob_gas)s, %(blob_gas_used)s, %(transactions_count)s, %(withdrawals_count)s
-        )
-        """
-        
-        self.clickhouse.execute(query, {
+        # Create execution payload data
+        payload_data = {
             "slot": slot,
             "block_root": block_root,
             "parent_hash": parent_hash,
@@ -315,7 +350,28 @@ class BlockScraper(BaseScraper):
             "blob_gas_used": blob_gas_used,
             "transactions_count": transactions_count,
             "withdrawals_count": withdrawals_count
-        })
+        }
+        
+        # Insert using bulk inserter if available
+        bulk_inserter = self.get_bulk_inserter()
+        if bulk_inserter:
+            bulk_inserter.queue_for_insertion("execution_payloads", payload_data)
+        else:
+            query = """
+            INSERT INTO execution_payloads (
+                slot, block_root, parent_hash, fee_recipient, state_root,
+                receipts_root, logs_bloom, prev_randao, block_number, gas_limit,
+                gas_used, timestamp, extra_data, base_fee_per_gas, block_hash,
+                excess_blob_gas, blob_gas_used, transactions_count, withdrawals_count
+            ) VALUES (
+                %(slot)s, %(block_root)s, %(parent_hash)s, %(fee_recipient)s, %(state_root)s,
+                %(receipts_root)s, %(logs_bloom)s, %(prev_randao)s, %(block_number)s, %(gas_limit)s,
+                %(gas_used)s, %(timestamp)s, %(extra_data)s, %(base_fee_per_gas)s, %(block_hash)s,
+                %(excess_blob_gas)s, %(blob_gas_used)s, %(transactions_count)s, %(withdrawals_count)s
+            )
+            """
+            
+            self.clickhouse.execute(query, payload_data)
         
         logger.info(f"Processed execution payload for block at slot {slot}")
         
@@ -331,19 +387,24 @@ class BlockScraper(BaseScraper):
                 })
             
             if tx_params:
-                tx_query = """
-                INSERT INTO transactions (
-                    slot, block_root, tx_index, transaction_data
-                ) VALUES
-                """
-                
-                # Process in batches for larger transaction sets
-                batch_size = 1000
-                for i in range(0, len(tx_params), batch_size):
-                    batch = tx_params[i:i+batch_size]
-                    self.clickhouse.execute_many(tx_query, batch)
-                
-                logger.info(f"Processed {len(tx_params)} transactions for block at slot {slot}")
+                if bulk_inserter:
+                    for param in tx_params:
+                        bulk_inserter.queue_for_insertion("transactions", param)
+                    logger.info(f"Queued {len(tx_params)} transactions for block at slot {slot}")
+                else:
+                    tx_query = """
+                    INSERT INTO transactions (
+                        slot, block_root, tx_index, transaction_data
+                    ) VALUES
+                    """
+                    
+                    # Process in batches for larger transaction sets
+                    batch_size = 1000
+                    for i in range(0, len(tx_params), batch_size):
+                        batch = tx_params[i:i+batch_size]
+                        self.clickhouse.execute_many(tx_query, batch)
+                    
+                    logger.info(f"Processed {len(tx_params)} transactions for block at slot {slot}")
         
         # Process withdrawals
         if withdrawals:
@@ -359,14 +420,19 @@ class BlockScraper(BaseScraper):
                 })
             
             if wd_params:
-                wd_query = """
-                INSERT INTO withdrawals (
-                    slot, block_root, withdrawal_index, validator_index, address, amount
-                ) VALUES
-                """
-                
-                self.clickhouse.execute_many(wd_query, wd_params)
-                logger.info(f"Processed {len(wd_params)} withdrawals for block at slot {slot}")
+                if bulk_inserter:
+                    for param in wd_params:
+                        bulk_inserter.queue_for_insertion("withdrawals", param)
+                    logger.info(f"Queued {len(wd_params)} withdrawals for block at slot {slot}")
+                else:
+                    wd_query = """
+                    INSERT INTO withdrawals (
+                        slot, block_root, withdrawal_index, validator_index, address, amount
+                    ) VALUES
+                    """
+                    
+                    self.clickhouse.execute_many(wd_query, wd_params)
+                    logger.info(f"Processed {len(wd_params)} withdrawals for block at slot {slot}")
     
     async def _process_deposits(self, info: Dict, deposits: List[Dict]) -> None:
         """Process and store deposits."""
@@ -394,16 +460,21 @@ class BlockScraper(BaseScraper):
             })
         
         if params:
-            query = """
-            INSERT INTO deposits (
-                slot, block_root, deposit_index, pubkey,
-                withdrawal_credentials, amount, signature
-            ) VALUES
-            """
-            
-            self.clickhouse.execute_many(query, params)
-            
-            logger.info(f"Processed {len(params)} deposits for block at slot {slot}")
+            bulk_inserter = self.get_bulk_inserter()
+            if bulk_inserter:
+                for param in params:
+                    bulk_inserter.queue_for_insertion("deposits", param)
+                logger.info(f"Queued {len(params)} deposits for block at slot {slot}")
+            else:
+                query = """
+                INSERT INTO deposits (
+                    slot, block_root, deposit_index, pubkey,
+                    withdrawal_credentials, amount, signature
+                ) VALUES
+                """
+                
+                self.clickhouse.execute_many(query, params)
+                logger.info(f"Processed {len(params)} deposits for block at slot {slot}")
     
     async def _process_voluntary_exits(self, info: Dict, exits: List[Dict]) -> None:
         """Process and store voluntary exits."""
@@ -427,15 +498,20 @@ class BlockScraper(BaseScraper):
             })
         
         if params:
-            query = """
-            INSERT INTO voluntary_exits (
-                slot, block_root, validator_index, epoch, signature
-            ) VALUES
-            """
-            
-            self.clickhouse.execute_many(query, params)
-            
-            logger.info(f"Processed {len(params)} voluntary exits for block at slot {slot}")
+            bulk_inserter = self.get_bulk_inserter()
+            if bulk_inserter:
+                for param in params:
+                    bulk_inserter.queue_for_insertion("voluntary_exits", param)
+                logger.info(f"Queued {len(params)} voluntary exits for block at slot {slot}")
+            else:
+                query = """
+                INSERT INTO voluntary_exits (
+                    slot, block_root, validator_index, epoch, signature
+                ) VALUES
+                """
+                
+                self.clickhouse.execute_many(query, params)
+                logger.info(f"Processed {len(params)} voluntary exits for block at slot {slot}")
     
     async def _process_bls_changes(self, info: Dict, changes: List[Dict]) -> None:
         """Process and store BLS to execution changes."""
@@ -462,16 +538,21 @@ class BlockScraper(BaseScraper):
             })
         
         if params:
-            query = """
-            INSERT INTO bls_to_execution_changes (
-                slot, block_root, change_index, validator_index, 
-                from_bls_pubkey, to_execution_address, signature
-            ) VALUES
-            """
-            
-            self.clickhouse.execute_many(query, params)
-            
-            logger.info(f"Processed {len(params)} BLS to execution changes for block at slot {slot}")
+            bulk_inserter = self.get_bulk_inserter()
+            if bulk_inserter:
+                for param in params:
+                    bulk_inserter.queue_for_insertion("bls_to_execution_changes", param)
+                logger.info(f"Queued {len(params)} BLS to execution changes for block at slot {slot}")
+            else:
+                query = """
+                INSERT INTO bls_to_execution_changes (
+                    slot, block_root, change_index, validator_index, 
+                    from_bls_pubkey, to_execution_address, signature
+                ) VALUES
+                """
+                
+                self.clickhouse.execute_many(query, params)
+                logger.info(f"Processed {len(params)} BLS to execution changes for block at slot {slot}")
     
     async def _process_kzg_commitments(self, info: Dict, commitments: List) -> None:
         """Process and store KZG commitments."""
@@ -489,15 +570,20 @@ class BlockScraper(BaseScraper):
             })
         
         if params:
-            query = """
-            INSERT INTO kzg_commitments (
-                slot, block_root, commitment_index, commitment
-            ) VALUES
-            """
-            
-            self.clickhouse.execute_many(query, params)
-            
-            logger.info(f"Processed {len(params)} KZG commitments for block at slot {slot}")
+            bulk_inserter = self.get_bulk_inserter()
+            if bulk_inserter:
+                for param in params:
+                    bulk_inserter.queue_for_insertion("kzg_commitments", param)
+                logger.info(f"Queued {len(params)} KZG commitments for block at slot {slot}")
+            else:
+                query = """
+                INSERT INTO kzg_commitments (
+                    slot, block_root, commitment_index, commitment
+                ) VALUES
+                """
+                
+                self.clickhouse.execute_many(query, params)
+                logger.info(f"Processed {len(params)} KZG commitments for block at slot {slot}")
 
     async def _process_sync_aggregate(self, info: Dict, sync_aggregate: Dict) -> None:
         """Process and store sync aggregate data."""
@@ -507,22 +593,28 @@ class BlockScraper(BaseScraper):
         sync_committee_bits = sync_aggregate.get("sync_committee_bits", "")
         sync_committee_signature = sync_aggregate.get("sync_committee_signature", "")
         
-        query = """
-        INSERT INTO sync_aggregates (
-            slot, block_root, sync_committee_bits, sync_committee_signature
-        ) VALUES (
-            %(slot)s, %(block_root)s, %(sync_committee_bits)s, %(sync_committee_signature)s
-        )
-        """
-        
-        self.clickhouse.execute(query, {
+        sync_data = {
             "slot": slot,
             "block_root": block_root,
             "sync_committee_bits": sync_committee_bits,
             "sync_committee_signature": sync_committee_signature
-        })
+        }
         
-        logger.info(f"Processed sync aggregate for block at slot {slot}")
+        bulk_inserter = self.get_bulk_inserter()
+        if bulk_inserter:
+            bulk_inserter.queue_for_insertion("sync_aggregates", sync_data)
+            logger.info(f"Queued sync aggregate for block at slot {slot}")
+        else:
+            query = """
+            INSERT INTO sync_aggregates (
+                slot, block_root, sync_committee_bits, sync_committee_signature
+            ) VALUES (
+                %(slot)s, %(block_root)s, %(sync_committee_bits)s, %(sync_committee_signature)s
+            )
+            """
+            
+            self.clickhouse.execute(query, sync_data)
+            logger.info(f"Processed sync aggregate for block at slot {slot}")
     
     async def _process_proposer_slashings(self, info: Dict, slashings: List[Dict]) -> None:
         """Process and store proposer slashings."""
@@ -564,17 +656,22 @@ class BlockScraper(BaseScraper):
             })
         
         if params:
-            query = """
-            INSERT INTO proposer_slashings (
-                slot, block_root, proposer_index, header_1_slot, header_1_proposer,
-                header_1_root, header_1_signature, header_2_slot, header_2_proposer,
-                header_2_root, header_2_signature
-            ) VALUES
-            """
-            
-            self.clickhouse.execute_many(query, params)
-            
-            logger.info(f"Processed {len(params)} proposer slashings for block at slot {slot}")
+            bulk_inserter = self.get_bulk_inserter()
+            if bulk_inserter:
+                for param in params:
+                    bulk_inserter.queue_for_insertion("proposer_slashings", param)
+                logger.info(f"Queued {len(params)} proposer slashings for block at slot {slot}")
+            else:
+                query = """
+                INSERT INTO proposer_slashings (
+                    slot, block_root, proposer_index, header_1_slot, header_1_proposer,
+                    header_1_root, header_1_signature, header_2_slot, header_2_proposer,
+                    header_2_root, header_2_signature
+                ) VALUES
+                """
+                
+                self.clickhouse.execute_many(query, params)
+                logger.info(f"Processed {len(params)} proposer slashings for block at slot {slot}")
     
     async def _process_attester_slashings(self, info: Dict, slashings: List[Dict]) -> None:
         """Process and store attester slashings."""
@@ -617,15 +714,20 @@ class BlockScraper(BaseScraper):
             })
         
         if params:
-            query = """
-            INSERT INTO attester_slashings (
-                slot, block_root, slashing_index, attestation_1_indices,
-                attestation_1_slot, attestation_1_index, attestation_1_root, attestation_1_sig,
-                attestation_2_indices, attestation_2_slot, attestation_2_index,
-                attestation_2_root, attestation_2_sig
-            ) VALUES
-            """
-            
-            self.clickhouse.execute_many(query, params)
-            
-            logger.info(f"Processed {len(params)} attester slashings for block at slot {slot}")
+            bulk_inserter = self.get_bulk_inserter()
+            if bulk_inserter:
+                for param in params:
+                    bulk_inserter.queue_for_insertion("attester_slashings", param)
+                logger.info(f"Queued {len(params)} attester slashings for block at slot {slot}")
+            else:
+                query = """
+                INSERT INTO attester_slashings (
+                    slot, block_root, slashing_index, attestation_1_indices,
+                    attestation_1_slot, attestation_1_index, attestation_1_root, attestation_1_sig,
+                    attestation_2_indices, attestation_2_slot, attestation_2_index,
+                    attestation_2_root, attestation_2_sig
+                ) VALUES
+                """
+                
+                self.clickhouse.execute_many(query, params)
+                logger.info(f"Processed {len(params)} attester slashings for block at slot {slot}")

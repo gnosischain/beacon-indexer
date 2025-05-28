@@ -7,6 +7,7 @@ from src.utils.logger import logger
 from src.services.beacon_api_service import BeaconAPIService
 from src.services.clickhouse_service import ClickHouseService
 from src.scrapers.base_scraper import BaseScraper
+from src.scrapers.validator_scraper import ValidatorScraper
 from src.utils.block_processor import BlockProcessor
 
 class RealtimeService:
@@ -31,6 +32,15 @@ class RealtimeService:
             time_params = self.clickhouse.get_time_parameters()
             self.poll_interval = time_params.get('seconds_per_slot', 5) // 2  # Poll at half slot time
     
+    def should_process_with_validator_scraper(self, slot: int) -> bool:
+        """Check if this slot should be processed by the validator scraper."""
+        validator_scrapers = [s for s in self.scrapers if isinstance(s, ValidatorScraper)]
+        
+        if not validator_scrapers:
+            return False
+            
+        # For realtime, we use the instance method to check if slot should be processed
+        return any(scraper.should_process_slot(slot) for scraper in validator_scrapers)
     
     async def start(self):
         """Start the realtime scraper."""
@@ -44,9 +54,34 @@ class RealtimeService:
         
         logger.info(f"Starting realtime scraper from slot {self.last_processed_slot + 1}")
         
+        # Pre-check one-time scrapers to avoid checking in every block
+        active_scrapers = []
+        for scraper in self.scrapers:
+            if scraper.one_time:
+                should_run = await scraper.should_process()
+                if should_run:
+                    active_scrapers.append(scraper)
+            else:
+                # Regular scrapers always get included
+                active_scrapers.append(scraper)
+        
         try:
             while self.running:
-                await self._check_new_blocks()
+                # For each cycle, check if we need to remove completed one-time scrapers
+                for scraper in list(active_scrapers):  # Create a copy to allow modification
+                    if scraper.one_time:
+                        last_processed = await scraper.get_last_processed_slot()
+                        if last_processed > 0:
+                            # This one-time scraper has completed, remove it
+                            active_scrapers.remove(scraper)
+                            logger.info(f"One-time scraper {scraper.scraper_id} completed and removed from active scrapers")
+                            
+                if not active_scrapers:
+                    logger.warning("No active scrapers remaining. Exiting realtime scraper.")
+                    self.running = False
+                    break
+                
+                await self._check_new_blocks(active_scrapers)
                 await asyncio.sleep(self.poll_interval)
         except asyncio.CancelledError:
             logger.info("Realtime scraper cancelled")
@@ -56,7 +91,7 @@ class RealtimeService:
             self.running = False
             raise
     
-    async def _check_new_blocks(self):
+    async def _check_new_blocks(self, active_scrapers: List[BaseScraper]):
         """Check for new blocks and process them using the block processor."""
         try:
             # Get the latest header
@@ -72,31 +107,44 @@ class RealtimeService:
             
             # Process new slots
             for slot in range(self.last_processed_slot + 1, latest_slot + 1):
-                # Create processor functions for each scraper
+                # Filter scrapers based on slot requirements
+                slot_scrapers = []
+                for scraper in active_scrapers:
+                    # If it's a validator scraper, only include it if this is a target slot
+                    if isinstance(scraper, ValidatorScraper):
+                        if self.should_process_with_validator_scraper(slot):
+                            slot_scrapers.append(scraper)
+                        # else: skip validator scraper for this slot
+                    else:
+                        # Non-validator scrapers process all slots
+                        slot_scrapers.append(scraper)
+                
+                # Create processor functions for active scrapers for this slot
                 processors = []
-                for scraper in self.scrapers:
-                    if scraper.one_time and scraper.clickhouse.get_last_processed_slot(scraper.scraper_id) > 0:
-                        continue
+                for scraper in slot_scrapers:
                     processors.append(scraper.process)
                 
-                # Process the block once
-                success = await block_processor.get_and_process_block(slot, processors)
+                # Process the block once (only if we have processors)
+                success = False
+                if processors:
+                    success = await block_processor.get_and_process_block(slot, processors)
                 
                 # Update the last processed slot even if no block was found (might be a skipped slot)
                 self.last_processed_slot = slot
                 
-                # Update scraper state
-                for scraper in self.scrapers:
-                    self.clickhouse.update_scraper_state(
-                        scraper_id=scraper.scraper_id,
+                # Update scraper state for all active scrapers
+                for scraper in active_scrapers:
+                    await scraper.update_scraper_state(
                         last_processed_slot=slot,
                         mode="realtime"
                     )
                 
                 if success:
                     logger.info(f"Processed block at slot {slot}")
-                else:
+                elif processors:
                     logger.info(f"Skipped slot {slot} (no block found)")
+                else:
+                    logger.debug(f"Skipped slot {slot} (no scrapers needed to process)")
         
         except Exception as e:
             logger.error(f"Error checking for new blocks: {e}")

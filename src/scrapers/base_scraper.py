@@ -52,3 +52,15 @@ class BaseScraper(ABC):
             last_processed_slot=last_processed_slot,
             mode=mode
         )
+        
+    async def should_process(self) -> bool:
+        """
+        Determine if the scraper should process a block.
+        One-time scrapers should only process if they haven't run before.
+        """
+        if not self.one_time:
+            return True
+            
+        # For one-time scrapers, check if we've already run
+        last_slot = await self.get_last_processed_slot()
+        return last_slot == 0  # Only process if we haven't processed anything yet

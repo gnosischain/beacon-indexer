@@ -404,7 +404,7 @@ class ClickHouseService:
                 formatted_values.append(f"({', '.join(row_values)})")
             
             # Break into smaller subsets for each execute to avoid too-large queries
-            batch_size = min(config.scraper.batch_size // 2, 500)
+            batch_size = min(config.scraper.batch_size // 2, 5000)
             
             for i in range(0, len(formatted_values), batch_size):
                 batch_values = formatted_values[i:i+batch_size]
@@ -604,3 +604,15 @@ class ClickHouseService:
                 self._slots_per_epoch = int(row["parameter_value"])
                 
         return time_params
+
+    def get_threadsafe_client(self):
+        """Get a thread-safe client for concurrent operations."""
+        return ClickHouseService(
+            host=self.host,
+            port=self.port,
+            user=self.user,
+            password=self.password,
+            database=self.database,
+            secure=self.secure,
+            verify=self.verify
+        )

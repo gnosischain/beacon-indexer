@@ -7,7 +7,7 @@ from src.utils.logger import logger
 import traceback
 
 class SpecsScraper(BaseScraper):
-    """Scraper for chain specifications."""
+    """Scraper for chain specifications - runs as a one-time process only."""
     
     def __init__(self, beacon_api: BeaconAPIService, clickhouse: ClickHouseService):
         super().__init__("specs_scraper", beacon_api, clickhouse, one_time=True)
@@ -49,6 +49,17 @@ class SpecsScraper(BaseScraper):
             logger.error(f"Error fetching chain specs: {e}")
             logger.debug(traceback.format_exc())
             return {}
+    
+    async def has_data(self) -> bool:
+        """Check if the specs table already has data."""
+        try:
+            query = "SELECT COUNT(*) as count FROM specs"
+            results = self.clickhouse.execute(query)
+            count = results[0]["count"] if results else 0
+            return count > 0
+        except Exception as e:
+            logger.error(f"Error checking specs table: {e}")
+            return False
             
     async def process(self, block_data: Optional[Dict] = None) -> Tuple[int, int]:
         """
@@ -63,7 +74,22 @@ class SpecsScraper(BaseScraper):
         slots_per_epoch = 32
         
         try:
-            # Load current specs from database
+            # Check if we've already processed specs before
+            has_specs = await self.has_data()
+            already_ran = await self.get_last_processed_slot() > 0
+            
+            # If we have specs and we've already run once, just load values from database
+            if has_specs and already_ran:
+                logger.info("Specs already exist and scraper has run before - using stored values")
+                await self._load_current_specs()
+                if "SECONDS_PER_SLOT" in self.current_specs:
+                    seconds_per_slot = int(self.current_specs["SECONDS_PER_SLOT"])
+                if "SLOTS_PER_EPOCH" in self.current_specs:
+                    slots_per_epoch = int(self.current_specs["SLOTS_PER_EPOCH"])
+                
+                return seconds_per_slot, slots_per_epoch
+            
+            # Otherwise, load current specs from database for comparison
             await self._load_current_specs()
             
             # Fetch latest specs from beacon node
@@ -110,8 +136,8 @@ class SpecsScraper(BaseScraper):
             else:
                 logger.info("No spec changes detected")
                 
-            # Update scraper state
-            await self.update_scraper_state(0, "one_time")
+            # Update scraper state to mark as run
+            await self.update_scraper_state(1, "one_time")
             
             return seconds_per_slot, slots_per_epoch
             
