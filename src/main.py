@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import asyncio
-import argparse
 import sys
 import traceback
 from typing import List
@@ -123,34 +122,29 @@ async def setup_genesis(beacon_api: BeaconAPIService, clickhouse: ClickHouseServ
 
 async def main():
     # Ensure our logger is properly set up
-    debug_logger = setup_logger("beacon_scraper", log_level=config.scraper.log_level)  # 10: DEBUG 20: INFO level
-    debug_logger.debug("Starting beacon chain scraper")
+    debug_logger = setup_logger("beacon_scraper", log_level=config.scraper.log_level)
+    debug_logger.info("Starting beacon chain scraper")
     
-    parser = argparse.ArgumentParser(description="Beacon Chain Scraper")
-    parser.add_argument("--mode", choices=["historical", "realtime", "parallel"], default=config.scraper.mode,
-                  help="Scraper mode: historical, realtime, or parallel")
-    parser.add_argument("--scrapers", type=str, default=config.scraper.enabled_scrapers,
-                  help="Comma-separated list of scrapers to enable (block,validator,reward,blob,specs)")
-    parser.add_argument("--start-slot", type=int, default=config.scraper.historical_start_slot,
-                      help="Starting slot for historical mode")
-    parser.add_argument("--end-slot", type=int, default=config.scraper.historical_end_slot,
-                      help="Ending slot for historical mode")
-    parser.add_argument("--batch-size", type=int, default=config.scraper.batch_size,
-                      help="Batch size for processing slots")
-    parser.add_argument("--bulk-insert", action="store_true", 
-                      help="Use bulk insert mode for better performance")
-    parser.add_argument("--workers", type=int, default=4,
-                      help="Number of parallel workers (for parallel mode)")
-    parser.add_argument("--update-specs", action="store_true",
-                      help="Force update specs even if they have been processed before")
+    # Get configuration from environment variables
+    mode = config.scraper.mode
+    enabled_scrapers_str = config.scraper.enabled_scrapers
+    start_slot = config.scraper.historical_start_slot
+    end_slot = config.scraper.historical_end_slot
+    batch_size = config.scraper.batch_size
+    parallel_workers = config.scraper.parallel_workers
     
-
-    args = parser.parse_args()
-    debug_logger.debug(f"Parsed arguments: {args}")
+    debug_logger.info(f"Configuration loaded from environment:")
+    debug_logger.info(f"  Mode: {mode}")
+    debug_logger.info(f"  Enabled scrapers: {enabled_scrapers_str}")
+    debug_logger.info(f"  Start slot: {start_slot}")
+    debug_logger.info(f"  End slot: {end_slot}")
+    debug_logger.info(f"  Batch size: {batch_size}")
+    debug_logger.info(f"  Parallel workers: {parallel_workers}")
     
     # Parse enabled scrapers
-    enabled_scrapers = [s.strip() for s in args.scrapers.split(',')]
-    debug_logger.info(f"Enabled scrapers: {enabled_scrapers}")
+    enabled_scrapers = [s.strip() for s in enabled_scrapers_str.split(',')]
+    debug_logger.info(f"Parsed enabled scrapers: {enabled_scrapers}")
+    
     try:
         # Initialize services
         debug_logger.debug(f"Initializing services with config: {config}")
@@ -170,11 +164,10 @@ async def main():
         specs_scraper = SpecsScraper(beacon_api, clickhouse)
         
         # If specs are already in database and scraper has run before, skip the API call
-        # unless --update-specs flag is set
         has_specs = await specs_scraper.has_data()
         already_ran = await specs_scraper.get_last_processed_slot() > 0
         
-        if args.update_specs or not has_specs or not already_ran:
+        if not has_specs or not already_ran:
             debug_logger.info("Updating specs from beacon node")
             seconds_per_slot, slots_per_epoch = await specs_scraper.process()
         else:
@@ -213,8 +206,8 @@ async def main():
         
         # Only include SpecsScraper in the regular scrapers list if:
         # 1. It's explicitly enabled AND
-        # 2. Either the --update-specs flag is set OR the specs haven't been processed yet
-        if "specs" in enabled_scrapers and (args.update_specs or not already_ran):
+        # 2. The specs haven't been processed yet
+        if "specs" in enabled_scrapers and not already_ran:
             specs_scraper_instance = SpecsScraper(beacon_api, clickhouse)
             scrapers.append(specs_scraper_instance)
             debug_logger.debug("Added SpecsScraper to regular scrapers")
@@ -228,34 +221,34 @@ async def main():
             scraper.set_specs_manager(specs_manager)
         
         debug_logger.debug(f"Using dynamic poll interval of {specs_manager.get_seconds_per_slot()} seconds")
-        debug_logger.debug(f"Starting service in {args.mode} mode")
+        debug_logger.info(f"Starting service in {mode} mode")
         
         # Start the appropriate service based on mode
-        if args.mode == "historical":
+        if mode == "historical":
             service = HistoricalService(
                 beacon_api=beacon_api,
                 clickhouse=clickhouse,
                 scrapers=scrapers,
                 specs_manager=specs_manager,
-                start_slot=args.start_slot,
-                end_slot=args.end_slot,
-                batch_size=args.batch_size
+                start_slot=start_slot,
+                end_slot=end_slot,
+                batch_size=batch_size
             )
             await service.start()
-        elif args.mode == "parallel":
+        elif mode == "parallel":
             # Use the new parallel service
             service = ParallelService(
                 beacon_api=beacon_api,
                 clickhouse=clickhouse,
                 scrapers=scrapers,
                 specs_manager=specs_manager,
-                start_slot=args.start_slot,
-                end_slot=args.end_slot,
-                num_workers=args.workers,
-                worker_batch_size=args.batch_size
+                start_slot=start_slot,
+                end_slot=end_slot,
+                num_workers=parallel_workers,
+                worker_batch_size=batch_size
             )
             await service.start()
-        else:  # realtime
+        else:  # realtime (default)
             service = RealtimeService(
                 beacon_api=beacon_api,
                 clickhouse=clickhouse,

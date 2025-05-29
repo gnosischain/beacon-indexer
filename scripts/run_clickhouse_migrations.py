@@ -2,6 +2,7 @@
 import os
 import sys
 import logging
+import time
 from typing import Dict, List, Tuple
 
 import clickhouse_connect
@@ -103,11 +104,93 @@ def ensure_migrations_table(client: Client, database: str) -> None:
         ORDER BY (id, name, direction)
     """
     client.command(create_table_sql)
+
+def wait_for_mutations(client: Client, database: str, max_wait: int = 300) -> None:
+    """
+    Wait for all pending mutations to complete before proceeding.
+    
+    Args:
+        client: ClickHouse client
+        database: Database name
+        max_wait: Maximum time to wait in seconds
+    """
+    logger.info("Checking for pending mutations...")
+    start_time = time.time()
+    
+    while time.time() - start_time < max_wait:
+        try:
+            # Check for running mutations
+            query = f"""
+            SELECT count() as pending_mutations
+            FROM system.mutations 
+            WHERE database = '{database}' 
+            AND is_done = 0
+            """
+            
+            result = client.query(query)
+            pending_count = result.result_rows[0][0]
+            
+            if pending_count == 0:
+                logger.info("No pending mutations found. Safe to proceed.")
+                return
+            else:
+                logger.info(f"Found {pending_count} pending mutations. Waiting...")
+                time.sleep(5)
+                
+        except Exception as e:
+            logger.warning(f"Error checking mutations: {e}")
+            time.sleep(5)
+    
+    logger.warning(f"Timed out waiting for mutations after {max_wait} seconds")
+
+def execute_statement_with_retry(client: Client, statement: str, max_retries: int = 5, ignore_missing: bool = False) -> None:
+    """
+    Execute a statement with retry logic for mutation conflicts.
+    
+    Args:
+        client: ClickHouse client
+        statement: SQL statement to execute
+        max_retries: Maximum number of retries
+        ignore_missing: If True, ignore errors about missing objects (for down migrations)
+    """
+    for attempt in range(max_retries):
+        try:
+            logger.debug(f"Executing statement (attempt {attempt + 1}): {statement[:100]}...")
+            client.command(statement)
+            return
+        except ClickHouseError as e:
+            error_message = str(e)
+            
+            # Handle mutation conflicts
+            if "CANNOT_ASSIGN_ALTER" in error_message or "mutation queries are not finished" in error_message:
+                if attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 5  # Progressive backoff: 5s, 10s, 15s, etc.
+                    logger.warning(f"Mutation conflict detected. Waiting {wait_time}s before retry {attempt + 2}/{max_retries}")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.error(f"Failed after {max_retries} attempts due to mutation conflicts")
+                    raise
+            
+            # Handle missing objects in down migrations
+            elif ignore_missing and any(phrase in error_message for phrase in [
+                "Cannot find index",
+                "Wrong index name", 
+                "doesn't exist",
+                "BAD_ARGUMENTS"
+            ]):
+                logger.warning(f"Ignoring missing object error (expected in down migration): {error_message}")
+                return
+            
+            else:
+                # For other errors, don't retry
+                raise
     
 def run_migrations(client: Client, database: str, migrations_dir: str, direction: str):
     """
     Create the 'migrations' table if not exists, then apply .up.sql or .down.sql files.
     Each .sql file is split by semicolons and run as individual statements.
+    Now with improved handling for ALTER/DROP operations.
 
     :param direction: "up" to run *.up.sql in ascending order,
                       "down" to run *.down.sql in descending order.
@@ -115,6 +198,9 @@ def run_migrations(client: Client, database: str, migrations_dir: str, direction
     # Make sure the migrations tracking table exists
     logger.debug("Ensuring 'migrations' tracking table exists if it doesn't already...")
     ensure_migrations_table(client, database)
+
+    # Wait for any pending mutations before starting
+    wait_for_mutations(client, database)
 
     # Get the current state of migrations
     migration_state = get_applied_migrations(client, database)
@@ -193,10 +279,47 @@ def run_migrations(client: Client, database: str, migrations_dir: str, direction
         statements = [stmt.strip() for stmt in sql_content.split(";") if stmt.strip()]
 
         try:
-            for stmt in statements:
+            mutation_count = 0
+            total_statements = len(statements)
+            logger.info(f"Processing {total_statements} statements in {filename}")
+            
+            for i, stmt in enumerate(statements):
                 if stmt:
-                    logger.debug(f"Executing statement: {stmt[:100]}...")
-                    client.command(stmt)
+                    # Log progress every 10 statements or for mutations
+                    is_mutation = any(keyword in stmt.upper() for keyword in [
+                        'ALTER TABLE', 'DROP INDEX', 'ADD INDEX', 'DROP COLUMN', 'ADD COLUMN'
+                    ])
+                    
+                    if is_mutation or (i + 1) % 10 == 0:
+                        logger.info(f"Processing statement {i + 1}/{total_statements}: {stmt[:60]}...")
+                    
+                    if is_mutation:
+                        mutation_count += 1
+                        # Only wait for mutations if we haven't checked recently or it's the first mutation
+                        if mutation_count == 1 or mutation_count % 5 == 0:
+                            wait_for_mutations(client, database, max_wait=60)
+                        
+                        # Execute with retry logic, ignoring missing objects for down migrations
+                        execute_statement_with_retry(client, stmt, ignore_missing=(direction == "down"))
+                        
+                        # Add a small delay after mutation operations (reduced from 2s to 0.5s)
+                        if i < len(statements) - 1:  # Not the last statement
+                            time.sleep(0.5)
+                    else:
+                        # Regular statement, execute normally (but still handle missing objects in down migrations)
+                        try:
+                            logger.debug(f"Executing statement: {stmt[:100]}...")
+                            client.command(stmt)
+                        except ClickHouseError as e:
+                            if direction == "down" and any(phrase in str(e) for phrase in [
+                                "Cannot find index",
+                                "Wrong index name", 
+                                "doesn't exist",
+                                "BAD_ARGUMENTS"
+                            ]):
+                                logger.warning(f"Ignoring missing object error in down migration: {str(e)}")
+                            else:
+                                raise
 
             # Record success in the migrations table
             next_id = get_next_migration_id(client, database)
@@ -213,6 +336,9 @@ def run_migrations(client: Client, database: str, migrations_dir: str, direction
         except Exception as e:
             logger.error(f"Migration {filename} failed with unexpected error: {e}")
             raise
+
+        # Add a delay between migrations to prevent overwhelming ClickHouse
+        time.sleep(1)
 
     logger.info(f"All '{direction}' migrations complete.")
 

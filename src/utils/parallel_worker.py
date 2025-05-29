@@ -10,7 +10,7 @@ from src.config import config
 from src.services.beacon_api_service import BeaconAPIService
 from src.services.clickhouse_service import ClickHouseService
 from src.services.bulk_insertion_service import BulkInsertionService
-from src.utils.logger import logger
+from src.utils.logger import logger, setup_logger
 from src.utils.block_processor import BlockProcessor
 from src.scrapers.validator_scraper import ValidatorScraper
 
@@ -51,8 +51,8 @@ class ParallelWorker:
             batch_size=1000
         )
         
-        # Use the standard logger (initialize early)
-        self.logger = logger
+        # Use the standard logger - create a worker-specific logger
+        self.logger = setup_logger(f"worker_{worker_id}", log_level=config.scraper.log_level)
         
         # Pre-calculate validator target slots for efficiency
         self.validator_target_slots = set()
