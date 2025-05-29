@@ -9,6 +9,7 @@ from src.services.clickhouse_service import ClickHouseService
 from src.scrapers.base_scraper import BaseScraper
 from src.scrapers.validator_scraper import ValidatorScraper
 from src.utils.block_processor import BlockProcessor
+from src.utils.specs_manager import SpecsManager
 
 class RealtimeService:
     """Service to scrape realtime data from the beacon chain."""
@@ -18,19 +19,24 @@ class RealtimeService:
         beacon_api: BeaconAPIService,
         clickhouse: ClickHouseService,
         scrapers: List[BaseScraper],
+        specs_manager: SpecsManager,
         poll_interval: Optional[int] = None
     ):
         self.beacon_api = beacon_api
         self.clickhouse = clickhouse
         self.scrapers = scrapers
+        self.specs_manager = specs_manager
         self.running = False
         self.last_processed_slot = 0
         
-        # Initialize poll interval from specs if not provided
+        # Initialize poll interval from specs manager if not provided
         self.poll_interval = poll_interval
         if not self.poll_interval:
-            time_params = self.clickhouse.get_time_parameters()
-            self.poll_interval = time_params.get('seconds_per_slot', 5) // 2  # Poll at half slot time
+            self.poll_interval = self.specs_manager.get_seconds_per_slot() // 2  # Poll at half slot time
+        
+        # Set specs manager for all scrapers
+        for scraper in scrapers:
+            scraper.set_specs_manager(specs_manager)
     
     def should_process_with_validator_scraper(self, slot: int) -> bool:
         """Check if this slot should be processed by the validator scraper."""
@@ -54,16 +60,20 @@ class RealtimeService:
         
         logger.info(f"Starting realtime scraper from slot {self.last_processed_slot + 1}")
         
-        # Pre-check one-time scrapers to avoid checking in every block
+        # Pre-check one-time scrapers to avoid checking in every block (similar to parallel service)
         active_scrapers = []
         for scraper in self.scrapers:
             if scraper.one_time:
                 should_run = await scraper.should_process()
                 if should_run:
                     active_scrapers.append(scraper)
+                    logger.info(f"One-time scraper {scraper.scraper_id} will be processed")
+                else:
+                    logger.info(f"One-time scraper {scraper.scraper_id} determined it should not run")
             else:
                 # Regular scrapers always get included
                 active_scrapers.append(scraper)
+                logger.info(f"Regular scraper {scraper.scraper_id} will be processed")
         
         try:
             while self.running:
@@ -114,7 +124,9 @@ class RealtimeService:
                     if isinstance(scraper, ValidatorScraper):
                         if self.should_process_with_validator_scraper(slot):
                             slot_scrapers.append(scraper)
-                        # else: skip validator scraper for this slot
+                            logger.debug(f"ValidatorScraper {scraper.scraper_id} will process slot {slot}")
+                        else:
+                            logger.debug(f"ValidatorScraper {scraper.scraper_id} skipping slot {slot}")
                     else:
                         # Non-validator scrapers process all slots
                         slot_scrapers.append(scraper)

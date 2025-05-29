@@ -173,8 +173,8 @@ async def main():
         else:
             debug_logger.info("Using existing specs from database")
             await specs_scraper._load_current_specs()
-            seconds_per_slot = int(specs_scraper.current_specs.get("SECONDS_PER_SLOT", 12))
-            slots_per_epoch = int(specs_scraper.current_specs.get("SLOTS_PER_EPOCH", 32))
+            seconds_per_slot = int(specs_scraper.current_specs.get("SECONDS_PER_SLOT", 5))
+            slots_per_epoch = int(specs_scraper.current_specs.get("SLOTS_PER_EPOCH", 16))
             
         # Update time helpers
         debug_logger.debug("Updating time helpers")
@@ -253,6 +253,7 @@ async def main():
                 beacon_api=beacon_api,
                 clickhouse=clickhouse,
                 scrapers=scrapers,
+                specs_manager=specs_manager,
                 poll_interval=specs_manager.get_seconds_per_slot()
             )
             await service.start()
