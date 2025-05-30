@@ -22,12 +22,18 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy project files
+# Copy project files first
 COPY . .
 
-# Create necessary directories
+# Explicitly copy critical directories to ensure they're included
+COPY migrations/ /app/migrations/
+COPY scripts/ /app/scripts/
+
+# Create additional directories
 RUN mkdir -p /app/logs
-#RUN mkdir -p /app/migrations
+
+# Ensure scripts are executable
+RUN chmod +x /app/scripts/*.py 2>/dev/null || true
 
 # Set entrypoint script
 COPY scripts/docker-entrypoint.sh /docker-entrypoint.sh
