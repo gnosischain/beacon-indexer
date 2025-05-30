@@ -27,7 +27,7 @@ COPY . .
 
 # Create necessary directories
 RUN mkdir -p /app/logs
-RUN mkdir -p /app/migrations
+#RUN mkdir -p /app/migrations
 
 # Set entrypoint script
 COPY scripts/docker-entrypoint.sh /docker-entrypoint.sh
