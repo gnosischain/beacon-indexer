@@ -59,7 +59,7 @@ class ClickHouseService:
         database: str = None,
         secure: bool = False,
         verify: bool = False,
-        max_batch_size: int = 500  # Limit batch size for better reliability
+        max_batch_size: int = 10000  # Limit batch size for better reliability
     ):
         """
         Initialize the ClickHouseService with given or default config parameters.
@@ -404,7 +404,7 @@ class ClickHouseService:
                 formatted_values.append(f"({', '.join(row_values)})")
             
             # Break into smaller subsets for each execute to avoid too-large queries
-            batch_size = min(config.scraper.batch_size // 2, 5000)
+            batch_size = config.scraper.batch_size // 2 #min(config.scraper.batch_size // 2, 15000)
             
             for i in range(0, len(formatted_values), batch_size):
                 batch_values = formatted_values[i:i+batch_size]

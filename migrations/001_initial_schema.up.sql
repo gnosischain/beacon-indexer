@@ -3,8 +3,9 @@ CREATE TABLE IF NOT EXISTS genesis (
     genesis_time DateTime64(0, 'UTC'),
     genesis_validators_root String,
     genesis_fork_version String,
-    created_at DateTime64(0, 'UTC') DEFAULT now('UTC')
-) ENGINE = ReplacingMergeTree()
+    created_at DateTime64(0, 'UTC') DEFAULT now('UTC'),
+    insert_version UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9))
+) ENGINE = ReplacingMergeTree(insert_version)
 ORDER BY (genesis_time);
 
 -- Specs table to store chain configuration parameters
@@ -12,8 +13,9 @@ CREATE TABLE IF NOT EXISTS specs (
     parameter_name String,
     parameter_value String,
     updated_at DateTime64(0, 'UTC') DEFAULT now('UTC'),
+    insert_version UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9)),
     PRIMARY KEY (parameter_name, updated_at)
-) ENGINE = ReplacingMergeTree()
+) ENGINE = ReplacingMergeTree(insert_version)
 ORDER BY (parameter_name, updated_at);
 
 -- Instead of functions, we'll use expressions directly in table definitions
@@ -21,8 +23,9 @@ ORDER BY (parameter_name, updated_at);
 CREATE TABLE IF NOT EXISTS time_helpers (
     genesis_time_unix UInt64,
     seconds_per_slot UInt64,
-    slots_per_epoch UInt64
-) ENGINE = ReplacingMergeTree()
+    slots_per_epoch UInt64,
+    insert_version UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9))
+) ENGINE = ReplacingMergeTree(insert_version)
 ORDER BY tuple();
 
 -- Insert initial placeholder values (will be updated after genesis and specs are populated)
@@ -47,8 +50,9 @@ CREATE TABLE IF NOT EXISTS blocks (
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    )
-) ENGINE = ReplacingMergeTree()
+    ),
+    insert_version UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9))
+) ENGINE = ReplacingMergeTree(insert_version)
 PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, block_root);
 
@@ -62,8 +66,9 @@ CREATE TABLE IF NOT EXISTS raw_blocks (
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    )
-) ENGINE = ReplacingMergeTree()
+    ),
+    insert_version UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9))
+) ENGINE = ReplacingMergeTree(insert_version)
 PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, block_root);
 
@@ -85,8 +90,9 @@ CREATE TABLE IF NOT EXISTS attestations (
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    )
-) ENGINE = ReplacingMergeTree()
+    ),
+    insert_version UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9))
+) ENGINE = ReplacingMergeTree(insert_version)
 PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, attestation_index);
 
@@ -100,8 +106,9 @@ CREATE TABLE IF NOT EXISTS committees (
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    )
-) ENGINE = ReplacingMergeTree()
+    ),
+    insert_version UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9))
+) ENGINE = ReplacingMergeTree(insert_version)
 PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, committee_index);
 
@@ -113,8 +120,9 @@ CREATE TABLE IF NOT EXISTS sync_committees (
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    )
-) ENGINE = ReplacingMergeTree()
+    ),
+    insert_version UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9))
+) ENGINE = ReplacingMergeTree(insert_version)
 PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, epoch);
 
@@ -127,8 +135,9 @@ CREATE TABLE IF NOT EXISTS sync_aggregates (
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    )
-) ENGINE = ReplacingMergeTree()
+    ),
+    insert_version UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9))
+) ENGINE = ReplacingMergeTree(insert_version)
 PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, block_root);
 
@@ -151,12 +160,11 @@ CREATE TABLE IF NOT EXISTS validators (
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    )
-) ENGINE = ReplacingMergeTree()
+    ),
+    insert_version UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9))
+) ENGINE = ReplacingMergeTree(insert_version)
 PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, validator_index);
-
-
 
 -- Execution payloads table
 CREATE TABLE IF NOT EXISTS execution_payloads (
@@ -182,8 +190,9 @@ CREATE TABLE IF NOT EXISTS execution_payloads (
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    )
-) ENGINE = ReplacingMergeTree()
+    ),
+    insert_version UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9))
+) ENGINE = ReplacingMergeTree(insert_version)
 PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, block_root);
 
@@ -196,8 +205,9 @@ CREATE TABLE IF NOT EXISTS transactions (
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    )
-) ENGINE = ReplacingMergeTree()
+    ),
+    insert_version UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9))
+) ENGINE = ReplacingMergeTree(insert_version)
 PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, tx_index);
 
@@ -212,8 +222,9 @@ CREATE TABLE IF NOT EXISTS withdrawals (
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    )
-) ENGINE = ReplacingMergeTree()
+    ),
+    insert_version UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9))
+) ENGINE = ReplacingMergeTree(insert_version)
 PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, withdrawal_index);
 
@@ -229,8 +240,9 @@ CREATE TABLE IF NOT EXISTS bls_to_execution_changes (
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    )
-) ENGINE = ReplacingMergeTree()
+    ),
+    insert_version UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9))
+) ENGINE = ReplacingMergeTree(insert_version)
 PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, change_index);
 
@@ -246,8 +258,9 @@ CREATE TABLE IF NOT EXISTS deposits (
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    )
-) ENGINE = ReplacingMergeTree()
+    ),
+    insert_version UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9))
+) ENGINE = ReplacingMergeTree(insert_version)
 PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, deposit_index);
 
@@ -263,7 +276,8 @@ CREATE TABLE IF NOT EXISTS blob_sidecars (
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
     ),
-) ENGINE = ReplacingMergeTree()
+    insert_version UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9))
+) ENGINE = ReplacingMergeTree(insert_version)
 PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, blob_index);
 
@@ -276,8 +290,9 @@ CREATE TABLE IF NOT EXISTS kzg_commitments (
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    )
-) ENGINE = ReplacingMergeTree()
+    ),
+    insert_version UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9))
+) ENGINE = ReplacingMergeTree(insert_version)
 PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, commitment_index);
 
@@ -295,7 +310,8 @@ CREATE TABLE IF NOT EXISTS block_rewards (
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
     ),
-) ENGINE = ReplacingMergeTree()
+    insert_version UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9))
+) ENGINE = ReplacingMergeTree(insert_version)
 PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, proposer_index);
 
@@ -311,8 +327,9 @@ CREATE TABLE IF NOT EXISTS attestation_rewards (
     epoch_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         epoch * (SELECT slots_per_epoch FROM time_helpers LIMIT 1) * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    )
-) ENGINE = ReplacingMergeTree()
+    ),
+    insert_version UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9))
+) ENGINE = ReplacingMergeTree(insert_version)
 PARTITION BY toStartOfMonth(epoch_timestamp)
 ORDER BY (epoch, validator_index);
 
@@ -325,8 +342,9 @@ CREATE TABLE IF NOT EXISTS sync_committee_rewards (
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    )
-) ENGINE = ReplacingMergeTree()
+    ),
+    insert_version UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9))
+) ENGINE = ReplacingMergeTree(insert_version)
 PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, validator_index);
 
@@ -340,8 +358,9 @@ CREATE TABLE IF NOT EXISTS voluntary_exits (
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    )
-) ENGINE = ReplacingMergeTree()
+    ),
+    insert_version UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9))
+) ENGINE = ReplacingMergeTree(insert_version)
 PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, validator_index);
 
@@ -361,8 +380,9 @@ CREATE TABLE IF NOT EXISTS proposer_slashings (
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    )
-) ENGINE = ReplacingMergeTree()
+    ),
+    insert_version UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9))
+) ENGINE = ReplacingMergeTree(insert_version)
 PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, proposer_index);
 
@@ -384,8 +404,9 @@ CREATE TABLE IF NOT EXISTS attester_slashings (
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    )
-) ENGINE = ReplacingMergeTree()
+    ),
+    insert_version UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9))
+) ENGINE = ReplacingMergeTree(insert_version)
 PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, slashing_index);
 
@@ -394,6 +415,7 @@ CREATE TABLE IF NOT EXISTS scraper_state (
     scraper_id String,
     last_processed_slot UInt64,
     mode String,
-    updated_at DateTime64(0, 'UTC') DEFAULT now()
-) ENGINE = ReplacingMergeTree()
+    updated_at DateTime64(0, 'UTC') DEFAULT now(),
+    insert_version UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9))
+) ENGINE = ReplacingMergeTree(insert_version)
 ORDER BY (scraper_id, updated_at);
