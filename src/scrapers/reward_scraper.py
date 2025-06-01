@@ -217,7 +217,7 @@ class RewardScraper(BaseScraper):
                             """
                             
                             # Use smaller batches for attestation rewards
-                            batch_size = 500
+                            batch_size = 10000
                             for i in range(0, len(params), batch_size):
                                 batch = params[i:i+batch_size]
                                 self.clickhouse.execute_many(query, batch)
