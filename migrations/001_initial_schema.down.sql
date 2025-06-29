@@ -45,8 +45,9 @@ DROP TABLE IF EXISTS committees;
 DROP TABLE IF EXISTS attestations;
 
 -- Drop block tables
-DROP TABLE IF EXISTS raw_blocks;
 DROP TABLE IF EXISTS blocks;
+
+DROP TABLE IF EXISTS consolidations;
 
 -- Drop time helpers table
 DROP TABLE IF EXISTS time_helpers;

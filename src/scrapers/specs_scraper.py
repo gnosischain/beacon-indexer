@@ -12,6 +12,7 @@ class SpecsScraper(BaseScraper):
     def __init__(self, beacon_api: BeaconAPIService, clickhouse: ClickHouseService):
         super().__init__("specs_scraper", beacon_api, clickhouse, one_time=True)
         self.current_specs = {}
+        self.register_table("specs")
         
     async def _load_current_specs(self) -> Dict[str, str]:
         """Load current specs from the database."""

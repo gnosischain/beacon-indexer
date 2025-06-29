@@ -586,6 +586,75 @@ ENABLED_SCRAPERS=validator \
 python -m src.main
 ```
 
+## State Management
+
+The beacon indexer now includes comprehensive state management to track indexing progress and enable efficient restarts.
+
+### Key Features
+
+- **Range-based tracking**: Indexes data in configurable ranges (default: 10,000 slots)
+- **Per-table state**: Each scraper tracks progress for each table it writes to
+- **Automatic gap detection**: Continuously monitors for gaps in indexed data
+- **Retry mechanism**: Failed ranges are automatically retried with exponential backoff
+- **Worker coordination**: Multiple workers can process different ranges in parallel
+- **Progress monitoring**: Real-time visibility into indexing progress
+
+### State Tables
+
+- `beacon_indexing_state`: Tracks the state of each range being processed
+- `beacon_sync_position`: Tracks the latest synced position for real-time mode
+- `beacon_indexing_progress`: View showing aggregated progress statistics
+- `beacon_indexing_gaps`: View showing detected gaps in indexed data
+
+### Monitoring Tools
+
+#### Check Progress
+```bash
+python scripts/check_indexing_progress.py
+```
+
+#### Real-time Performance Monitor
+```bash
+python scripts/monitor_performance.py
+```
+
+#### State Management CLI
+```bash
+# Show progress
+python scripts/manage_state.py progress
+
+# Reset failed ranges
+python scripts/manage_state.py reset-failed --scraper block_scraper
+
+# Show gaps
+python scripts/manage_state.py gaps
+
+# Reset stale jobs
+python scripts/manage_state.py reset-stale --timeout 60
+
+# Create ranges manually
+python scripts/manage_state.py create-ranges block_scraper blocks 0 1000000
+```
+
+### Configuration
+
+New environment variables for state management:
+
+- `STATE_RANGE_SIZE`: Size of each indexing range (default: 10000)
+- `MAX_RETRY_ATTEMPTS`: Maximum retry attempts for failed ranges (default: 3)
+- `STALE_JOB_TIMEOUT_MINUTES`: Timeout for marking jobs as stale (default: 30)
+- `GAP_CHECK_INTERVAL_SECONDS`: Interval for gap detection (default: 300)
+- `ENABLE_STATE_CACHING`: Enable caching of completed ranges (default: true)
+
+### Benefits
+
+1. **Efficient Restarts**: No need to re-query already indexed data
+2. **Granular Progress Tracking**: Know exactly what's been indexed for each table
+3. **Automatic Recovery**: Failed ranges are retried automatically
+4. **Parallel Processing**: Multiple workers coordinate through the database
+5. **Gap Prevention**: Continuous monitoring ensures no data is missed
+
+
 ## License
 
 This project is licensed under the [MIT License](LICENSE).

@@ -45,6 +45,9 @@ ALTER TABLE bls_to_execution_changes DROP INDEX IF EXISTS bls_changes_validator_
 ALTER TABLE withdrawals DROP INDEX IF EXISTS withdrawals_address;
 ALTER TABLE withdrawals DROP INDEX IF EXISTS withdrawals_validator_index;
 
+ALTER TABLE consolidations DROP INDEX IF EXISTS consolidations_source_address;
+ALTER TABLE consolidations DROP INDEX IF EXISTS consolidations_target_pubkey;
+
 -- Transactions table indices
 ALTER TABLE transactions DROP INDEX IF EXISTS transactions_tx_index;
 
@@ -79,7 +82,3 @@ ALTER TABLE blocks DROP INDEX IF EXISTS blocks_fork_version;
 ALTER TABLE blocks DROP INDEX IF EXISTS blocks_timestamp;
 ALTER TABLE blocks DROP INDEX IF EXISTS blocks_parent_root;
 ALTER TABLE blocks DROP INDEX IF EXISTS blocks_proposer_index;
-
--- Raw blocks table indices
-ALTER TABLE raw_blocks DROP INDEX IF EXISTS raw_blocks_is_canonical;
-ALTER TABLE raw_blocks DROP INDEX IF EXISTS raw_blocks_version;

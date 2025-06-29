@@ -1,9 +1,5 @@
 -- Add indices to improve query performance
 
--- Raw blocks table indices
-ALTER TABLE raw_blocks ADD INDEX raw_blocks_version (version) TYPE minmax;
-ALTER TABLE raw_blocks ADD INDEX raw_blocks_is_canonical (is_canonical) TYPE minmax;
-
 -- Blocks table indices
 ALTER TABLE blocks ADD INDEX blocks_proposer_index (proposer_index) TYPE minmax;
 ALTER TABLE blocks ADD INDEX blocks_parent_root (parent_root) TYPE minmax;
@@ -25,6 +21,10 @@ ALTER TABLE sync_committees ADD INDEX sync_committees_epoch (epoch) TYPE minmax;
 
 -- Sync aggregates table indices
 ALTER TABLE sync_aggregates ADD INDEX sync_aggregates_bits (sync_committee_bits) TYPE minmax;
+
+
+ALTER TABLE consolidations ADD INDEX consolidations_source_address (source_address) TYPE minmax;
+ALTER TABLE consolidations ADD INDEX consolidations_target_pubkey (target_pubkey) TYPE minmax;
 
 -- Validators table indices
 ALTER TABLE validators ADD INDEX validators_pubkey (pubkey) TYPE minmax;

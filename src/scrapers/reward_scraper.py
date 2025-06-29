@@ -12,6 +12,9 @@ class RewardScraper(BaseScraper):
     def __init__(self, beacon_api: BeaconAPIService, clickhouse: ClickHouseService):
         super().__init__("reward_scraper", beacon_api, clickhouse)
         self._bulk_inserter = None
+        self.register_table("block_rewards")
+        self.register_table("attestation_rewards")
+        self.register_table("sync_committee_rewards")
     
     def get_bulk_inserter(self) -> Optional[BulkInsertionService]:
         """Get the bulk inserter from the parent worker if available."""

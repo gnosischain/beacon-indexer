@@ -12,6 +12,7 @@ class BlobSidecarScraper(BaseScraper):
     def __init__(self, beacon_api: BeaconAPIService, clickhouse: ClickHouseService):
         super().__init__("blob_sidecar_scraper", beacon_api, clickhouse)
         self._bulk_inserter = None
+        self.register_table("blob_sidecars")
     
     def get_bulk_inserter(self) -> Optional[BulkInsertionService]:
         """Get the bulk inserter from the parent worker if available."""

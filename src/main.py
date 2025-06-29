@@ -1,74 +1,41 @@
-#!/usr/bin/env python3
+"""
+Main entry point for the beacon indexer with optimized parallel mode.
+"""
 import asyncio
+import argparse
 import sys
+import os
 import traceback
-from typing import List
+from typing import List, Dict, Any, Type
 from datetime import datetime
 
-from src.config import config
+from src.config import config, DEFAULT_SCRAPER_SETS, get_enabled_scrapers
 from src.utils.logger import logger, setup_logger
 from src.services.beacon_api_service import BeaconAPIService
 from src.services.clickhouse_service import ClickHouseService
-
-# Import specs manager after services
+from src.services.historical_service import HistoricalService
+from src.services.realtime_service import RealtimeService
+from src.services.thread_pool_parallel_service import ThreadPoolParallelService
+from src.services.state_manager import StateManager
+from src.utils.time_utils import update_time_helpers
 from src.utils.specs_manager import SpecsManager
 
-# Import scrapers
+# Import all scrapers
 from src.scrapers.block_scraper import BlockScraper
+from src.scrapers.core_block_scraper import CoreBlockScraper
+from src.scrapers.operational_events_scraper import OperationalEventsScraper
+from src.scrapers.attestation_scraper import AttestationScraper
+from src.scrapers.slashing_scraper import SlashingScraper
+from src.scrapers.transaction_scraper import TransactionScraper
 from src.scrapers.validator_scraper import ValidatorScraper
 from src.scrapers.blob_sidecar_scraper import BlobSidecarScraper
 from src.scrapers.reward_scraper import RewardScraper
 from src.scrapers.specs_scraper import SpecsScraper
 
-from src.services.historical_service import HistoricalService
-from src.services.realtime_service import RealtimeService
-from src.services.parallel_service import ParallelService
+# Import the optimized worker pool
+from src.services.worker_pool_service import WorkerPoolService
 
-def update_time_helpers(clickhouse: ClickHouseService, genesis_time: int, seconds_per_slot: int, slots_per_epoch: int) -> None:
-    """Update the time helpers table with current values."""
-    # First check if we need to clear existing data
-    query = "SELECT COUNT(*) as count FROM time_helpers"
-    result = clickhouse.execute(query)
-    
-    # Convert result to a list if it's a generator
-    if hasattr(result, '__iter__') and not isinstance(result, list):
-        result = list(result)
-    
-    count = result[0].get('count', 0) if result and len(result) > 0 else 0
-    
-    if count > 0:
-        # Update existing data
-        query = """
-        ALTER TABLE time_helpers UPDATE 
-        genesis_time_unix = %(genesis_time)s,
-        seconds_per_slot = %(seconds_per_slot)s,
-        slots_per_epoch = %(slots_per_epoch)s
-        WHERE 1=1
-        """
-        
-        clickhouse.execute(query, {
-            "genesis_time": genesis_time,
-            "seconds_per_slot": seconds_per_slot,
-            "slots_per_epoch": slots_per_epoch
-        })
-    else:
-        # Insert new data
-        query = """
-        INSERT INTO time_helpers (
-            genesis_time_unix, seconds_per_slot, slots_per_epoch
-        ) VALUES (
-            %(genesis_time)s, %(seconds_per_slot)s, %(slots_per_epoch)s
-        )
-        """
-        
-        clickhouse.execute(query, {
-            "genesis_time": genesis_time,
-            "seconds_per_slot": seconds_per_slot,
-            "slots_per_epoch": slots_per_epoch
-        })
-    
-    logger.info("Updated time helpers table with current values")
-    
+
 async def setup_genesis(beacon_api: BeaconAPIService, clickhouse: ClickHouseService):
     """Setup genesis information if not already exists."""
     try:
@@ -96,6 +63,10 @@ async def setup_genesis(beacon_api: BeaconAPIService, clickhouse: ClickHouseServ
         # If not, fetch and store genesis information
         genesis_data = await beacon_api.get_genesis()
         
+        # The genesis endpoint returns data in a 'data' field
+        if isinstance(genesis_data, dict) and 'data' in genesis_data:
+            genesis_data = genesis_data['data']
+        
         # Convert genesis_time from string to timestamp
         genesis_time = int(genesis_data.get("genesis_time", 0))
         
@@ -115,10 +86,35 @@ async def setup_genesis(beacon_api: BeaconAPIService, clickhouse: ClickHouseServ
         
         logger.info(f"Genesis information stored in the database (unix time: {genesis_time})")
         return genesis_time
+        
     except Exception as e:
         logger.error(f"Error setting up genesis information: {e}")
         logger.debug(traceback.format_exc())
         return 0
+
+
+def get_scraper_instance(scraper_name: str, beacon_api: BeaconAPIService, clickhouse: ClickHouseService):
+    """Get an instance of a scraper by name."""
+    scraper_map = {
+        "block": BlockScraper,
+        "core_block": CoreBlockScraper,
+        "operational_events": OperationalEventsScraper,
+        "attestation": AttestationScraper,
+        "slashing": SlashingScraper,
+        "transaction": TransactionScraper,
+        "validator": ValidatorScraper,
+        "blob": BlobSidecarScraper,
+        "reward": RewardScraper,
+        "specs": SpecsScraper
+    }
+    
+    scraper_class = scraper_map.get(scraper_name)
+    if scraper_class:
+        return scraper_class(beacon_api, clickhouse)
+    else:
+        logger.warning(f"Unknown scraper: {scraper_name}")
+        return None
+
 
 async def main():
     # Ensure our logger is properly set up
@@ -141,15 +137,23 @@ async def main():
     debug_logger.info(f"  Batch size: {batch_size}")
     debug_logger.info(f"  Parallel workers: {parallel_workers}")
     
-    # Parse enabled scrapers
+    # Parse enabled scrapers directly from config
     enabled_scrapers = [s.strip() for s in enabled_scrapers_str.split(',')]
-    debug_logger.info(f"Parsed enabled scrapers: {enabled_scrapers}")
+    debug_logger.info(f"Using enabled scrapers: {enabled_scrapers}")
     
     try:
         # Initialize services
         debug_logger.debug(f"Initializing services with config: {config}")
         beacon_api = BeaconAPIService()
-        clickhouse = ClickHouseService()
+        # ClickHouse Cloud requires secure=True for port 443
+        # Check if port is 443 or 8443 for automatic secure connection
+        secure = config.clickhouse.port in [443, 8443]
+        verify = os.getenv("CLICKHOUSE_VERIFY", "false").lower() in ("true", "1", "yes")
+        
+        clickhouse = ClickHouseService(
+            secure=secure,
+            verify=verify
+        )
         
         debug_logger.debug("Starting beacon API service")
         # Start the beacon API
@@ -188,29 +192,20 @@ async def main():
         debug_logger.debug("Initializing scrapers")
         scrapers = []
         
-        if "block" in enabled_scrapers:
-            scrapers.append(BlockScraper(beacon_api, clickhouse))
-            debug_logger.debug("Added BlockScraper")
-            
-        if "validator" in enabled_scrapers:
-            scrapers.append(ValidatorScraper(beacon_api, clickhouse))
-            debug_logger.debug("Added ValidatorScraper")
-            
-        if "reward" in enabled_scrapers:
-            scrapers.append(RewardScraper(beacon_api, clickhouse))
-            debug_logger.debug("Added RewardScraper")
-            
-        if "blob" in enabled_scrapers:
-            scrapers.append(BlobSidecarScraper(beacon_api, clickhouse))
-            debug_logger.debug("Added BlobSidecarScraper")
+        for scraper_name in enabled_scrapers:
+            scraper_instance = get_scraper_instance(scraper_name, beacon_api, clickhouse)
+            if scraper_instance:
+                scrapers.append(scraper_instance)
+                debug_logger.debug(f"Added {scraper_name} scraper")
         
         # Only include SpecsScraper in the regular scrapers list if:
         # 1. It's explicitly enabled AND
         # 2. The specs haven't been processed yet
         if "specs" in enabled_scrapers and not already_ran:
-            specs_scraper_instance = SpecsScraper(beacon_api, clickhouse)
-            scrapers.append(specs_scraper_instance)
-            debug_logger.debug("Added SpecsScraper to regular scrapers")
+            if not any(isinstance(s, SpecsScraper) for s in scrapers):
+                specs_scraper_instance = SpecsScraper(beacon_api, clickhouse)
+                scrapers.append(specs_scraper_instance)
+                debug_logger.debug("Added SpecsScraper to regular scrapers")
         
         if not scrapers:
             debug_logger.warning("No scrapers enabled. Please enable at least one scraper.")
@@ -236,8 +231,8 @@ async def main():
             )
             await service.start()
         elif mode == "parallel":
-            # Use the new parallel service
-            service = ParallelService(
+            # Use ThreadPoolParallelService which actually exists
+            service = ThreadPoolParallelService(
                 beacon_api=beacon_api,
                 clickhouse=clickhouse,
                 scrapers=scrapers,

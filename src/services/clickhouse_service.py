@@ -181,39 +181,31 @@ class ClickHouseService:
             logger.error(traceback.format_exc())
             raise
 
-    def execute_many(self, query: str, params_list: List[Dict]) -> None:
+    def execute_many(self, query: str, params: List[Dict[str, Any]]) -> None:
         """
-        Execute a query multiple times with different parameter sets efficiently.
-        Now with improved batch handling and automatic batch size limitation.
+        Execute a query with multiple parameter sets.
+        
+        Args:
+            query: Query with placeholders or table name
+            params: List of parameter dictionaries
         """
-        if not params_list:
+        if not params:
             return
-            
+        
+        # If query is just a table name, construct the INSERT query
+        if not query.upper().startswith('INSERT') and ' ' not in query:
+            # It's just a table name, construct the INSERT query
+            table_name = query
+            if params:
+                columns = list(params[0].keys())
+                query = f"INSERT INTO {table_name} ({', '.join(columns)}) VALUES"
+        
+        # Use the existing batch insert logic
         try:
-            # For better performance, use batch insertion when possible
-            if query.strip().upper().startswith("INSERT INTO"):
-                # Extract table name from query
-                table_name = query.split("INSERT INTO")[1].split("(")[0].strip()
-                
-                # Break into smaller batches if needed
-                if len(params_list) > self.max_batch_size:
-                    logger.info(f"Breaking large batch of {len(params_list)} into smaller batches of {self.max_batch_size}")
-                    for i in range(0, len(params_list), self.max_batch_size):
-                        batch = params_list[i:i+self.max_batch_size]
-                        # Prepare data for optimized insertion
-                        self._optimize_and_insert(table_name, batch)
-                        
-                        # Small delay between batches
-                        time.sleep(0.2)
-                else:
-                    # Prepare data for optimized insertion
-                    self._optimize_and_insert(table_name, params_list)
-            else:
-                # For non-INSERT queries, fall back to executing them individually
-                for params in params_list:
-                    self.client.command(query, parameters=params)
-        except ClickHouseError as e:
-            logger.error(f"ClickHouse error during batch operation: {e}")
+            # Call the internal batch insert method
+            self._execute_batch_insert(query, params)
+        except Exception as e:
+            logger.error(f"Error in execute_many: {e}")
             raise
 
     def _get_table_schema(self, table_name: str) -> Tuple[List[str], Dict[str, str]]:

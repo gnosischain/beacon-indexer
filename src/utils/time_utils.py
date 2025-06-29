@@ -1,5 +1,6 @@
 from typing import Dict, Tuple, Optional, List, Set
 from datetime import datetime, timezone, timedelta
+from src.utils.logger import logger
 
 def calculate_slot_timestamp(genesis_time: int, slot: int, seconds_per_slot: int) -> datetime:
     """Calculate UTC timestamp for a given slot."""
@@ -81,9 +82,7 @@ def get_relevant_validator_slots_in_range(
         current_day_start_dt = start_slot_dt.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
         end_slot_dt = calculate_slot_timestamp(genesis_time, historical_end_slot, seconds_per_slot)
     except ValueError: # Can happen if slot results in invalid timestamp (e.g. negative before epoch)
-        # logger.error(f"Invalid timestamp calculation for start/end slots in get_relevant_validator_slots_in_range.") # Requires logger
         return []
-
 
     while True:
         current_day_probe_slot_ts = int(current_day_start_dt.timestamp())
@@ -123,9 +122,6 @@ def get_relevant_validator_slots_in_range(
             # *** Key Change: Verify with is_last_slot_of_day before adding ***
             if is_last_slot_of_day(day_end_slot, genesis_time, seconds_per_slot):
                 target_slots.append(day_end_slot)
-            # else:
-                # Optional: log that a candidate was rejected if debugging is needed
-                # print(f"Debug: Slot {day_end_slot} (from day boundaries of {current_day_start_dt.date()}) rejected by is_last_slot_of_day.")
 
         if day_end_slot >= historical_end_slot or current_day_start_dt.date() >= end_slot_dt.date():
             break
@@ -133,3 +129,64 @@ def get_relevant_validator_slots_in_range(
         current_day_start_dt += timedelta(days=1)
 
     return sorted(list(set(target_slots)))
+
+
+def update_time_helpers(clickhouse, genesis_time: int, seconds_per_slot: int, slots_per_epoch: int) -> None:
+    """
+    Update the time_helpers table with the current time parameters.
+    This table is used for materialized column calculations in ClickHouse.
+    Uses TRUNCATE to ensure only one row exists.
+    """
+    try:
+        # First truncate the table to remove all existing rows
+        truncate_query = "TRUNCATE TABLE time_helpers"
+        clickhouse.execute(truncate_query)
+        logger.info("Truncated time_helpers table")
+        
+        # Then insert the new values
+        insert_query = """
+        INSERT INTO time_helpers (genesis_time_unix, seconds_per_slot, slots_per_epoch)
+        VALUES (%(genesis_time)s, %(seconds_per_slot)s, %(slots_per_epoch)s)
+        """
+        
+        clickhouse.execute(insert_query, {
+            "genesis_time": genesis_time,
+            "seconds_per_slot": seconds_per_slot,
+            "slots_per_epoch": slots_per_epoch
+        })
+        
+        logger.info(f"Updated time_helpers: genesis_time={genesis_time}, seconds_per_slot={seconds_per_slot}, slots_per_epoch={slots_per_epoch}")
+    except Exception as e:
+        logger.error(f"Error updating time_helpers: {e}")
+
+async def get_head_slot_time(beacon_api, clickhouse) -> Optional[datetime]:
+    """
+    Get the timestamp of the current head slot.
+    
+    Args:
+        beacon_api: BeaconAPIService instance
+        clickhouse: ClickHouseService instance
+        
+    Returns:
+        datetime of the head slot, or None if unable to determine
+    """
+    try:
+        # Get the latest block header
+        header = await beacon_api.get_block_header("head")
+        slot = int(header["header"]["message"]["slot"])
+        
+        # Get time parameters
+        genesis_time = clickhouse.get_genesis_time()
+        time_params = clickhouse.get_time_parameters()
+        
+        if not genesis_time or not time_params:
+            return None
+            
+        seconds_per_slot = time_params.get('seconds_per_slot', 5)
+        
+        # Calculate timestamp
+        return calculate_slot_timestamp(genesis_time, slot, seconds_per_slot)
+        
+    except Exception as e:
+        logger.error(f"Error getting head slot time: {e}")
+        return None

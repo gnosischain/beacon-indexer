@@ -24,6 +24,7 @@ class ValidatorScraper(BaseScraper):
         self.last_processed_day = None
         self._bulk_inserter = None
         self._processed_slots = set()  # Track which slots we've already processed
+        self.register_table("validators")
         
     def get_bulk_inserter(self) -> Optional[BulkInsertionService]:
         """Get the bulk inserter from the parent worker if available."""
@@ -288,3 +289,8 @@ class ValidatorScraper(BaseScraper):
             import traceback
             logger.error(traceback.format_exc())
             return []
+        
+    def range_has_target_slots(self, start_slot: int, end_slot: int) -> bool:
+        """Check if a range contains any validator target slots."""
+        target_slots = self.get_target_slots_in_range(start_slot, end_slot, self.clickhouse)
+        return len(target_slots) > 0

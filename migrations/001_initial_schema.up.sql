@@ -26,10 +26,8 @@ CREATE TABLE IF NOT EXISTS time_helpers (
     slots_per_epoch UInt64,
     insert_version UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9))
 ) ENGINE = ReplacingMergeTree(insert_version)
-ORDER BY tuple();
-
--- Insert initial placeholder values (will be updated after genesis and specs are populated)
-INSERT INTO time_helpers (genesis_time_unix, seconds_per_slot, slots_per_epoch) VALUES (0, 12, 32);
+ORDER BY tuple()
+SETTINGS index_granularity = 1;
 
 -- Beacon blocks table
 CREATE TABLE IF NOT EXISTS blocks (
@@ -47,22 +45,6 @@ CREATE TABLE IF NOT EXISTS blocks (
     timestamp DateTime64(0, 'UTC'),
     is_canonical UInt8,
     fork_version String,
-    slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
-        (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
-        slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
-    ),
-    insert_version UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9))
-) ENGINE = ReplacingMergeTree(insert_version)
-PARTITION BY toStartOfMonth(slot_timestamp)
-ORDER BY (slot, block_root);
-
--- Raw blocks table for storing complete block data
-CREATE TABLE IF NOT EXISTS raw_blocks (
-    slot UInt64,
-    block_root String,
-    version String,
-    block_data String, -- JSON representation of the full block data
-    is_canonical UInt8 DEFAULT 1,
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
@@ -132,6 +114,7 @@ CREATE TABLE IF NOT EXISTS sync_aggregates (
     block_root String,
     sync_committee_bits String,
     sync_committee_signature String,
+    participating_validators UInt32 DEFAULT 0,
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
@@ -140,6 +123,21 @@ CREATE TABLE IF NOT EXISTS sync_aggregates (
 ) ENGINE = ReplacingMergeTree(insert_version)
 PARTITION BY toStartOfMonth(slot_timestamp)
 ORDER BY (slot, block_root);
+
+CREATE TABLE IF NOT EXISTS consolidations (
+    slot UInt64,
+    block_root String,
+    source_address String,
+    source_pubkey String,
+    target_pubkey String,
+    slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
+        (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
+        slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
+    ),
+    insert_version UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9))
+) ENGINE = ReplacingMergeTree(insert_version)
+PARTITION BY toStartOfMonth(slot_timestamp)
+ORDER BY (slot, source_pubkey);
 
 -- Validators table
 CREATE TABLE IF NOT EXISTS validators (
@@ -200,8 +198,10 @@ ORDER BY (slot, block_root);
 CREATE TABLE IF NOT EXISTS transactions (
     slot UInt64,
     block_root String,
+    block_hash String DEFAULT '',
     tx_index UInt64,
-    transaction_data String,
+    raw_tx String DEFAULT '',
+    transaction_data String DEFAULT '',
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
@@ -286,7 +286,8 @@ CREATE TABLE IF NOT EXISTS kzg_commitments (
     slot UInt64,
     block_root String,
     commitment_index UInt64,
-    commitment String,
+    kzg_commitment String DEFAULT '',
+    commitment String DEFAULT '',
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
@@ -371,11 +372,17 @@ CREATE TABLE IF NOT EXISTS proposer_slashings (
     proposer_index UInt64,
     header_1_slot UInt64,
     header_1_proposer UInt64,
-    header_1_root String,
+    header_1_parent_root String DEFAULT '',
+    header_1_state_root String DEFAULT '',
+    header_1_body_root String DEFAULT '',
+    header_1_root String DEFAULT '',
     header_1_signature String,
     header_2_slot UInt64,
     header_2_proposer UInt64,
-    header_2_root String,
+    header_2_parent_root String DEFAULT '',
+    header_2_state_root String DEFAULT '',
+    header_2_body_root String DEFAULT '',
+    header_2_root String DEFAULT '',
     header_2_signature String,
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
@@ -394,13 +401,25 @@ CREATE TABLE IF NOT EXISTS attester_slashings (
     attestation_1_indices Array(UInt64),
     attestation_1_slot UInt64,
     attestation_1_index UInt64,
-    attestation_1_root String,
-    attestation_1_sig String,
+    attestation_1_beacon_block_root String DEFAULT '',
+    attestation_1_source_epoch UInt64 DEFAULT 0,
+    attestation_1_source_root String DEFAULT '',
+    attestation_1_target_epoch UInt64 DEFAULT 0,
+    attestation_1_target_root String DEFAULT '',
+    attestation_1_root String DEFAULT '',
+    attestation_1_sig String DEFAULT '',
+    attestation_1_signature String DEFAULT '',
     attestation_2_indices Array(UInt64),
     attestation_2_slot UInt64,
     attestation_2_index UInt64,
-    attestation_2_root String,
-    attestation_2_sig String,
+    attestation_2_beacon_block_root String DEFAULT '',
+    attestation_2_source_epoch UInt64 DEFAULT 0,
+    attestation_2_source_root String DEFAULT '',
+    attestation_2_target_epoch UInt64 DEFAULT 0,
+    attestation_2_target_root String DEFAULT '',
+    attestation_2_root String DEFAULT '',
+    attestation_2_sig String DEFAULT '',
+    attestation_2_signature String DEFAULT '',
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time, 'UTC') FROM genesis LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)

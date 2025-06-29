@@ -30,10 +30,16 @@ COPY migrations/ /app/migrations/
 COPY scripts/ /app/scripts/
 
 # Create additional directories
-RUN mkdir -p /app/logs
+RUN mkdir -p /app/logs /app/state
 
-# Ensure scripts are executable
+# Copy state management scripts
+COPY scripts/check_progress.py /app/scripts/
+COPY scripts/manage_state.py /app/scripts/
+COPY scripts/monitor_performance.py /app/scripts/
+
+# Ensure all scripts are executable
 RUN chmod +x /app/scripts/*.py 2>/dev/null || true
+RUN chmod +x /app/scripts/*.sh 2>/dev/null || true
 
 # Set entrypoint script
 COPY scripts/docker-entrypoint.sh /docker-entrypoint.sh
