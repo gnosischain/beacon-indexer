@@ -151,8 +151,9 @@ class BlockScraper(BaseScraper):
             import traceback
             logger.error(traceback.format_exc())
     
-    async def _process_beacon_block(self, info: Dict, is_canonical: bool = True) -> None:
-        """Process and store beacon block data."""
+    async def _process_beacon_block(self, info: Dict, is_canonical: bool) -> None:
+        """Process and store basic beacon block information."""
+        
         slot = info["slot"]
         block_root = info["block_root"]
         proposer_index = info["proposer_index"]
@@ -179,7 +180,12 @@ class BlockScraper(BaseScraper):
             if execution_payload and "timestamp" in execution_payload:
                 timestamp_val = int(execution_payload.get("timestamp", 0))
                 if timestamp_val > 0:
-                    timestamp = datetime.fromtimestamp(timestamp_val, tz=timezone.utc)
+                    # Create datetime without timezone for ClickHouse
+                    timestamp = datetime.fromtimestamp(timestamp_val).replace(tzinfo=None)
+        
+        # If no timestamp from execution payload, use current time
+        if timestamp is None:
+            timestamp = datetime.now().replace(tzinfo=None)
         
         block_data = {
             "slot": slot,
@@ -202,7 +208,7 @@ class BlockScraper(BaseScraper):
         await self._insert_with_bulk("blocks", block_data)
         
         logger.info(f"Processed beacon block at slot {slot} with root {block_root}")
-    
+
     async def _process_attestations(self, info: Dict, attestations: List[Dict]) -> None:
         """Process and store attestations."""
         slot = info["slot"]

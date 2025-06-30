@@ -45,9 +45,11 @@ def extract_block_info(block_data: Dict) -> Dict[str, Any]:
     }
 
 def parse_timestamp(timestamp_str: str) -> datetime:
-    """Convert a timestamp string to UTC datetime."""
+    """Convert a timestamp string to timezone-naive datetime for ClickHouse."""
     timestamp = int(timestamp_str)
-    return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    # Return timezone-naive datetime
+    return datetime.fromtimestamp(timestamp).replace(tzinfo=None)
+
 
 def ensure_list(value: Any) -> List:
     """Ensure a value is a list."""

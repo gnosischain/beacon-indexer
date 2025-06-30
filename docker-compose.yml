@@ -1,3 +1,4 @@
+# Base environment variables
 x-base-env: &base-env
   # Beacon node configuration
   BEACON_NODE_URL: ${BEACON_NODE_URL:-http://your-beacon-node:5052}
@@ -7,15 +8,18 @@ x-base-env: &base-env
   CLICKHOUSE_PORT: ${CLICKHOUSE_PORT:-9000}
   CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
   CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
-  CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-ethereum}
+  CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-beacon_chain}
   CLICKHOUSE_SECURE: ${CLICKHOUSE_SECURE:-true}
   CLICKHOUSE_VERIFY: ${CLICKHOUSE_VERIFY:-false}
   
   # Logging
-  LOG_LEVEL: ${LOG_LEVEL:-20}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
 
 x-complete-env: &complete-env
   <<: *base-env
+  
+  # Operation mode
+  OPERATION: ${OPERATION:-continuous}
   
   # Scraper configuration
   SCRAPER_MODE: ${SCRAPER_MODE:-realtime}
@@ -32,6 +36,7 @@ x-complete-env: &complete-env
   
   # Parallel mode settings
   PARALLEL_WORKERS: ${PARALLEL_WORKERS:-4}
+  NUM_WORKERS: ${NUM_WORKERS:-4}
   ENABLE_WORKER_POOL: ${ENABLE_WORKER_POOL:-true}
   WORKER_POOL_SIZE: ${WORKER_POOL_SIZE:-8}
   WORKER_BATCH_SIZE: ${WORKER_BATCH_SIZE:-100}
@@ -69,6 +74,9 @@ services:
     environment:
       <<: *base-env
       CH_DIRECTION: ${CH_DIRECTION:-up}
+      CH_MIGRATIONS_DIR: /app/migrations
+      CH_SECURE: "True"
+      CH_VERIFY: "False"
     volumes:
       - ./migrations:/app/migrations
       - ./scripts/run_clickhouse_migrations.py:/app/scripts/run_clickhouse_migrations.py
@@ -95,16 +103,21 @@ services:
     container_name: beacon-scraper-parallel
     environment:
       <<: *complete-env
+      OPERATION: historical  # Use historical operation for parallel processing
       SCRAPER_MODE: parallel
       # Override with optimized values for parallel processing
       PARALLEL_WORKERS: ${PARALLEL_WORKERS:-16}
+      NUM_WORKERS: ${NUM_WORKERS:-16}
       STATE_RANGE_SIZE: ${STATE_RANGE_SIZE:-10000}
       STATE_BULK_INSERT_BATCH_SIZE: ${STATE_BULK_INSERT_BATCH_SIZE:-5000}
       STATE_BULK_CHECK_BATCH_SIZE: ${STATE_BULK_CHECK_BATCH_SIZE:-5000}
-      BATCH_SIZE: ${BATCH_SIZE:-1000}
-      MAX_CONCURRENT_REQUESTS: ${MAX_CONCURRENT_REQUESTS:-50}
-      WORKER_BATCH_SIZE: ${WORKER_BATCH_SIZE:-100}
-      BULK_INSERT_BATCH_SIZE: ${BULK_INSERT_BATCH_SIZE:-5000}
+      BATCH_SIZE: ${BATCH_SIZE:-2000}
+      MAX_CONCURRENT_REQUESTS: ${MAX_CONCURRENT_REQUESTS:-100}
+      WORKER_BATCH_SIZE: ${WORKER_BATCH_SIZE:-500}
+      BULK_INSERT_BATCH_SIZE: ${BULK_INSERT_BATCH_SIZE:-10000}
+      # Historical operation settings
+      START_SLOT: ${HISTORICAL_START_SLOT:-0}
+      END_SLOT: ${HISTORICAL_END_SLOT:-}
     volumes:
       - ./migrations:/app/migrations
     command: python -m src.main

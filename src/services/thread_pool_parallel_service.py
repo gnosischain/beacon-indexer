@@ -1,6 +1,5 @@
 """
-Thread pool-based parallel service that replaces the async parallel service.
-Uses the worker pool for efficient processing.
+Fixed thread pool-based parallel service with proper event loop handling.
 """
 import asyncio
 import time
@@ -20,8 +19,7 @@ from src.utils.specs_manager import SpecsManager
 
 class ThreadPoolParallelService:
     """
-    Parallel processing service using thread-based worker pool.
-    Replaces the async-based parallel service for better performance.
+    Fixed implementation with proper event loop and state management.
     """
     
     def __init__(
@@ -50,7 +48,8 @@ class ThreadPoolParallelService:
         # Set managers for scrapers
         for scraper in scrapers:
             scraper.set_specs_manager(specs_manager)
-            scraper.set_state_manager(self.state_manager)
+            if hasattr(scraper, 'set_state_manager'):
+                scraper.set_state_manager(self.state_manager)
             
         # Worker pool
         self.worker_pool = None
@@ -85,30 +84,38 @@ class ThreadPoolParallelService:
             f"workers={self.num_workers}, batch_size={self.worker_batch_size}"
         )
         
-        # Reset stale ranges (fixed method name)
+        # Reset stale ranges
         self.state_manager.reset_stale_ranges()
         
         # Filter active scrapers
         active_scrapers = []
         for scraper in self.scrapers:
-            if scraper.one_time and await scraper.get_last_processed_slot() > 0:
-                logger.info(f"Skipping one-time scraper {scraper.scraper_id} (already completed)")
-                continue
+            if scraper.one_time:
+                # Check if this one-time scraper should run
+                should_run = await scraper.should_process()
+                if not should_run:
+                    logger.info(f"Skipping one-time scraper {scraper.scraper_id} (already completed)")
+                    continue
             active_scrapers.append(scraper)
             
         if not active_scrapers:
             logger.warning("No active scrapers to run")
             return
             
+        # Log active scrapers with their IDs
+        logger.info(f"Active scrapers: {[s.scraper_id for s in active_scrapers]}")
+            
         # Convert scraper instances to a dictionary of scraper classes
         scraper_classes = {}
         for scraper in active_scrapers:
+            # Use the scraper's actual ID as the key
             scraper_classes[scraper.scraper_id] = type(scraper)
+            logger.debug(f"Registered scraper class: {scraper.scraper_id} -> {type(scraper).__name__}")
             
         # Create initial ranges in the database
         logger.info("Creating initial ranges in database...")
         created_ranges = self.state_manager.bulk_create_ranges(
-            scraper_classes, 
+            active_scrapers,  # Pass scraper instances
             self.start_slot, 
             self.end_slot
         )
@@ -118,85 +125,30 @@ class ThreadPoolParallelService:
         else:
             logger.info("Using existing ranges from database")
             
-        # Create worker pool with correct parameters
+        # Create worker pool with fixed implementation
         self.worker_pool = WorkerPoolService(
             beacon_url=self.beacon_api.base_url,
-            clickhouse_config={
-                'host': self.clickhouse.host,
-                'port': self.clickhouse.port,
-                'user': self.clickhouse.user,
-                'password': self.clickhouse.password,
-                'database': self.clickhouse.database,
-                'secure': self.clickhouse.secure,
-                'verify': self.clickhouse.verify
-            },
+            existing_clickhouse=self.clickhouse,  # Pass existing connection
             scraper_classes=scraper_classes,
-            num_workers=self.num_workers,
-            existing_clickhouse=self.clickhouse
+            specs_manager=self.specs_manager,
+            num_workers=self.num_workers
         )
         
-        # Set the specs manager and state manager on the worker pool
-        self.worker_pool.set_specs_manager(self.specs_manager)
-        self.worker_pool.set_state_manager(self.state_manager)
-        
         try:
-            # Process the entire range using the worker pool
+            # Process the full range
             await self.worker_pool.process_range(self.start_slot, self.end_slot)
             
-            logger.info("All work completed successfully")
-                
+            # Log final statistics
+            elapsed_time = time.time() - self.progress['start_time']
+            logger.info(
+                f"Parallel processing completed in {elapsed_time:.1f}s. "
+                f"Total rows indexed: {self.worker_pool.stats['total_rows']}"
+            )
+            
         except Exception as e:
-            logger.error(f"Error during parallel processing: {e}")
+            logger.error(f"Error in parallel processing: {e}")
             raise
         finally:
-            # Final summary
-            self._print_summary()
-            
-    def _print_summary(self):
-        """Print final processing summary."""
-        elapsed = time.time() - self.progress['start_time']
-        
-        # Get final stats from state manager
-        stats_query = """
-        SELECT 
-            countIf(status = 'completed') as completed,
-            countIf(status = 'failed') as failed,
-            countIf(status = 'pending') as pending,
-            countIf(status = 'processing') as processing,
-            sum(rows_indexed) as total_rows
-        FROM indexing_state
-        WHERE start_slot >= %(start_slot)s AND end_slot <= %(end_slot)s
-        """
-        
-        results = self.state_manager.db.execute(stats_query, {
-            "start_slot": self.start_slot,
-            "end_slot": self.end_slot
-        })
-        
-        if results:
-            stats = results[0]
-            completed = stats['completed']
-            failed = stats['failed'] 
-            pending = stats['pending']
-            processing = stats['processing']
-            total_rows = stats['total_rows'] or 0
-        else:
-            completed = failed = pending = processing = total_rows = 0
-        
-        total_ranges = completed + failed + pending + processing
-        
-        logger.info("=" * 80)
-        logger.info("PARALLEL PROCESSING SUMMARY")
-        logger.info("=" * 80)
-        logger.info(f"Total time: {elapsed/60:.2f} minutes")
-        logger.info(f"Total ranges: {total_ranges}")
-        logger.info(f"Completed ranges: {completed}")
-        logger.info(f"Failed ranges: {failed}")
-        logger.info(f"Pending ranges: {pending}")
-        logger.info(f"Processing ranges: {processing}")
-        logger.info(f"Total rows processed: {total_rows:,}")
-        
-        if elapsed > 0:
-            logger.info(f"Average rate: {total_rows/elapsed:.0f} rows/second")
-            
-        logger.info("=" * 80)
+            # Ensure beacon API is properly closed
+            if self.beacon_api:
+                await self.beacon_api.stop()

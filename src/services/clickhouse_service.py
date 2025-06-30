@@ -156,13 +156,19 @@ class ClickHouseService:
                             elif isinstance(val, str):
                                 escaped_val = val.replace("'", "''")
                                 values.append(f"'{escaped_val}'")
-                                #values.append(f"'{val.replace('\'', '\'\'')}'")
                             elif isinstance(val, bool):
                                 values.append("1" if val else "0")
                             elif isinstance(val, (list, tuple)):
                                 values.append(f"[{', '.join(str(x) for x in val)}]")
                             elif isinstance(val, datetime):
-                                values.append(f"'{val.isoformat()}'")
+                                # Safely handle both timezone-aware and naive datetimes
+                                if val.tzinfo is not None:
+                                    dt_without_tz = val.replace(tzinfo=None)
+                                else:
+                                    dt_without_tz = val
+                                # Format without microseconds for DateTime64(0)
+                                dt_str = dt_without_tz.strftime('%Y-%m-%d %H:%M:%S')
+                                values.append(f"'{dt_str}'")
                             else:
                                 values.append(str(val))
                         
@@ -186,27 +192,98 @@ class ClickHouseService:
         Execute a query with multiple parameter sets.
         
         Args:
-            query: Query with placeholders or table name
+            query: Query with placeholders
             params: List of parameter dictionaries
         """
         if not params:
             return
         
-        # If query is just a table name, construct the INSERT query
-        if not query.upper().startswith('INSERT') and ' ' not in query:
-            # It's just a table name, construct the INSERT query
-            table_name = query
-            if params:
+        # For INSERT queries, we need to execute them differently
+        if query.strip().upper().startswith("INSERT"):
+            # ClickHouse doesn't support parameterized VALUES in bulk inserts
+            # We need to construct the query with actual values
+            
+            # Extract table name from INSERT query
+            # Pattern: INSERT INTO [db.]table_name (columns...) VALUES ...
+            import re
+            match = re.search(r'INSERT\s+INTO\s+(?:[\w\.]+\.)?(\w+)', query, re.IGNORECASE)
+            if not match:
+                raise ValueError(f"Could not extract table name from query: {query}")
+            
+            table_name = match.group(1)
+            
+            # Extract column names
+            cols_match = re.search(r'\(([\w\s,]+)\)', query)
+            if cols_match:
+                columns = [col.strip() for col in cols_match.group(1).split(',')]
+            else:
+                # Get columns from first param
                 columns = list(params[0].keys())
-                query = f"INSERT INTO {table_name} ({', '.join(columns)}) VALUES"
-        
-        # Use the existing batch insert logic
-        try:
-            # Call the internal batch insert method
-            self._execute_batch_insert(query, params)
-        except Exception as e:
-            logger.error(f"Error in execute_many: {e}")
-            raise
+            
+            # Build VALUES with actual data
+            values_parts = []
+            for param in params:
+                row_values = []
+                for col in columns:
+                    val = param.get(col)
+                    if val is None:
+                        row_values.append("NULL")
+                    elif col == "version" and val == "now()":
+                        # Special handling for now() function
+                        row_values.append("now()")
+                    elif isinstance(val, str):
+                        escaped_val = val.replace("'", "''")
+                        row_values.append(f"'{escaped_val}'")
+                    elif isinstance(val, bool):
+                        row_values.append("1" if val else "0")
+                    elif isinstance(val, datetime):
+                        # Safely handle both timezone-aware and naive datetimes
+                        if val.tzinfo is not None:
+                            dt_without_tz = val.replace(tzinfo=None)
+                        else:
+                            dt_without_tz = val
+                        # Format without microseconds for DateTime64(0)
+                        dt_str = dt_without_tz.strftime('%Y-%m-%d %H:%M:%S')
+                        row_values.append(f"'{dt_str}'")
+                    elif isinstance(val, (list, tuple)):
+                        items = []
+                        for item in val:
+                            if isinstance(item, str):
+                                escaped_item = item.replace("'", "''")
+                                items.append(f"'{escaped_item}'")
+                            else:
+                                items.append(str(item))
+                        row_values.append(f"[{', '.join(items)}]")
+                    else:
+                        row_values.append(str(val))
+                
+                values_parts.append(f"({', '.join(row_values)})")
+            
+            # Construct the full query
+            base_query = query.split("VALUES")[0].strip()
+            
+            # Process in batches
+            batch_size = min(1000, self.max_batch_size)
+            for i in range(0, len(values_parts), batch_size):
+                batch = values_parts[i:i+batch_size]
+                full_query = f"{base_query} VALUES {', '.join(batch)}"
+                
+                try:
+                    self.client.command(full_query)
+                except Exception as e:
+                    logger.error(f"Error executing batch insert: {e}")
+                    # Try row by row as fallback
+                    for j, value_part in enumerate(batch):
+                        single_query = f"{base_query} VALUES {value_part}"
+                        try:
+                            self.client.command(single_query)
+                        except Exception as inner_e:
+                            logger.error(f"Error inserting row {i+j}: {inner_e}")
+                            raise
+        else:
+            # For non-INSERT queries, execute them one by one
+            for param in params:
+                self.execute(query, param)
 
     def _get_table_schema(self, table_name: str) -> Tuple[List[str], Dict[str, str]]:
         """
@@ -320,7 +397,14 @@ class ClickHouseService:
                                 items.append(str(item))
                         row_values.append(f"[{', '.join(items)}]")
                     elif isinstance(val, datetime):
-                        row_values.append(f"'{val.isoformat()}'")
+                        # Safely handle both timezone-aware and naive datetimes
+                        if val.tzinfo is not None:
+                            dt_without_tz = val.replace(tzinfo=None)
+                        else:
+                            dt_without_tz = val
+                        # Format without microseconds for DateTime64(0)
+                        dt_str = dt_without_tz.strftime('%Y-%m-%d %H:%M:%S')
+                        row_values.append(f"'{dt_str}'")
                     else:
                         row_values.append(str(val))
                 
@@ -389,19 +473,29 @@ class ClickHouseService:
                                 items.append(str(item))
                         row_values.append(f"[{', '.join(items)}]")
                     elif isinstance(val, datetime):
-                        row_values.append(f"'{val.isoformat()}'")
+                        # Safely handle both timezone-aware and naive datetimes
+                        if val.tzinfo is not None:
+                            dt_without_tz = val.replace(tzinfo=None)
+                        else:
+                            dt_without_tz = val
+                        # Format without microseconds for DateTime64(0)
+                        dt_str = dt_without_tz.strftime('%Y-%m-%d %H:%M:%S')
+                        row_values.append(f"'{dt_str}'")
                     else:
                         row_values.append(str(val))
                 
                 formatted_values.append(f"({', '.join(row_values)})")
             
             # Break into smaller subsets for each execute to avoid too-large queries
-            batch_size = config.scraper.batch_size // 2 #min(config.scraper.batch_size // 2, 15000)
+            batch_size = min(config.scraper.batch_size // 2, 15000)
             
             for i in range(0, len(formatted_values), batch_size):
                 batch_values = formatted_values[i:i+batch_size]
                 values_str = ', '.join(batch_values)
-                query = f"INSERT INTO {table_name} ({columns_str}) VALUES {values_str}"
+                
+                # Make sure we include the database name in the table reference
+                full_table_name = f"{self.database}.{table_name}"
+                query = f"INSERT INTO {full_table_name} ({columns_str}) VALUES {values_str}"
                 
                 # Execute the query with retries
                 try:
@@ -420,7 +514,7 @@ class ClickHouseService:
             import traceback
             logger.error(traceback.format_exc())
             raise
-
+    
     def bulk_insert(self, table_name: str, data: List[Dict], batch_size: int = 1000) -> None:
         """
         Perform a high-performance bulk insert into ClickHouse.

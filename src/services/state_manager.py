@@ -1,19 +1,21 @@
 """
-State management for tracking indexing progress.
+Enhanced state management for tracking indexing progress.
 """
 import os
 import time
 import uuid
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Dict, List, Optional, Tuple, Set, Any
 from datetime import datetime, timedelta
 import threading
 
 from src.utils.logger import logger
 from src.services.clickhouse_service import ClickHouseService
+from src.core.state import StateStatus, IndexingRange
+from src.core.datasets import DatasetRegistry
 
 
 class StateManager:
-    """Manages indexing state across scrapers and tables."""
+    """Enhanced state manager with operation mode support."""
     
     def __init__(self, clickhouse: ClickHouseService):
         self.db = clickhouse
@@ -21,215 +23,103 @@ class StateManager:
         self._lock = threading.Lock()
         self._cache = {}  # Simple cache for completed ranges
         self._cache_ttl = 300  # 5 minutes
+        self.dataset_registry = DatasetRegistry()
         
-    def _get_latest_status(self, scraper_id: str, table_name: str, 
-                          start_slot: int, end_slot: int) -> Optional[Dict]:
-        """Get the latest status for a range using FINAL to handle ReplacingMergeTree."""
+    def get_range_status(self, mode: str, dataset: str, 
+                        start_slot: int, end_slot: int) -> Optional[StateStatus]:
+        """Get the current status of a range."""
         query = """
-        SELECT 
-            status,
-            worker_id,
-            rows_indexed,
-            updated_at
+        SELECT status, worker_id, started_at
         FROM indexing_state FINAL
-        WHERE scraper_id = %(scraper_id)s
-          AND table_name = %(table_name)s
+        WHERE mode = %(mode)s
+          AND dataset = %(dataset)s
           AND start_slot = %(start_slot)s
           AND end_slot = %(end_slot)s
-        ORDER BY updated_at DESC
+        ORDER BY version DESC
         LIMIT 1
         """
         
         result = self.db.execute(query, {
-            "scraper_id": scraper_id,
-            "table_name": table_name,
+            "mode": mode,
+            "dataset": dataset,
             "start_slot": start_slot,
             "end_slot": end_slot
         })
         
-        return result[0] if result else None
-    
-    def bulk_create_ranges(self, scrapers: Dict, start_slot: int, end_slot: int) -> int:
-        """Bulk create ranges for all scrapers and tables."""
-        logger.info(f"Bulk creating ranges from {start_slot} to {end_slot}")
-        
-        # Calculate all ranges
-        ranges = []
-        current_start = start_slot
-        while current_start <= end_slot:
-            range_end = min(current_start + self.range_size - 1, end_slot)
-            ranges.append((current_start, range_end))
-            current_start = range_end + 1
-        
-        logger.info(f"Calculated {len(ranges)} ranges")
-        
-        # Prepare all range entries
-        all_entries = []
-        for scraper_id in scrapers:
-            # Get tables for this scraper
-            if hasattr(scrapers[scraper_id], 'get_tables_written'):
-                temp_scraper = scrapers[scraper_id](None, self.db)
-                tables = temp_scraper.get_tables_written()
-            else:
-                tables = ['default']
+        if result:
+            status_str = result[0]['status']
             
-            for table in tables:
-                for range_start, range_end in ranges:
-                    all_entries.append({
-                        'scraper_id': scraper_id,
-                        'table_name': table,
-                        'start_slot': range_start,
-                        'end_slot': range_end
-                    })
-        
-        logger.info(f"Prepared {len(all_entries)} total entries for bulk insert")
-        
-        # Check which entries already exist using FINAL
-        if all_entries:
-            # Check existing ranges
-            existing_ranges = set()
-            check_query = """
-            SELECT DISTINCT scraper_id, table_name, start_slot, end_slot
-            FROM indexing_state FINAL
-            WHERE (scraper_id, table_name, start_slot, end_slot) IN (%(values)s)
-            """
-            
-            # Build values for IN clause
-            values_list = []
-            for entry in all_entries:
-                values_list.append(f"('{entry['scraper_id']}', '{entry['table_name']}', {entry['start_slot']}, {entry['end_slot']})")
-            
-            if values_list:
-                # Execute in batches to avoid query too long
-                batch_size = 100
-                for i in range(0, len(values_list), batch_size):
-                    batch = values_list[i:i+batch_size]
-                    batch_query = f"""
-                    SELECT DISTINCT scraper_id, table_name, start_slot, end_slot
-                    FROM indexing_state FINAL
-                    WHERE (scraper_id, table_name, start_slot, end_slot) IN ({','.join(batch)})
-                    """
-                    
-                    results = self.db.execute(batch_query)
-                    for row in results:
-                        key = f"{row['scraper_id']}:{row['table_name']}:{row['start_slot']}:{row['end_slot']}"
-                        existing_ranges.add(key)
-            
-            logger.info(f"Found {len(existing_ranges)} existing ranges")
-            
-            # Filter out existing entries
-            entries_to_create = []
-            for entry in all_entries:
-                key = f"{entry['scraper_id']}:{entry['table_name']}:{entry['start_slot']}:{entry['end_slot']}"
-                if key not in existing_ranges:
-                    entries_to_create.append(entry)
-            
-            logger.info(f"Will create {len(entries_to_create)} new ranges")
-            
-            # Bulk insert new entries
-            if entries_to_create:
-                # Insert in batches
-                insert_batch_size = 1000
-                total_inserted = 0
+            # Check if processing status is stale
+            if status_str == 'processing' and result[0].get('started_at'):
+                started_at = result[0]['started_at']
+                stale_timeout = int(os.getenv("STALE_JOB_TIMEOUT_MINUTES", "30"))
                 
-                for i in range(0, len(entries_to_create), insert_batch_size):
-                    batch = entries_to_create[i:i+insert_batch_size]
+                if datetime.now() - started_at > timedelta(minutes=stale_timeout):
+                    logger.warning(
+                        f"Range {dataset} {start_slot}-{end_slot} has stale processing status"
+                    )
+                    return StateStatus.PENDING
                     
-                    # Build values for batch insert
-                    values = []
-                    batch_id = str(uuid.uuid4())
-                    for entry in batch:
-                        values.append(
-                            f"('{entry['scraper_id']}', "
-                            f"'{entry['table_name']}', "
-                            f"{entry['start_slot']}, "
-                            f"{entry['end_slot']}, "
-                            f"'pending', "  # status
-                            f"'', "  # worker_id
-                            f"'{batch_id}', "  # batch_id
-                            f"0, "  # attempt_count
-                            f"0, "  # rows_indexed
-                            f"'', "  # error_message
-                            f"now(), "  # started_at
-                            f"NULL, "  # completed_at
-                            f"now(), "  # created_at
-                            f"now())"  # updated_at
-                        )
-                    
-                    # Insert with ALL columns explicitly specified
-                    insert_query = f"""
-                    INSERT INTO indexing_state
-                    (scraper_id, table_name, start_slot, end_slot, status, 
-                    worker_id, batch_id, attempt_count, rows_indexed, error_message,
-                    started_at, completed_at, created_at, updated_at)
-                    VALUES {','.join(values)}
-                    """
-                    
-                    try:
-                        self.db.execute(insert_query)
-                        total_inserted += len(batch)
-                        
-                        if i > 0 and i % 5000 == 0:
-                            logger.info(f"Inserted {total_inserted} ranges so far...")
-                    except Exception as e:
-                        logger.error(f"Error inserting batch: {e}")
-                
-                logger.info(f"Successfully bulk inserted {total_inserted} ranges")
-                return total_inserted
-            else:
-                logger.info("All ranges already exist, nothing to create")
-                return 0
+            return StateStatus(status_str)
+            
+        return None
         
-        return 0
-    
-    def claim_range(self, scraper_id: str, table_name: str, 
-                   start_slot: int, end_slot: int, worker_id: str,
+    def claim_range(self, mode: str, dataset: str, start_slot: int, 
+                   end_slot: int, worker_id: str, batch_id: str = "",
                    force: bool = False) -> bool:
-        """Try to claim a range. Returns True if successful."""
+        """Atomically claim a range for processing."""
         with self._lock:
             try:
-                # Check current status with FINAL
-                current_status = self._get_latest_status(scraper_id, table_name, start_slot, end_slot)
+                # Check current status
+                status = self.get_range_status(mode, dataset, start_slot, end_slot)
                 
                 # Can we claim it?
-                can_claim = False
-                if not current_status:
-                    logger.warning(f"No status found for {scraper_id}/{table_name} {start_slot}-{end_slot}, creating new entry")
-                    can_claim = True
-                elif current_status['status'] == 'pending':
-                    can_claim = True
-                elif current_status['status'] == 'completed':
-                    logger.debug(f"Range {scraper_id}/{table_name} {start_slot}-{end_slot} already completed")
+                if not force and status == StateStatus.COMPLETED:
+                    logger.debug(f"Range {dataset} {start_slot}-{end_slot} already completed")
                     return False
-                elif force and current_status['status'] in ['failed', 'processing']:
-                    can_claim = True
-                elif current_status['status'] == 'processing' and current_status['worker_id'] == worker_id:
-                    can_claim = True
-                
-                if not can_claim:
-                    logger.debug(f"Cannot claim range {scraper_id}/{table_name} {start_slot}-{end_slot}, status: {current_status['status'] if current_status else 'unknown'}")
+                    
+                if not force and status == StateStatus.PROCESSING:
+                    logger.debug(f"Range {dataset} {start_slot}-{end_slot} being processed")
                     return False
-                
-                # Always use the same batch_id for this range
-                batch_id = f"{scraper_id}:{table_name}:{start_slot}:{end_slot}"
-                
-                # Insert new status - this will replace the old one due to ReplacingMergeTree
+                    
+                # Get attempt count
+                attempt_count = 0
+                if status:
+                    count_query = """
+                    SELECT attempt_count
+                    FROM indexing_state FINAL
+                    WHERE mode = %(mode)s
+                      AND dataset = %(dataset)s
+                      AND start_slot = %(start_slot)s
+                      AND end_slot = %(end_slot)s
+                    ORDER BY version DESC
+                    LIMIT 1
+                    """
+                    
+                    result = self.db.execute(count_query, {
+                        "mode": mode,
+                        "dataset": dataset,
+                        "start_slot": start_slot,
+                        "end_slot": end_slot
+                    })
+                    
+                    if result:
+                        attempt_count = result[0].get('attempt_count', 0)
+                        
+                # Insert new status
                 insert_query = """
                 INSERT INTO indexing_state 
-                (scraper_id, table_name, start_slot, end_slot, status, worker_id, 
-                started_at, updated_at, batch_id, attempt_count, rows_indexed, 
-                error_message, completed_at, created_at)
+                (mode, dataset, start_slot, end_slot, status, worker_id, 
+                 started_at, batch_id, attempt_count, version)
                 VALUES 
-                (%(scraper_id)s, %(table_name)s, %(start_slot)s, %(end_slot)s, 
-                'processing', %(worker_id)s, now(), now(), %(batch_id)s, 
-                %(attempt_count)s, 0, '', NULL, now())
+                (%(mode)s, %(dataset)s, %(start_slot)s, %(end_slot)s, 
+                 'processing', %(worker_id)s, now(), %(batch_id)s, 
+                 %(attempt_count)s, now())
                 """
                 
-                attempt_count = current_status['attempt_count'] + 1 if current_status and 'attempt_count' in current_status else 1
-                
                 self.db.execute(insert_query, {
-                    "scraper_id": scraper_id,
-                    "table_name": table_name,
+                    "mode": mode,
+                    "dataset": dataset,
                     "start_slot": start_slot,
                     "end_slot": end_slot,
                     "worker_id": worker_id,
@@ -237,220 +127,674 @@ class StateManager:
                     "attempt_count": attempt_count
                 })
                 
-                logger.debug(f"Claimed range {scraper_id}/{table_name} {start_slot}-{end_slot} for {worker_id}")
+                logger.debug(f"Claimed range {dataset} {start_slot}-{end_slot} for {worker_id}")
                 return True
                     
             except Exception as e:
                 logger.error(f"Error claiming range: {e}")
                 return False
-    
-    def complete_range(self, scraper_id: str, table_name: str,
-                      start_slot: int, end_slot: int, rows_indexed: int) -> None:
+                
+    def complete_range(self, mode: str, dataset: str, start_slot: int, 
+                      end_slot: int, rows_indexed: int = 0) -> None:
         """Mark a range as completed."""
-        with self._lock:
-            try:
-                # Use consistent batch_id
-                batch_id = f"{scraper_id}:{table_name}:{start_slot}:{end_slot}"
-                
-                query = """
-                INSERT INTO indexing_state 
-                (scraper_id, table_name, start_slot, end_slot, status, 
-                 rows_indexed, completed_at, updated_at, worker_id, batch_id,
-                 attempt_count, error_message, started_at, created_at)
-                VALUES 
-                (%(scraper_id)s, %(table_name)s, %(start_slot)s, %(end_slot)s, 
-                 'completed', %(rows_indexed)s, now(), now(), '', %(batch_id)s,
-                 0, '', now(), now())
-                """
-                
-                self.db.execute(query, {
-                    "scraper_id": scraper_id,
-                    "table_name": table_name,
-                    "start_slot": start_slot,
-                    "end_slot": end_slot,
-                    "rows_indexed": rows_indexed,
-                    "batch_id": batch_id
-                })
-                
-                cache_key = f"{scraper_id}:{table_name}:{start_slot}:{end_slot}"
-                self._cache[cache_key] = {
-                    'status': 'completed',
-                    'timestamp': time.time()
-                }
-                
-                logger.debug(f"Completed range {scraper_id}/{table_name} {start_slot}-{end_slot} with {rows_indexed} rows")
-                
-            except Exception as e:
-                logger.error(f"Error completing range: {e}")
-    
-    def fail_range(self, scraper_id: str, table_name: str,
-                  start_slot: int, end_slot: int, error: str) -> None:
+        try:
+            query = """
+            INSERT INTO indexing_state 
+            (mode, dataset, start_slot, end_slot, status, 
+             completed_at, rows_indexed, version)
+            VALUES 
+            (%(mode)s, %(dataset)s, %(start_slot)s, %(end_slot)s, 
+             'completed', now(), %(rows_indexed)s, now())
+            """
+            
+            self.db.execute(query, {
+                "mode": mode,
+                "dataset": dataset,
+                "start_slot": start_slot,
+                "end_slot": end_slot,
+                "rows_indexed": rows_indexed
+            })
+            
+            logger.debug(f"Completed range {dataset} {start_slot}-{end_slot} ({rows_indexed} rows)")
+            
+        except Exception as e:
+            logger.error(f"Error completing range: {e}")
+            
+    def fail_range(self, mode: str, dataset: str, start_slot: int, 
+                   end_slot: int, error_message: str) -> None:
         """Mark a range as failed."""
-        with self._lock:
-            try:
-                # Use consistent batch_id
-                batch_id = f"{scraper_id}:{table_name}:{start_slot}:{end_slot}"
+        try:
+            # Get current attempt count
+            attempt_count = 0
+            count_query = """
+            SELECT attempt_count
+            FROM indexing_state FINAL
+            WHERE mode = %(mode)s
+              AND dataset = %(dataset)s
+              AND start_slot = %(start_slot)s
+              AND end_slot = %(end_slot)s
+            ORDER BY version DESC
+            LIMIT 1
+            """
+            
+            result = self.db.execute(count_query, {
+                "mode": mode,
+                "dataset": dataset,
+                "start_slot": start_slot,
+                "end_slot": end_slot
+            })
+            
+            if result:
+                attempt_count = result[0].get('attempt_count', 0) + 1
                 
-                query = """
-                INSERT INTO indexing_state 
-                (scraper_id, table_name, start_slot, end_slot, status, 
-                 error_message, updated_at, worker_id, batch_id,
-                 attempt_count, rows_indexed, started_at, completed_at, created_at)
-                VALUES 
-                (%(scraper_id)s, %(table_name)s, %(start_slot)s, %(end_slot)s, 
-                 'failed', %(error_message)s, now(), '', %(batch_id)s,
-                 0, 0, now(), NULL, now())
-                """
+            # Determine if we should retry
+            max_attempts = int(os.getenv("MAX_RETRY_ATTEMPTS", "3"))
+            status = 'failed' if attempt_count >= max_attempts else 'pending'
+            
+            query = """
+            INSERT INTO indexing_state 
+            (mode, dataset, start_slot, end_slot, status, 
+             error_message, attempt_count, version)
+            VALUES 
+            (%(mode)s, %(dataset)s, %(start_slot)s, %(end_slot)s, 
+             %(status)s, %(error_message)s, %(attempt_count)s, now())
+            """
+            
+            self.db.execute(query, {
+                "mode": mode,
+                "dataset": dataset,
+                "start_slot": start_slot,
+                "end_slot": end_slot,
+                "status": status,
+                "error_message": error_message[:500],  # Truncate long errors
+                "attempt_count": attempt_count
+            })
+            
+            logger.error(
+                f"Failed range {dataset} {start_slot}-{end_slot} "
+                f"(attempt {attempt_count}/{max_attempts}): {error_message}"
+            )
+            
+        except Exception as e:
+            logger.error(f"Error marking range as failed: {e}")
+            
+    def create_range(self, mode: str, dataset: str, start_slot: int, 
+                    end_slot: int, batch_id: str = "") -> bool:
+        """Create a new range if it doesn't exist."""
+        try:
+            # Check if already exists
+            status = self.get_range_status(mode, dataset, start_slot, end_slot)
+            if status:
+                return False
                 
-                self.db.execute(query, {
-                    "scraper_id": scraper_id,
-                    "table_name": table_name,
-                    "start_slot": start_slot,
-                    "end_slot": end_slot,
-                    "error_message": error[:500],
-                    "batch_id": batch_id
-                })
+            query = """
+            INSERT INTO indexing_state
+            (mode, dataset, start_slot, end_slot, status, batch_id, version)
+            VALUES
+            (%(mode)s, %(dataset)s, %(start_slot)s, %(end_slot)s, 
+             'pending', %(batch_id)s, now())
+            """
+            
+            self.db.execute(query, {
+                "mode": mode,
+                "dataset": dataset,
+                "start_slot": start_slot,
+                "end_slot": end_slot,
+                "batch_id": batch_id
+            })
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error creating range: {e}")
+            return False
+            
+    def create_ranges_for_dataset(self, mode: str, dataset: str, 
+                                 start_slot: int, end_slot: int) -> int:
+        """Create all ranges for a dataset in a slot range."""
+        created = 0
+        
+        current = start_slot
+        while current < end_slot:
+            range_end = min(current + self.range_size, end_slot)
+            
+            if self.create_range(mode, dataset, current, range_end):
+                created += 1
                 
-                logger.debug(f"Failed range {scraper_id}/{table_name} {start_slot}-{end_slot}: {error}")
-                
-            except Exception as e:
-                logger.error(f"Error marking range as failed: {e}")
+            current = range_end
+            
+        return created
     
-    def get_next_range(self, scraper_id: str, table_name: str, 
-                      worker_id: str, max_slot: Optional[int] = None) -> Optional[Tuple[int, int]]:
-        """Get next available range for processing."""
-        with self._lock:
-            try:
-                # Find the next pending range using FINAL
-                query = """
-                SELECT start_slot, end_slot
-                FROM indexing_state FINAL
-                WHERE scraper_id = %(scraper_id)s
-                  AND table_name = %(table_name)s
-                  AND status = 'pending'
-                """
-                
-                params = {
-                    "scraper_id": scraper_id,
-                    "table_name": table_name
-                }
-                
-                if max_slot is not None:
-                    query += " AND start_slot <= %(max_slot)s"
-                    params["max_slot"] = max_slot
-                
-                query += " ORDER BY start_slot LIMIT 1"
-                
-                result = self.db.execute(query, params)
-                
-                if result:
-                    start_slot = result[0]['start_slot']
-                    end_slot = result[0]['end_slot']
-                    return (start_slot, end_slot)
-                
-                return None
-                
-            except Exception as e:
-                logger.error(f"Error getting next range: {e}")
-                return None
-    
-    def get_progress(self, scraper_id: str = None, table_name: str = None) -> Dict:
-        """Get progress statistics using FINAL."""
-        conditions = []
-        params = {}
+    def bulk_create_ranges_for_dataset(self, mode: str, dataset: str, 
+                                       start_slot: int, end_slot: int) -> int:
+        """Create all ranges for a dataset in a slot range using bulk insert."""
+        # Validate dataset name
+        if not dataset or not isinstance(dataset, str):
+            logger.error(f"Invalid dataset name: {dataset}")
+            return 0
+            
+        logger.info(f"Bulk creating ranges for dataset '{dataset}' from slot {start_slot} to {end_slot}")
         
-        if scraper_id:
-            conditions.append("scraper_id = %(scraper_id)s")
-            params["scraper_id"] = scraper_id
-        
-        if table_name:
-            conditions.append("table_name = %(table_name)s")
-            params["table_name"] = table_name
-        
-        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        
-        query = f"""
-        SELECT 
-            countIf(status = 'completed') as completed,
-            countIf(status = 'processing') as processing,
-            countIf(status = 'pending') as pending,
-            countIf(status = 'failed') as failed,
-            max(end_slot) as max_slot,
-            sum(rows_indexed) as total_rows
+        # First, get all existing ranges in one query
+        check_query = """
+        SELECT start_slot, end_slot
         FROM indexing_state FINAL
-        {where_clause}
+        WHERE mode = %(mode)s
+          AND dataset = %(dataset)s
+          AND start_slot >= %(start_slot)s
+          AND end_slot <= %(end_slot)s
+          AND status IN ('pending', 'processing', 'completed')
+        ORDER BY start_slot
         """
+        
+        existing_ranges = self.db.execute(check_query, {
+            "mode": mode,
+            "dataset": dataset,
+            "start_slot": start_slot,
+            "end_slot": end_slot
+        })
+        
+        # Convert to set of tuples for fast lookup
+        existing_set = {(r['start_slot'], r['end_slot']) for r in existing_ranges}
+        
+        # Build list of ranges to create
+        ranges_to_create = []
+        current = start_slot
+        
+        while current < end_slot:
+            range_end = min(current + self.range_size, end_slot)
+            
+            # Check if this range already exists
+            if (current, range_end) not in existing_set:
+                ranges_to_create.append({
+                    "mode": mode,
+                    "dataset": dataset,
+                    "start_slot": current,
+                    "end_slot": range_end,
+                    "status": "pending",
+                    "batch_id": ""
+                })
+            
+            current = range_end
+        
+        # Bulk insert all ranges
+        if ranges_to_create:
+            logger.info(f"Bulk creating {len(ranges_to_create)} ranges for {dataset}")
+            
+            # Insert in batches to avoid memory issues
+            batch_size = int(os.getenv("STATE_BULK_INSERT_BATCH_SIZE", "5000"))
+            
+            # Define the insert query template for execute_many
+            insert_query = """
+            INSERT INTO indexing_state
+            (mode, dataset, start_slot, end_slot, status, batch_id, version)
+            VALUES
+            (%(mode)s, %(dataset)s, %(start_slot)s, %(end_slot)s, %(status)s, %(batch_id)s, now())
+            """
+            
+            for i in range(0, len(ranges_to_create), batch_size):
+                batch = ranges_to_create[i:i + batch_size]
+                
+                try:
+                    # Use execute_many for bulk insert
+                    self.db.execute_many(insert_query, batch)
+                    logger.info(f"Inserted batch of {len(batch)} ranges ({i+1}-{min(i+batch_size, len(ranges_to_create))} of {len(ranges_to_create)})")
+                except Exception as e:
+                    logger.error(f"Error bulk inserting ranges: {e}")
+                    # Fall back to individual inserts for this batch
+                    for range_data in batch:
+                        self.create_range(
+                            range_data["mode"], 
+                            range_data["dataset"],
+                            range_data["start_slot"], 
+                            range_data["end_slot"],
+                            range_data["batch_id"]
+                        )
+        
+        return len(ranges_to_create)
+    
+    def bulk_create_ranges(self, scrapers: List[Any], start_slot: int, end_slot: int) -> int:
+        """Create ranges for all scrapers in the given slot range."""
+        try:
+            total_created = 0
+            
+            # Get all datasets for the enabled scrapers
+            datasets_to_process = set()
+            
+            for scraper in scrapers:
+                # Get datasets for this scraper from the registry
+                scraper_datasets = self.dataset_registry.get_datasets_for_scraper(scraper.scraper_id)
+                for dataset in scraper_datasets:
+                    if dataset.is_continuous:
+                        datasets_to_process.add(dataset.name)
+                        logger.info(f"Found dataset '{dataset.name}' for scraper '{scraper.scraper_id}'")
+            
+            # Create ranges for each dataset
+            for dataset_name in datasets_to_process:
+                logger.info(f"Creating ranges for dataset: {dataset_name}")
+                created = self.bulk_create_ranges_for_dataset(
+                    "historical",
+                    dataset_name,
+                    start_slot,
+                    end_slot
+                )
+                total_created += created
+                logger.info(f"Created {created} ranges for dataset {dataset_name}")
+            
+            return total_created
+            
+        except Exception as e:
+            logger.error(f"Error in bulk_create_ranges: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return 0
+    
+    def reset_stale_ranges(self, stale_minutes: int = None) -> int:
+        """Reset ranges that have been processing for too long."""
+        if stale_minutes is None:
+            stale_minutes = int(os.getenv("STALE_JOB_TIMEOUT_MINUTES", "30"))
+            
+        try:
+            # Same as reset_stale_processing_jobs but using the name expected by the service
+            return self.reset_stale_processing_jobs(stale_minutes)
+        except Exception as e:
+            logger.error(f"Error resetting stale ranges: {e}")
+            return 0
+    
+    async def bulk_create_validator_ranges(self, mode: str, dataset: str,
+                                          start_slot: int, end_slot: int,
+                                          validator_scraper) -> int:
+        """Create ranges for validator dataset with target slots using bulk operations."""
+        logger.info(f"Creating validator ranges for {dataset} from slot {start_slot} to {end_slot}")
+        
+        range_size = self.range_size
+        
+        # Get all target slots in the range at once
+        all_target_slots = validator_scraper.get_target_slots_in_range(
+            start_slot, end_slot, self.db
+        )
+        
+        if not all_target_slots:
+            logger.warning(f"No validator target slots found in range {start_slot}-{end_slot}")
+            return 0
+        
+        # Group target slots by range
+        ranges_with_targets = set()
+        for slot in all_target_slots:
+            range_start = (slot // range_size) * range_size
+            range_end = range_start + range_size
+            ranges_with_targets.add((range_start, range_end))
+        
+        # Get all existing ranges in one query
+        check_query = """
+        SELECT start_slot, end_slot
+        FROM indexing_state FINAL
+        WHERE mode = %(mode)s
+          AND dataset = %(dataset)s
+          AND start_slot >= %(start_slot)s
+          AND end_slot <= %(end_slot)s
+          AND status IN ('pending', 'processing', 'completed')
+        """
+        
+        existing_ranges = self.db.execute(check_query, {
+            "mode": mode,
+            "dataset": dataset,
+            "start_slot": start_slot - range_size,  # Include boundary
+            "end_slot": end_slot + range_size
+        })
+        
+        existing_set = {(r['start_slot'], r['end_slot']) for r in existing_ranges}
+        
+        # Build list of ranges to create
+        ranges_to_create = []
+        for range_start, range_end in sorted(ranges_with_targets):
+            if (range_start, range_end) not in existing_set:
+                ranges_to_create.append({
+                    "mode": mode,
+                    "dataset": dataset,
+                    "start_slot": range_start,
+                    "end_slot": range_end,
+                    "status": "pending",
+                    "batch_id": ""
+                })
+        
+        # Bulk insert
+        if ranges_to_create:
+            logger.info(f"Bulk creating {len(ranges_to_create)} validator ranges containing target slots")
+            
+            # Use the same batch size setting
+            batch_size = int(os.getenv("STATE_BULK_INSERT_BATCH_SIZE", "5000"))
+            
+            # Define the insert query template
+            insert_query = """
+            INSERT INTO indexing_state
+            (mode, dataset, start_slot, end_slot, status, batch_id, version)
+            VALUES
+            (%(mode)s, %(dataset)s, %(start_slot)s, %(end_slot)s, %(status)s, %(batch_id)s, now())
+            """
+            
+            for i in range(0, len(ranges_to_create), batch_size):
+                batch = ranges_to_create[i:i + batch_size]
+                
+                try:
+                    # Use execute_many for bulk insert
+                    self.db.execute_many(insert_query, batch)
+                    logger.info(f"Inserted validator batch of {len(batch)} ranges")
+                except Exception as e:
+                    logger.error(f"Error bulk inserting validator ranges: {e}")
+                    # Fall back to individual inserts for this batch
+                    for range_data in batch:
+                        self.create_range(
+                            range_data["mode"], 
+                            range_data["dataset"],
+                            range_data["start_slot"], 
+                            range_data["end_slot"],
+                            ""
+                        )
+        
+        logger.info(f"Created {len(ranges_to_create)} validator ranges containing target slots")
+        return len(ranges_to_create)
+        
+    def get_next_pending_range(self, mode: str, dataset: str, 
+                              max_slot: Optional[int] = None) -> Optional[Tuple[int, int]]:
+        """Get the next pending range to process."""
+        query = """
+        SELECT start_slot, end_slot
+        FROM indexing_state FINAL
+        WHERE mode = %(mode)s
+          AND dataset = %(dataset)s
+          AND status = 'pending'
+        """
+        
+        params = {
+            "mode": mode,
+            "dataset": dataset
+        }
+        
+        if max_slot is not None:
+            query += " AND start_slot <= %(max_slot)s"
+            params["max_slot"] = max_slot
+            
+        query += " ORDER BY start_slot LIMIT 1"
         
         result = self.db.execute(query, params)
         
         if result:
-            return result[0]
-        else:
-            return {
-                'completed': 0,
-                'processing': 0,
-                'pending': 0,
-                'failed': 0,
-                'max_slot': 0,
-                'total_rows': 0
-            }
-    
-    def reset_stale_ranges(self, timeout_minutes: int = 30) -> int:
-        """Reset ranges that have been processing for too long."""
-        stale_time = datetime.now() - timedelta(minutes=timeout_minutes)
+            return (result[0]['start_slot'], result[0]['end_slot'])
+            
+        return None
         
-        # Get stale ranges first
-        select_query = """
-        SELECT scraper_id, table_name, start_slot, end_slot, attempt_count
+    def find_gaps(self, mode: str, dataset: str, start_slot: int, 
+                  end_slot: int, min_gap_size: int = 1) -> List[Tuple[int, int]]:
+        """Find gaps in indexed data."""
+        query = """
+        SELECT start_slot, end_slot
         FROM indexing_state FINAL
-        WHERE status = 'processing'
-          AND updated_at < %(stale_time)s
+        WHERE mode = %(mode)s
+          AND dataset = %(dataset)s
+          AND start_slot >= %(start_slot)s
+          AND end_slot <= %(end_slot)s
+          AND status = 'completed'
+        ORDER BY start_slot
         """
         
-        stale_ranges = self.db.execute(select_query, {"stale_time": stale_time})
+        completed_ranges = self.db.execute(query, {
+            "mode": mode,
+            "dataset": dataset,
+            "start_slot": start_slot,
+            "end_slot": end_slot
+        })
         
-        count = 0
-        for row in stale_ranges:
-            # Use consistent batch_id
-            batch_id = f"{row['scraper_id']}:{row['table_name']}:{row['start_slot']}:{row['end_slot']}"
+        if not completed_ranges:
+            return [(start_slot, end_slot)]
             
-            insert_query = """
+        gaps = []
+        current_pos = start_slot
+        
+        for range_data in completed_ranges:
+            range_start = range_data['start_slot']
+            range_end = range_data['end_slot']
+            
+            # Gap before this range?
+            if range_start > current_pos:
+                gap_size = range_start - current_pos
+                if gap_size >= min_gap_size:
+                    gaps.append((current_pos, range_start))
+                    
+            # Move position
+            current_pos = max(current_pos, range_end)
+            
+        # Final gap?
+        if current_pos < end_slot:
+            gaps.append((current_pos, end_slot))
+            
+        return gaps
+    
+    def reset_all_processing_jobs(self) -> int:
+        """Reset all jobs stuck in processing state back to pending."""
+        try:
+            query = """
             INSERT INTO indexing_state 
-            (scraper_id, table_name, start_slot, end_slot, status, 
-             error_message, updated_at, worker_id, batch_id,
-             attempt_count, rows_indexed, started_at, completed_at, created_at)
-            VALUES 
-            (%(scraper_id)s, %(table_name)s, %(start_slot)s, %(end_slot)s, 
-             'pending', 'Reset due to timeout', now(), '', %(batch_id)s,
-             %(attempt_count)s, 0, now(), NULL, now())
+            (mode, dataset, start_slot, end_slot, status, version)
+            SELECT 
+                mode, dataset, start_slot, end_slot, 
+                'pending' as status, now() as version
+            FROM indexing_state FINAL
+            WHERE status = 'processing'
             """
             
-            self.db.execute(insert_query, {
-                "scraper_id": row['scraper_id'],
-                "table_name": row['table_name'],
-                "start_slot": row['start_slot'],
-                "end_slot": row['end_slot'],
-                "batch_id": batch_id,
-                "attempt_count": row['attempt_count'] + 1
-            })
-            count += 1
-        
-        if count > 0:
-            logger.info(f"Reset {count} stale ranges back to pending")
-        
-        return count
+            # Get count first
+            count_query = """
+            SELECT COUNT(*) as count
+            FROM indexing_state FINAL
+            WHERE status = 'processing'
+            """
+            
+            result = self.db.execute(count_query, {})
+            count = result[0]['count'] if result else 0
+            
+            if count > 0:
+                self.db.execute(query, {})
+                logger.info(f"Reset {count} processing jobs to pending status")
+            else:
+                logger.info("No processing jobs to reset")
+                
+            return count
+            
+        except Exception as e:
+            logger.error(f"Error resetting processing jobs: {e}")
+            return 0
     
-    def update_sync_position(self, scraper_id: str, table_name: str, slot: int) -> None:
-        """Update sync position for realtime mode."""
+    def reset_stale_processing_jobs(self, stale_minutes: int = None) -> int:
+        """Reset jobs that have been processing for too long."""
+        if stale_minutes is None:
+            stale_minutes = int(os.getenv("STALE_JOB_TIMEOUT_MINUTES", "30"))
+            
+        try:
+            query = """
+            INSERT INTO indexing_state 
+            (mode, dataset, start_slot, end_slot, status, version)
+            SELECT 
+                mode, dataset, start_slot, end_slot, 
+                'pending' as status, now() as version
+            FROM indexing_state FINAL
+            WHERE status = 'processing'
+              AND started_at < now() - INTERVAL %(minutes)s MINUTE
+            """
+            
+            # Get count first
+            count_query = """
+            SELECT COUNT(*) as count
+            FROM indexing_state FINAL
+            WHERE status = 'processing'
+              AND started_at < now() - INTERVAL %(minutes)s MINUTE
+            """
+            
+            result = self.db.execute(count_query, {"minutes": stale_minutes})
+            count = result[0]['count'] if result else 0
+            
+            if count > 0:
+                self.db.execute(query, {"minutes": stale_minutes})
+                logger.info(f"Reset {count} stale processing jobs to pending status")
+            else:
+                logger.info("No stale processing jobs to reset")
+                
+            return count
+            
+        except Exception as e:
+            logger.error(f"Error resetting stale processing jobs: {e}")
+            return 0
+            
+    def get_progress_summary(self, mode: str) -> Dict[str, Dict[str, Any]]:
+        """Get progress summary for all datasets in a mode."""
         query = """
-        INSERT INTO sync_position 
-        (scraper_id, table_name, last_synced_slot, updated_at)
-        VALUES 
-        (%(scraper_id)s, %(table_name)s, %(slot)s, now())
+        SELECT 
+            dataset,
+            countIf(status = 'completed') as completed_ranges,
+            countIf(status = 'pending') as pending_ranges,
+            countIf(status = 'processing') as processing_ranges,
+            countIf(status = 'failed') as failed_ranges,
+            sum(rows_indexed) as total_rows_indexed,
+            max(end_slot) as highest_slot
+        FROM indexing_state FINAL
+        WHERE mode = %(mode)s
+        GROUP BY dataset
         """
         
-        self.db.execute(query, {
-            "scraper_id": scraper_id,
-            "table_name": table_name,
-            "slot": slot
+        result = self.db.execute(query, {"mode": mode})
+        
+        summary = {}
+        for row in result:
+            summary[row['dataset']] = {
+                'completed_ranges': row['completed_ranges'],
+                'pending_ranges': row['pending_ranges'],
+                'processing_ranges': row['processing_ranges'],
+                'failed_ranges': row['failed_ranges'],
+                'total_rows_indexed': row['total_rows_indexed'] or 0,
+                'highest_slot': row['highest_slot'] or 0
+            }
+            
+        return summary
+        
+    def update_sync_position(self, mode: str, dataset: str, last_slot: int) -> None:
+        """Update sync position for continuous mode."""
+        try:
+            query = """
+            INSERT INTO sync_position (mode, dataset, last_synced_slot, updated_at)
+            VALUES (%(mode)s, %(dataset)s, %(last_slot)s, now())
+            """
+            
+            self.db.execute(query, {
+                "mode": mode,
+                "dataset": dataset,
+                "last_slot": last_slot
+            })
+            
+        except Exception as e:
+            logger.error(f"Error updating sync position: {e}")
+            
+    def get_sync_position(self, mode: str, dataset: str) -> Optional[int]:
+        """Get the last synced position."""
+        query = """
+        SELECT last_synced_slot
+        FROM sync_position FINAL
+        WHERE mode = %(mode)s AND dataset = %(dataset)s
+        ORDER BY updated_at DESC
+        LIMIT 1
+        """
+        
+        result = self.db.execute(query, {
+            "mode": mode,
+            "dataset": dataset
         })
+        
+        if result:
+            return result[0]['last_synced_slot']
+            
+        return None
+        
+    def get_last_synced_slot(self, mode: str, datasets: List[str]) -> int:
+        """Get the minimum last synced slot across datasets."""
+        if not datasets:
+            return 0
+            
+        query = """
+        SELECT MIN(last_synced_slot) as min_slot
+        FROM sync_position FINAL
+        WHERE mode = %(mode)s AND dataset IN %(datasets)s
+        """
+        
+        result = self.db.execute(query, {
+            "mode": mode,
+            "datasets": datasets
+        })
+        
+        if result and result[0]['min_slot'] is not None:
+            return result[0]['min_slot']
+            
+        return 0
+        
+    def get_failed_ranges(self, mode: str, dataset: str, start_slot: int,
+                         end_slot: int, max_attempts: int) -> List[Tuple[int, int, int, str]]:
+        """Get failed ranges that can be retried."""
+        query = """
+        SELECT start_slot, end_slot, attempt_count, error_message
+        FROM indexing_state FINAL
+        WHERE mode = %(mode)s
+          AND dataset = %(dataset)s
+          AND start_slot >= %(start_slot)s
+          AND end_slot <= %(end_slot)s
+          AND status = 'failed'
+          AND attempt_count < %(max_attempts)s
+        ORDER BY start_slot
+        """
+        
+        result = self.db.execute(query, {
+            "mode": mode,
+            "dataset": dataset,
+            "start_slot": start_slot,
+            "end_slot": end_slot,
+            "max_attempts": max_attempts
+        })
+        
+        return [(r['start_slot'], r['end_slot'], r['attempt_count'], r['error_message']) 
+                for r in result]
+                
+    def reset_failed_range(self, mode: str, dataset: str, start_slot: int, end_slot: int) -> None:
+        """Reset a failed range to pending."""
+        try:
+            query = """
+            INSERT INTO indexing_state 
+            (mode, dataset, start_slot, end_slot, status, version)
+            VALUES 
+            (%(mode)s, %(dataset)s, %(start_slot)s, %(end_slot)s, 'pending', now())
+            """
+            
+            self.db.execute(query, {
+                "mode": mode,
+                "dataset": dataset,
+                "start_slot": start_slot,
+                "end_slot": end_slot
+            })
+            
+        except Exception as e:
+            logger.error(f"Error resetting failed range: {e}")
+            
+    def count_completed_by_batch(self, mode: str, dataset: str, batch_id: str) -> int:
+        """Count completed ranges for a specific batch."""
+        query = """
+        SELECT COUNT(*) as count
+        FROM indexing_state FINAL
+        WHERE mode = %(mode)s
+          AND dataset = %(dataset)s
+          AND batch_id = %(batch_id)s
+          AND status = 'completed'
+        """
+        
+        result = self.db.execute(query, {
+            "mode": mode,
+            "dataset": dataset,
+            "batch_id": batch_id
+        })
+        
+        return result[0]['count'] if result else 0

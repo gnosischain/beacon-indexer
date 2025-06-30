@@ -1,22 +1,20 @@
 """
-Fixed worker pool service with proper parallel processing and work distribution.
+Fixed worker pool service with proper event loop management.
+This implementation correctly handles asyncio in multiprocessing workers.
 """
-import os 
 import asyncio
+import multiprocessing as mp
 import time
-import uuid
-from typing import Dict, Type, List, Optional, Any, Tuple
+import traceback
 from dataclasses import dataclass
-from queue import Queue, Empty, PriorityQueue
-from concurrent.futures import ThreadPoolExecutor, Future, as_completed
-import threading
-from collections import defaultdict
+from queue import Empty
+from typing import Dict, List, Optional, Type, Any
 
+from src.config import config
 from src.services.beacon_api_service import BeaconAPIService
 from src.services.clickhouse_service import ClickHouseService
 from src.services.state_manager import StateManager
-from src.services.bulk_insertion_service import BulkInsertionService
-from src.utils.logger import logger
+from src.utils.logger import logger, setup_logger
 from src.scrapers.base_scraper import BaseScraper
 from src.utils.specs_manager import SpecsManager
 
@@ -24,614 +22,468 @@ from src.utils.specs_manager import SpecsManager
 @dataclass
 class WorkItem:
     """Represents a unit of work for the pool."""
-    range_id: str
     scraper_id: str
-    table_name: str
     start_slot: int
     end_slot: int
+    worker_batch_size: int
     priority: int = 0
-    attempt: int = 0
-    
-    def __lt__(self, other):
-        """For priority queue ordering."""
-        return self.priority > other.priority  # Higher priority first
 
 
-@dataclass  
+@dataclass
 class WorkResult:
-    """Result from processing a work item."""
-    range_id: str
+    """Result of processing a work item."""
     scraper_id: str
-    table_name: str
     start_slot: int
     end_slot: int
     success: bool
     rows_indexed: int = 0
-    error: Optional[str] = None
+    error_message: Optional[str] = None
     duration: float = 0.0
 
 
+@dataclass
 class WorkerContext:
-    """Context for each worker thread with its own connections."""
-    
-    def __init__(self, worker_id: str, beacon_url: str, clickhouse_config: dict):
-        self.worker_id = worker_id
-        self.beacon_url = beacon_url
-        self.clickhouse_config = clickhouse_config
-        self._beacon_api = None
-        self._clickhouse = None
-        self._bulk_inserter = None
-        self._state_manager = None
-        self._loop = None
-        self._connection_retry_count = 3
-        self._connection_retry_delay = 2  # seconds
-        
-    @property
-    def loop(self) -> asyncio.AbstractEventLoop:
-        """Get or create event loop for this thread."""
-        if self._loop is None:
-            self._loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self._loop)
-        return self._loop
-        
-    @property
-    def beacon_api(self) -> BeaconAPIService:
-        """Get thread-local beacon API instance."""
-        if self._beacon_api is None:
-            self._beacon_api = BeaconAPIService(self.beacon_url)
-            # Start the beacon API in this thread's event loop
-            self.loop.run_until_complete(self._beacon_api.start())
-        return self._beacon_api
-        
-    @property
-    def clickhouse(self) -> ClickHouseService:
-        """Get thread-local ClickHouse instance with retry logic."""
-        if self._clickhouse is None:
-            for attempt in range(self._connection_retry_count):
-                try:
-                    self._clickhouse = ClickHouseService(
-                        host=self.clickhouse_config['host'],
-                        port=self.clickhouse_config['port'],
-                        user=self.clickhouse_config['user'],
-                        password=self.clickhouse_config['password'],
-                        database=self.clickhouse_config['database'],
-                        secure=self.clickhouse_config['secure'],
-                        verify=self.clickhouse_config['verify']
-                    )
-                    logger.info(f"{self.worker_id} successfully connected to ClickHouse")
-                    break
-                except Exception as e:
-                    if attempt < self._connection_retry_count - 1:
-                        logger.warning(f"{self.worker_id} ClickHouse connection attempt {attempt + 1} failed, retrying...")
-                        time.sleep(self._connection_retry_delay)
-                    else:
-                        logger.error(f"{self.worker_id} failed to connect to ClickHouse after {self._connection_retry_count} attempts")
-                        raise
-        return self._clickhouse
-        
-    @property
-    def bulk_inserter(self) -> BulkInsertionService:
-        """Get thread-local bulk inserter."""
-        if self._bulk_inserter is None:
-            self._bulk_inserter = BulkInsertionService(
-                clickhouse_service=self.clickhouse,
-                max_parallel_inserts=2,
-                batch_size=500  # Smaller batch size for more frequent flushes
-            )
-        return self._bulk_inserter
-        
-    @property
-    def state_manager(self) -> StateManager:
-        """Get thread-local state manager."""
-        if self._state_manager is None:
-            self._state_manager = StateManager(self.clickhouse)
-        return self._state_manager
-        
-    def cleanup(self):
-        """Clean up resources."""
-        if self._bulk_inserter:
-            self._bulk_inserter.flush_all()  # Final flush
-            self._bulk_inserter.stop()
-        if self._loop:
-            self._loop.close()
+    """Context for a worker process."""
+    worker_id: str
+    beacon_api: BeaconAPIService
+    clickhouse: ClickHouseService
+    state_manager: StateManager
+    specs_manager: Optional[SpecsManager]
+    scrapers: Dict[str, BaseScraper]
 
 
 class WorkerPoolService:
     """
-    Thread-based worker pool for parallel processing of beacon chain data.
+    Fixed implementation with proper event loop handling.
+    Uses multiprocessing with asyncio for parallel beacon chain scraping.
     """
     
     def __init__(
-        self, 
+        self,
         beacon_url: str,
-        clickhouse_config: dict,
-        scraper_classes: Dict[str, Type[BaseScraper]],
-        num_workers: int = 4,
-        existing_clickhouse: Optional[ClickHouseService] = None
+        clickhouse_config: Optional[Dict] = None,
+        existing_clickhouse: Optional[ClickHouseService] = None,
+        scraper_classes: Dict[str, Type[BaseScraper]] = None,
+        specs_manager: Optional[SpecsManager] = None,
+        num_workers: int = 4
     ):
         self.beacon_url = beacon_url
         self.clickhouse_config = clickhouse_config
-        self.scraper_classes = scraper_classes
+        self.existing_clickhouse = existing_clickhouse
+        self.scraper_classes = scraper_classes or {}
+        self.specs_manager = specs_manager
         self.num_workers = num_workers
         
-        # Work management
-        self.work_queue = PriorityQueue()
-        self.results_queue = Queue()
-        self.completed_work = set()
-        self.active_work = {}
+        # Multiprocessing components
+        self.work_queue = mp.Queue()
+        self.result_queue = mp.Queue()
+        self.stop_event = mp.Event()
         
-        # Thread pool
-        self.executor = ThreadPoolExecutor(max_workers=num_workers)
-        self.worker_futures = []
+        # Worker processes
+        self.workers = []
         
-        # Control flags
-        self.running = False
-        self.lock = threading.Lock()
-        
-        # Monitoring
+        # Statistics
         self.stats = {
             'work_distributed': 0,
-            'work_started': 0,
             'work_completed': 0,
             'work_failed': 0,
-            'total_rows': 0,
-            'worker_errors': 0
+            'total_rows': 0
         }
         
-        # Managers that are set later
-        self.specs_manager = None
-        self.state_manager = StateManager(existing_clickhouse) if existing_clickhouse else None
-        
-    def set_specs_manager(self, specs_manager: SpecsManager):
-        """Set the specs manager."""
-        self.specs_manager = specs_manager
-        
-    def set_state_manager(self, state_manager: StateManager):
-        """Set the state manager."""
-        self.state_manager = state_manager
+        # Progress tracking
+        self.progress_log_interval = 100
         
     async def process_range(self, start_slot: int, end_slot: int):
         """Process a range of slots using the worker pool."""
         logger.info(f"Starting worker pool processing for slots {start_slot}-{end_slot}")
         
-        self.running = True
+        # Start workers
+        self._start_workers()
         
-        # Start worker threads
-        for i in range(self.num_workers):
-            worker_id = f"worker-{i+1}"
-            future = self.executor.submit(self._worker_thread, worker_id)
-            self.worker_futures.append(future)
-            
+        # Start monitoring tasks
+        monitor_task = asyncio.create_task(self._monitor_progress())
+        distribute_task = asyncio.create_task(self._distribute_work(start_slot, end_slot))
+        collect_task = asyncio.create_task(self._collect_results())
+        
         try:
-            # Start monitoring task
-            monitor_task = asyncio.create_task(self._monitor_progress())
+            # Wait for distribution to complete
+            await distribute_task
             
-            # Distribute work
-            await self._distribute_work(end_slot)
+            # Wait for all work to be processed
+            await self._wait_for_completion()
             
-            # Wait for completion
-            await self._wait_for_completion(end_slot)
+            # Stop the workers
+            self.stop_event.set()
             
-        finally:
-            # Stop workers
-            self.running = False
+            # Cancel monitoring tasks
+            monitor_task.cancel()
+            collect_task.cancel()
             
             # Wait for workers to finish
-            for future in as_completed(self.worker_futures, timeout=30):
-                try:
-                    future.result()
-                except Exception as e:
-                    logger.error(f"Worker error: {e}")
+            for worker in self.workers:
+                worker.join(timeout=10)
+                if worker.is_alive():
+                    logger.warning(f"Worker {worker.name} did not stop gracefully")
+                    worker.terminate()
                     
-            # Cancel monitoring
-            monitor_task.cancel()
+        except Exception as e:
+            logger.error(f"Error in worker pool processing: {e}")
+            self.stop_event.set()
+            raise
+        finally:
+            # Log final statistics
+            logger.info(
+                f"Worker pool completed: "
+                f"{self.stats['work_completed']} successful, "
+                f"{self.stats['work_failed']} failed, "
+                f"{self.stats['total_rows']} total rows"
+            )
             
-            # Shutdown executor
-            self.executor.shutdown(wait=True)
+    def _start_workers(self):
+        """Start worker processes."""
+        for i in range(self.num_workers):
+            worker_id = f"worker-{i+1}"
+            worker = mp.Process(
+                target=self._worker_process,
+                args=(worker_id,),
+                name=worker_id
+            )
+            worker.start()
+            self.workers.append(worker)
+            logger.info(f"{worker_id} started")
             
-            logger.info("Worker pool shut down")
-            
-    async def _wait_for_completion(self, end_slot: int):
-        """Wait for all work to be completed."""
-        # Reuse the main StateManager's connection for monitoring
-        while self.running:
-            # Check if all work is done using the state manager
-            progress = self.state_manager.db.execute("""
-                SELECT 
-                    countIf(status = 'completed') as completed,
-                    countIf(status = 'processing') as processing,
-                    countIf(status = 'pending') as pending,
-                    countIf(status = 'failed') as failed
-                FROM indexing_state FINAL
-                WHERE start_slot < %(end_slot)s
-            """, {"end_slot": end_slot})
-            
-            if progress:
-                stats = progress[0]
-                if stats['pending'] == 0 and stats['processing'] == 0:
-                    logger.info("All work completed!")
-                    break
-            
-            await asyncio.sleep(5)
-    
-    async def _distribute_work(self, end_slot: int):
-        """Continuously distribute work to workers."""
-        distributed_count = 0
-        seen_ranges = set()
+    def _worker_process(self, worker_id: str):
+        """
+        Worker process main loop.
+        FIXED: Properly creates and manages its own event loop.
+        """
+        # Set up worker-specific logger
+        worker_logger = setup_logger(worker_id, log_level="INFO")
         
-        logger.info("Starting work distribution...")
-        
-        # Pre-calculate validator ranges if validator scraper is enabled
-        validator_ranges = set()
-        if "validator_scraper" in self.scraper_classes:
-            # Get all possible ranges
-            all_ranges = []
-            range_size = int(os.getenv("STATE_RANGE_SIZE", "10000"))
-            current = 0
-            while current < end_slot:
-                range_end = min(current + range_size - 1, end_slot)
-                all_ranges.append((current, range_end))
-                current = range_end + 1
-            
-            # Filter to only those with validator slots
-            from src.scrapers.validator_scraper import ValidatorScraper
-            validator_ranges_list = []
-            for start, end in all_ranges:
-                target_slots = ValidatorScraper.get_target_slots_in_range(
-                    start, end, self.state_manager.db
-                )
-                if target_slots:
-                    validator_ranges.add((start, end))
-                    validator_ranges_list.append((start, end))
-            
-            logger.info(f"Found {len(validator_ranges)} ranges containing validator target slots")
-        
-        while self.running:
-            work_found = False
-            
-            # Check each scraper/table combination for work
-            for scraper_id, scraper_class in self.scraper_classes.items():
-                # Create temporary instance to get tables
-                temp_scraper = scraper_class(None, None)
-                tables = temp_scraper.get_tables_written()
-                
-                for table_name in tables:
-                    # For validator scraper, only check ranges with target slots
-                    if scraper_id == "validator_scraper" and table_name == "validators":
-                        # Only get ranges that contain validator slots
-                        for start_slot, range_end in validator_ranges:
-                            range_key = f"{scraper_id}:{table_name}:{start_slot}:{range_end}"
-                            
-                            if range_key in seen_ranges:
-                                continue
-                            
-                            # Check if this range needs processing
-                            status = self.state_manager._get_latest_status(
-                                scraper_id, table_name, start_slot, range_end
-                            )
-                            
-                            if not status or status['status'] in ['pending', 'failed']:
-                                seen_ranges.add(range_key)
-                                
-                                work_item = WorkItem(
-                                    range_id=range_key,
-                                    scraper_id=scraper_id,
-                                    table_name=table_name,
-                                    start_slot=start_slot,
-                                    end_slot=range_end,
-                                    priority=self._calculate_priority(scraper_id, start_slot)
-                                )
-                                
-                                self.work_queue.put(work_item)
-                                distributed_count += 1
-                                work_found = True
-                                
-                                with self.lock:
-                                    self.stats['work_distributed'] += 1
-                    else:
-                        # Regular scraper - process all ranges
-                        range_info = self.state_manager.get_next_range(
-                            scraper_id, table_name, 
-                            f"pool-coordinator", 
-                            end_slot
-                        )
-                        
-                        if range_info:
-                            start_slot, range_end = range_info
-                            range_key = f"{scraper_id}:{table_name}:{start_slot}:{range_end}"
-                            
-                            if range_key not in seen_ranges:
-                                seen_ranges.add(range_key)
-                                
-                                work_item = WorkItem(
-                                    range_id=range_key,
-                                    scraper_id=scraper_id,
-                                    table_name=table_name,
-                                    start_slot=start_slot,
-                                    end_slot=range_end,
-                                    priority=self._calculate_priority(scraper_id, start_slot)
-                                )
-                                
-                                self.work_queue.put(work_item)
-                                distributed_count += 1
-                                work_found = True
-                                
-                                with self.lock:
-                                    self.stats['work_distributed'] += 1
-                        
-            if not work_found:
-                # No more work found, wait a bit before checking again
-                await asyncio.sleep(2)
-                
-        logger.info(f"Work distribution complete. Distributed {distributed_count} items")
-    
-    def _calculate_priority(self, scraper_id: str, start_slot: int) -> int:
-        """Calculate priority for a work item."""
-        # Higher priority for core scrapers and lower slots
-        priority = 1000000 - start_slot  # Lower slots first
-        
-        if scraper_id == "core_block_scraper":
-            priority += 1000000  # Highest priority
-        elif scraper_id == "block_scraper":
-            priority += 500000
-            
-        return priority
-    
-    def _worker_thread(self, worker_id: str):
-        """Worker thread that processes work items."""
-        logger.info(f"{worker_id} started")
-        
-        # Create worker context
-        context = WorkerContext(worker_id, self.beacon_url, self.clickhouse_config)
+        # Create new event loop for this process
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         
         try:
-            while self.running:
-                try:
-                    # Get work item with timeout
-                    work_item = self.work_queue.get(timeout=5)
-                    
-                    with self.lock:
-                        self.active_work[worker_id] = work_item
-                        self.stats['work_started'] += 1
-                    
-                    # Process the work
-                    result = self._process_work_item(work_item, context)
-                    
-                    # Store result
-                    self.results_queue.put(result)
-                    
-                    with self.lock:
-                        if worker_id in self.active_work:
-                            del self.active_work[worker_id]
-                        self.completed_work.add(work_item.range_id)
-                        
-                        if result.success:
-                            self.stats['work_completed'] += 1
-                            self.stats['total_rows'] += result.rows_indexed
-                        else:
-                            self.stats['work_failed'] += 1
-                    
-                except Empty:
-                    continue
-                except Exception as e:
-                    logger.error(f"{worker_id} error: {e}")
-                    with self.lock:
-                        self.stats['worker_errors'] += 1
+            # Run the async worker loop
+            loop.run_until_complete(self._async_worker_loop(worker_id, worker_logger))
+        except Exception as e:
+            worker_logger.error(f"Fatal error in worker: {e}")
+            worker_logger.error(traceback.format_exc())
         finally:
-            context.cleanup()
-            logger.info(f"{worker_id} stopped")
-    
-    def _process_work_item(self, work_item: WorkItem, context: WorkerContext) -> WorkResult:
+            # Clean up the event loop
+            try:
+                loop.close()
+            except:
+                pass
+            worker_logger.info(f"{worker_id} shutting down")
+            
+    async def _async_worker_loop(self, worker_id: str, worker_logger):
+        """
+        Async worker loop that runs in each worker process.
+        """
+        # Create worker context with proper async initialization
+        context = await self._create_worker_context_async(worker_id)
+        
+        # Process work items
+        while not self.stop_event.is_set():
+            try:
+                # Get work item with timeout (non-blocking check)
+                try:
+                    work_item = self.work_queue.get_nowait()
+                except Empty:
+                    # No work available, wait a bit
+                    await asyncio.sleep(0.1)
+                    continue
+                
+                # Process the work item
+                result = await self._process_work_item(context, work_item)
+                
+                # Put result in queue
+                self.result_queue.put(result)
+                
+            except Exception as e:
+                worker_logger.error(f"Error processing work item: {e}")
+                worker_logger.error(traceback.format_exc())
+                # Create error result
+                if 'work_item' in locals():
+                    error_result = WorkResult(
+                        scraper_id=work_item.scraper_id,
+                        start_slot=work_item.start_slot,
+                        end_slot=work_item.end_slot,
+                        success=False,
+                        error_message=str(e)
+                    )
+                    self.result_queue.put(error_result)
+                    
+        # Clean up resources
+        if context.beacon_api:
+            await context.beacon_api.stop()
+            
+    async def _create_worker_context_async(self, worker_id: str) -> WorkerContext:
+        """
+        Create worker context with proper async initialization.
+        FIXED: Properly initializes BeaconAPIService with await.
+        """
+        # Create new beacon API instance for this worker
+        beacon_api = BeaconAPIService(self.beacon_url)
+        await beacon_api.start()  # Properly await the start
+        
+        if self.existing_clickhouse:
+            # Use thread-safe client from existing connection
+            clickhouse = self.existing_clickhouse.get_threadsafe_client()
+        else:
+            clickhouse = ClickHouseService(**self.clickhouse_config)
+            
+        state_manager = StateManager(clickhouse)
+        
+        # Create scraper instances with correct IDs
+        scrapers = {}
+        for scraper_id, scraper_class in self.scraper_classes.items():
+            scraper = scraper_class(beacon_api, clickhouse)
+            # Ensure the scraper has the correct ID
+            scraper.scraper_id = scraper_id
+            if self.specs_manager:
+                scraper.set_specs_manager(self.specs_manager)
+            if hasattr(scraper, 'set_state_manager'):
+                scraper.set_state_manager(state_manager)
+            scrapers[scraper_id] = scraper
+            
+        return WorkerContext(
+            worker_id=worker_id,
+            beacon_api=beacon_api,
+            clickhouse=clickhouse,
+            state_manager=state_manager,
+            specs_manager=self.specs_manager,
+            scrapers=scrapers
+        )
+        
+    async def _process_work_item(self, context: WorkerContext, work_item: WorkItem) -> WorkResult:
         """Process a single work item."""
         start_time = time.time()
         
         try:
-            # Create scraper instance
-            scraper_class = self.scraper_classes[work_item.scraper_id]
-            scraper = scraper_class(context.beacon_api, context.clickhouse)
+            # Get the scraper
+            scraper = context.scrapers.get(work_item.scraper_id)
+            if not scraper:
+                raise ValueError(f"Unknown scraper ID: {work_item.scraper_id}")
+                
+            # Process the slot range
+            logger.info(
+                f"{context.worker_id} processing {work_item.scraper_id} "
+                f"slots {work_item.start_slot}-{work_item.end_slot}"
+            )
             
-            # Set managers
-            if self.specs_manager:
-                scraper.set_specs_manager(self.specs_manager)
-            if self.state_manager:
-                scraper.set_state_manager(self.state_manager)
+            rows_indexed = 0
             
-            # Inject bulk inserter
-            scraper._bulk_inserter = context.bulk_inserter
-            
-            # Reset row counts
-            scraper.reset_row_counts()
-            
-            # Special handling for validator scraper
-            if work_item.scraper_id == "validator_scraper" and work_item.table_name == "validators":
-                # Check if this range has any validator target slots
-                if hasattr(scraper, 'get_target_slots_in_range'):
-                    target_slots = scraper.get_target_slots_in_range(
-                        work_item.start_slot, work_item.end_slot, context.clickhouse
-                    )
-                    if not target_slots:
-                        # No target slots in this range, mark as completed with 0 rows
-                        logger.info(f"{context.worker_id} skipping {work_item.range_id} - no validator target slots")
-                        
-                        # Claim and immediately complete the range
-                        if context.state_manager.claim_range(
-                            work_item.scraper_id, work_item.table_name,
-                            work_item.start_slot, work_item.end_slot,
-                            context.worker_id
-                        ):
-                            context.state_manager.complete_range(
-                                work_item.scraper_id, work_item.table_name,
-                                work_item.start_slot, work_item.end_slot,
-                                0  # 0 rows
-                            )
-                        
-                        return WorkResult(
-                            range_id=work_item.range_id,
-                            scraper_id=work_item.scraper_id,
-                            table_name=work_item.table_name,
-                            start_slot=work_item.start_slot,
-                            end_slot=work_item.end_slot,
-                            success=True,
-                            rows_indexed=0,
-                            duration=time.time() - start_time
-                        )
-            
-            # Process slots in the range
-            batch_size = int(os.getenv("WORKER_BATCH_SIZE", "100"))
-            current = work_item.start_slot
-            
-            logger.info(f"{context.worker_id} processing {work_item.range_id}")
-            
-            # Try to claim the range for the specific table in the work item
-            if not context.state_manager.claim_range(
-                work_item.scraper_id, work_item.table_name,
-                work_item.start_slot, work_item.end_slot,
-                context.worker_id
-            ):
-                # Already being processed
-                logger.warning(f"{context.worker_id} failed to claim {work_item.range_id} - already claimed")
-                return WorkResult(
-                    range_id=work_item.range_id,
-                    scraper_id=work_item.scraper_id,
-                    table_name=work_item.table_name,
-                    start_slot=work_item.start_slot,
-                    end_slot=work_item.end_slot,
-                    success=False,
-                    error="Range already claimed",
-                    duration=time.time() - start_time
+            # Process in batches
+            for batch_start in range(work_item.start_slot, work_item.end_slot, work_item.worker_batch_size):
+                batch_end = min(batch_start + work_item.worker_batch_size, work_item.end_slot)
+                
+                # Claim the range for processing
+                claimed = context.state_manager.claim_range(
+                    mode='historical',  # or work_item.mode if available
+                    dataset=work_item.scraper_id,
+                    start_slot=batch_start,
+                    end_slot=batch_end,
+                    worker_id=context.worker_id,
+                    batch_id=str(batch_start)
                 )
-            
-            # Process the range
-            slots_processed = 0
-            blocks_found = 0
-            
-            while current < work_item.end_slot:
-                batch_end = min(current + batch_size, work_item.end_slot)
                 
-                # Process batch of slots
-                for slot in range(current, batch_end):
-                    try:
-                        # Fetch actual block data
-                        block_data = context.loop.run_until_complete(
-                            context.beacon_api.get_block(str(slot))
-                        )
-                        
-                        # Process with scraper - it will write to all its tables
-                        context.loop.run_until_complete(scraper.process(block_data))
-                        blocks_found += 1
-                        
-                    except Exception as e:
-                        if "404" not in str(e):  # Log non-404 errors
-                            logger.debug(f"Error processing slot {slot}: {e}")
-                    
-                    slots_processed += 1
-                    
-                    # Periodic flush every 100 slots
-                    if slots_processed % 100 == 0:
-                        context.bulk_inserter.flush_all()
-                        logger.debug(f"{context.worker_id} flushed after {slots_processed} slots")
+                if not claimed:
+                    logger.warning(f"Could not claim range {batch_start}-{batch_end}")
+                    continue
                 
-                # Flush after each batch
-                context.bulk_inserter.flush_all()
-                current = batch_end
-            
-            # Final flush to ensure all data is written
-            context.bulk_inserter.flush_all()
-            
-            # Log queue sizes for debugging
-            queue_sizes = context.bulk_inserter.get_queue_sizes()
-            if any(size > 0 for size in queue_sizes.values()):
-                logger.warning(f"{context.worker_id} has unflushed data: {queue_sizes}")
-                # Force another flush
-                context.bulk_inserter.flush_all()
-            
-            # Get final row counts for the specific table we're tracking
-            row_counts = scraper.get_row_counts()
-            table_rows = row_counts.get(work_item.table_name, 0)
-            
-            # Mark range as completed only for the table we claimed
+                # Process the batch
+                batch_rows = await self._process_batch(
+                    context,
+                    scraper,
+                    batch_start,
+                    batch_end
+                )
+                
+                rows_indexed += batch_rows
+                
+                # Mark batch as completed
+                context.state_manager.complete_range(
+                    mode='historical',
+                    dataset=work_item.scraper_id,
+                    start_slot=batch_start,
+                    end_slot=batch_end,
+                    rows_indexed=batch_rows
+                )
+                
+            # Mark the entire work item as completed
             context.state_manager.complete_range(
-                work_item.scraper_id, work_item.table_name,
-                work_item.start_slot, work_item.end_slot,
-                table_rows
+                mode='historical',
+                dataset=work_item.scraper_id,
+                start_slot=work_item.start_slot,
+                end_slot=work_item.end_slot,
+                rows_indexed=rows_indexed
             )
             
             duration = time.time() - start_time
-            logger.info(
-                f"{context.worker_id} completed {work_item.range_id} in {duration:.2f}s "
-                f"({table_rows} rows, {blocks_found} blocks found, {slots_processed} slots processed)"
-            )
             
             return WorkResult(
-                range_id=work_item.range_id,
                 scraper_id=work_item.scraper_id,
-                table_name=work_item.table_name,
                 start_slot=work_item.start_slot,
                 end_slot=work_item.end_slot,
                 success=True,
-                rows_indexed=table_rows,
+                rows_indexed=rows_indexed,
                 duration=duration
             )
             
         except Exception as e:
-            error_msg = str(e)
-            logger.error(f"{context.worker_id} failed {work_item.range_id}: {error_msg}")
+            logger.error(f"Error processing work item: {e}")
+            logger.error(traceback.format_exc())
             
-            # Mark range as failed for the table we were processing
+            # Mark as failed in state manager
             context.state_manager.fail_range(
-                work_item.scraper_id, work_item.table_name,
-                work_item.start_slot, work_item.end_slot,
-                error_msg
+                mode='historical',
+                dataset=work_item.scraper_id,
+                start_slot=work_item.start_slot,
+                end_slot=work_item.end_slot,
+                error_message=str(e)
             )
             
             return WorkResult(
-                range_id=work_item.range_id,
                 scraper_id=work_item.scraper_id,
-                table_name=work_item.table_name,
                 start_slot=work_item.start_slot,
                 end_slot=work_item.end_slot,
                 success=False,
-                error=error_msg,
+                error_message=str(e),
                 duration=time.time() - start_time
             )
-    
+            
+    async def _process_batch(
+        self,
+        context: WorkerContext,
+        scraper: BaseScraper,
+        start_slot: int,
+        end_slot: int
+    ) -> int:
+        """Process a batch of slots."""
+        rows_indexed = 0
+        
+        # Use BlockProcessor for proper block fetching and processing
+        from src.utils.block_processor import BlockProcessor
+        block_processor = BlockProcessor(context.beacon_api)
+        
+        # Create processor function list
+        processors = [scraper.process]
+        
+        # Process slots
+        for slot in range(start_slot, end_slot):
+            try:
+                # Use block processor which handles the block fetching properly
+                success = await block_processor.get_and_process_block(slot, processors)
+                if success:
+                    rows_indexed += 1
+                    
+            except Exception as e:
+                logger.error(f"Error processing slot {slot}: {e}")
+                # Continue with next slot
+                
+        return rows_indexed
+        
+    async def _distribute_work(self, start_slot: int, end_slot: int):
+        """Distribute work items to the queue."""
+        logger.info(f"Distributing work for slots {start_slot}-{end_slot}")
+        
+        # Calculate work items per scraper
+        for scraper_id in self.scraper_classes.keys():
+            # Create work items for this scraper
+            slot_range = end_slot - start_slot
+            items_per_scraper = max(1, slot_range // (self.num_workers * 2))
+            
+            for work_start in range(start_slot, end_slot, items_per_scraper):
+                work_end = min(work_start + items_per_scraper, end_slot)
+                
+                work_item = WorkItem(
+                    scraper_id=scraper_id,
+                    start_slot=work_start,
+                    end_slot=work_end,
+                    worker_batch_size=100,
+                    priority=self._calculate_priority(work_start)
+                )
+                
+                self.work_queue.put(work_item)
+                self.stats['work_distributed'] += 1
+                
+        logger.info(f"Distributed {self.stats['work_distributed']} work items")
+        
+    def _calculate_priority(self, start_slot: int) -> int:
+        """Calculate priority for work item."""
+        # Simple priority: earlier slots have higher priority
+        return start_slot
+        
+    async def _collect_results(self):
+        """Collect results from workers."""
+        while not self.stop_event.is_set() or not self.result_queue.empty():
+            try:
+                # Check for results (non-blocking)
+                try:
+                    result = self.result_queue.get_nowait()
+                except Empty:
+                    await asyncio.sleep(0.1)
+                    continue
+                
+                # Update statistics
+                if result.success:
+                    self.stats['work_completed'] += 1
+                    self.stats['total_rows'] += result.rows_indexed
+                else:
+                    self.stats['work_failed'] += 1
+                    
+                # Log progress if needed
+                if (self.stats['work_completed'] + self.stats['work_failed']) % self.progress_log_interval == 0:
+                    await self._log_progress()
+                    
+            except Exception as e:
+                logger.error(f"Error collecting results: {e}")
+                
+    async def _wait_for_completion(self):
+        """Wait for all work to be completed."""
+        logger.info("Waiting for all work to complete...")
+        
+        while True:
+            # Check if all work is done
+            total_processed = self.stats['work_completed'] + self.stats['work_failed']
+            
+            if total_processed >= self.stats['work_distributed']:
+                logger.info("All work items processed")
+                break
+                
+            # Check if workers are still alive
+            alive_workers = sum(1 for w in self.workers if w.is_alive())
+            if alive_workers == 0:
+                logger.error("All workers have died!")
+                break
+                
+            await asyncio.sleep(1)
+            
     async def _monitor_progress(self):
         """Monitor and log progress periodically."""
-        log_interval = int(os.getenv("WORKER_PROGRESS_LOG_INTERVAL", "30"))
-        
-        while self.running:
-            await asyncio.sleep(log_interval)
-            
-            with self.lock:
-                stats = self.stats.copy()
-                active = len(self.active_work)
+        while not self.stop_event.is_set():
+            try:
+                await asyncio.sleep(30)  # Log every 30 seconds
+                await self._log_progress()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in progress monitor: {e}")
                 
-            # Query database for overall progress
-            db_stats = self.state_manager.db.execute("""
-                SELECT 
-                    countIf(status = 'completed') as completed,
-                    countIf(status = 'processing') as processing,
-                    countIf(status = 'pending') as pending,
-                    countIf(status = 'failed') as failed,
-                    sum(rows_indexed) as total_rows
-                FROM indexing_state FINAL
-            """)
-            
-            if db_stats:
-                db_stats = db_stats[0]
-                logger.info(
-                    f"Progress: {db_stats['completed']} completed, "
-                    f"{db_stats['processing']} processing, "
-                    f"{db_stats['pending']} pending, "
-                    f"{db_stats['failed']} failed, "
-                    f"{active} active workers, "
-                    f"{db_stats['total_rows']:,} total rows"
-                )
-            
-            # Log worker stats
+    async def _log_progress(self):
+        """Log current progress."""
+        total = self.stats['work_distributed']
+        completed = self.stats['work_completed']
+        failed = self.stats['work_failed']
+        
+        if total > 0:
+            progress = ((completed + failed) / total) * 100
             logger.info(
-                f"Worker stats: {stats['work_distributed']} distributed, "
-                f"{stats['work_started']} started, "
-                f"{stats['work_completed']} completed, "
-                f"{stats['work_failed']} failed"
+                f"Progress: {progress:.1f}% "
+                f"({completed} completed, {failed} failed, "
+                f"{total - completed - failed} pending), "
+                f"Total rows: {self.stats['total_rows']}"
             )
