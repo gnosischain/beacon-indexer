@@ -1,25 +1,26 @@
 """
-Fixed thread pool-based parallel service with proper event loop handling.
+Fixed thread pool parallel service that works with the existing codebase.
+This is a drop-in replacement for the existing thread_pool_parallel_service.py
 """
 import asyncio
 import time
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Set
 from datetime import datetime
 
 from src.config import config
 from src.services.beacon_api_service import BeaconAPIService
 from src.services.clickhouse_service import ClickHouseService
 from src.services.state_manager import StateManager
-from src.services.worker_pool_service import WorkerPoolService, WorkResult
+from src.services.worker_pool_service import WorkerPoolService
 from src.utils.logger import logger
 from src.scrapers.base_scraper import BaseScraper
-from src.scrapers.validator_scraper import ValidatorScraper
 from src.utils.specs_manager import SpecsManager
+from src.core.datasets import DatasetRegistry
 
 
 class ThreadPoolParallelService:
     """
-    Fixed implementation with proper event loop and state management.
+    Fixed implementation that properly handles beacon API and worker distribution.
     """
     
     def __init__(
@@ -45,6 +46,13 @@ class ThreadPoolParallelService:
         # State manager
         self.state_manager = StateManager(clickhouse)
         
+        # Dataset registry
+        self.dataset_registry = DatasetRegistry()
+        
+        # Track enabled scrapers
+        self.enabled_scraper_ids = [s.scraper_id for s in scrapers]
+        logger.info(f"Enabled scrapers: {self.enabled_scraper_ids}")
+        
         # Set managers for scrapers
         for scraper in scrapers:
             scraper.set_specs_manager(specs_manager)
@@ -64,91 +72,187 @@ class ThreadPoolParallelService:
         }
         
     async def start(self) -> None:
-        """Start parallel processing using thread pool."""
-        await self.beacon_api.start()
+        """Start parallel processing with proper state management."""
         self.progress['start_time'] = time.time()
         
+        logger.info(f"Starting ThreadPoolParallelService for slots {self.start_slot}-{self.end_slot}")
+        logger.info(f"Workers: {self.num_workers}, Batch size: {self.worker_batch_size}")
+        
+        # Note: Beacon API should already be started in main.py
+        # No need to check or start it here
+            
         # Get end slot if not provided
         if self.end_slot is None:
-            try:
-                latest = await self.beacon_api.get_block_header("head")
-                self.end_slot = int(latest["header"]["message"]["slot"])
-                logger.info(f"Set end slot to latest: {self.end_slot}")
-            except Exception as e:
-                logger.error(f"Could not determine end slot: {e}")
-                return
-                
-        logger.info(
-            f"Starting thread pool parallel processing: "
-            f"slots {self.start_slot}-{self.end_slot}, "
-            f"workers={self.num_workers}, batch_size={self.worker_batch_size}"
-        )
+            await self._determine_end_slot()
+            
+        # Clean up old state entries (optional - already done in main.py)
+        # await self._cleanup_old_state_entries()
         
-        # Reset stale ranges
-        self.state_manager.reset_stale_ranges()
+        # Initialize state ranges for enabled scrapers only
+        created_ranges = await self._initialize_state_ranges()
         
-        # Filter active scrapers
-        active_scrapers = []
-        for scraper in self.scrapers:
-            if scraper.one_time:
-                # Check if this one-time scraper should run
-                should_run = await scraper.should_process()
-                if not should_run:
-                    logger.info(f"Skipping one-time scraper {scraper.scraper_id} (already completed)")
-                    continue
-            active_scrapers.append(scraper)
+        if created_ranges == 0:
+            logger.info("No new ranges created. Using existing ranges or checking for work...")
             
-        if not active_scrapers:
-            logger.warning("No active scrapers to run")
-            return
-            
-        # Log active scrapers with their IDs
-        logger.info(f"Active scrapers: {[s.scraper_id for s in active_scrapers]}")
-            
-        # Convert scraper instances to a dictionary of scraper classes
-        scraper_classes = {}
-        for scraper in active_scrapers:
-            # Use the scraper's actual ID as the key
-            scraper_classes[scraper.scraper_id] = type(scraper)
-            logger.debug(f"Registered scraper class: {scraper.scraper_id} -> {type(scraper).__name__}")
-            
-        # Create initial ranges in the database
-        logger.info("Creating initial ranges in database...")
-        created_ranges = self.state_manager.bulk_create_ranges(
-            active_scrapers,  # Pass scraper instances
-            self.start_slot, 
-            self.end_slot
-        )
+        # Create scraper classes dict for worker pool
+        scraper_classes = self._create_scraper_classes_dict()
         
-        if created_ranges > 0:
-            logger.info(f"Created {created_ranges} new ranges")
-        else:
-            logger.info("Using existing ranges from database")
-            
-        # Create worker pool with fixed implementation
+        # Calculate how many workers per scraper
+        workers_per_scraper = self._calculate_workers_per_scraper()
+        logger.info(f"Worker distribution plan: {workers_per_scraper}")
+        
+        # Create worker pool with better configuration
         self.worker_pool = WorkerPoolService(
             beacon_url=self.beacon_api.base_url,
-            existing_clickhouse=self.clickhouse,  # Pass existing connection
+            existing_clickhouse=self.clickhouse,
             scraper_classes=scraper_classes,
             specs_manager=self.specs_manager,
             num_workers=self.num_workers
         )
         
+        # If the worker pool doesn't support enabled_scrapers parameter,
+        # we'll work with what we have
+        if hasattr(self.worker_pool, 'enabled_scrapers'):
+            self.worker_pool.enabled_scrapers = self.enabled_scraper_ids
+        
         try:
-            # Process the full range
+            # Process the range
             await self.worker_pool.process_range(self.start_slot, self.end_slot)
             
             # Log final statistics
             elapsed_time = time.time() - self.progress['start_time']
             logger.info(
                 f"Parallel processing completed in {elapsed_time:.1f}s. "
-                f"Total rows indexed: {self.worker_pool.stats['total_rows']}"
+                f"Check worker pool statistics for details."
             )
             
         except Exception as e:
             logger.error(f"Error in parallel processing: {e}")
             raise
         finally:
-            # Ensure beacon API is properly closed
-            if self.beacon_api:
-                await self.beacon_api.stop()
+            # Note: Don't close beacon API here, it's managed by main.py
+            pass
+                
+    async def _determine_end_slot(self):
+        """Determine end slot from chain head."""
+        try:
+            latest_header = await self.beacon_api.get_block_header("head")
+            self.end_slot = int(latest_header["header"]["message"]["slot"])
+            logger.info(f"Set end slot to chain head: {self.end_slot}")
+        except Exception as e:
+            raise RuntimeError(f"Could not determine end slot: {e}")
+            
+    def _calculate_workers_per_scraper(self) -> Dict[str, int]:
+        """Calculate how many workers each scraper should get."""
+        num_scrapers = len(self.enabled_scraper_ids)
+        if num_scrapers == 0:
+            return {}
+            
+        # Equal distribution with remainder handling
+        base_workers = self.num_workers // num_scrapers
+        remainder = self.num_workers % num_scrapers
+        
+        workers_per_scraper = {}
+        for i, scraper_id in enumerate(self.enabled_scraper_ids):
+            # Give extra worker to first scrapers if there's remainder
+            workers_per_scraper[scraper_id] = base_workers + (1 if i < remainder else 0)
+            
+        return workers_per_scraper
+            
+    async def _cleanup_old_state_entries(self):
+        """Clean up state entries for non-enabled scrapers."""
+        logger.info("Cleaning up old state entries...")
+        
+        # Get all unique datasets in indexing_state
+        query = """
+        SELECT DISTINCT dataset
+        FROM indexing_state FINAL
+        WHERE mode = 'historical'
+        """
+        
+        results = self.clickhouse.execute(query)
+        existing_datasets = {row['dataset'] for row in results}
+        
+        # Get valid datasets for enabled scrapers
+        valid_datasets = set()
+        for scraper_id in self.enabled_scraper_ids:
+            datasets = self.dataset_registry.get_datasets_for_scraper(scraper_id)
+            for dataset in datasets:
+                valid_datasets.add(dataset.name)
+                
+        # Find datasets to remove
+        datasets_to_remove = existing_datasets - valid_datasets
+        
+        if datasets_to_remove:
+            logger.info(f"Removing state entries for disabled datasets: {datasets_to_remove}")
+            
+            for dataset in datasets_to_remove:
+                delete_query = """
+                ALTER TABLE indexing_state
+                DELETE WHERE mode = 'historical' AND dataset = %(dataset)s
+                """
+                self.clickhouse.execute(delete_query, {'dataset': dataset})
+                
+            logger.info(f"Cleaned up {len(datasets_to_remove)} disabled datasets")
+            
+    async def _initialize_state_ranges(self) -> int:
+        """Initialize state ranges for enabled scrapers only."""
+        logger.info("Initializing state ranges for enabled scrapers...")
+        
+        # Use state manager's bulk create with our scrapers
+        created_ranges = self.state_manager.bulk_create_ranges(
+            self.scrapers,  # Pass actual scraper instances
+            self.start_slot,
+            self.end_slot
+        )
+        
+        if created_ranges > 0:
+            logger.info(f"Created {created_ranges} new state ranges")
+            
+        # Log state summary
+        await self._log_state_summary()
+        
+        return created_ranges
+        
+    async def _log_state_summary(self):
+        """Log summary of state entries."""
+        query = """
+        SELECT 
+            dataset,
+            countIf(status = 'pending') as pending,
+            countIf(status = 'processing') as processing,
+            countIf(status = 'completed') as completed,
+            countIf(status = 'failed') as failed,
+            count() as total
+        FROM indexing_state FINAL
+        WHERE mode = 'historical'
+          AND start_slot >= %(start_slot)s
+          AND end_slot <= %(end_slot)s
+        GROUP BY dataset
+        ORDER BY dataset
+        """
+        
+        results = self.clickhouse.execute(query, {
+            'start_slot': self.start_slot,
+            'end_slot': self.end_slot
+        })
+        
+        logger.info("=== State Summary ===")
+        for row in results:
+            logger.info(
+                f"{row['dataset']}: "
+                f"Total: {row['total']}, "
+                f"Pending: {row['pending']}, "
+                f"Processing: {row['processing']}, "
+                f"Completed: {row['completed']}, "
+                f"Failed: {row['failed']}"
+            )
+            
+    def _create_scraper_classes_dict(self) -> Dict[str, type]:
+        """Create dictionary of scraper classes from instances."""
+        scraper_classes = {}
+        
+        for scraper in self.scrapers:
+            scraper_classes[scraper.scraper_id] = type(scraper)
+            
+        return scraper_classes

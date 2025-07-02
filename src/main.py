@@ -130,6 +130,49 @@ async def setup_genesis(beacon_api: BeaconAPIService, clickhouse: ClickHouseServ
         logger.debug(traceback.format_exc())
         return 0
 
+
+async def cleanup_disabled_datasets(clickhouse: ClickHouseService, scrapers: List, mode: str):
+    """Clean up state entries for disabled scrapers."""
+    from src.core.datasets import DatasetRegistry
+    dataset_registry = DatasetRegistry()
+    
+    # Get valid datasets for enabled scrapers
+    valid_datasets = set()
+    for scraper in scrapers:
+        datasets = dataset_registry.get_datasets_for_scraper(scraper.scraper_id)
+        for dataset in datasets:
+            valid_datasets.add(dataset.name)
+    
+    logger.info(f"Valid datasets for enabled scrapers: {valid_datasets}")
+    
+    # Get all datasets currently in indexing_state
+    query = """
+    SELECT DISTINCT dataset
+    FROM indexing_state FINAL
+    WHERE mode = %(mode)s
+    """
+    
+    all_datasets = clickhouse.execute(query, {"mode": mode})
+    all_dataset_names = {row['dataset'] for row in all_datasets}
+    
+    # Find datasets to remove
+    datasets_to_remove = all_dataset_names - valid_datasets
+    
+    if datasets_to_remove:
+        logger.info(f"Removing state entries for disabled datasets: {datasets_to_remove}")
+        
+        for dataset in datasets_to_remove:
+            delete_query = """
+            ALTER TABLE indexing_state
+            DELETE WHERE mode = %(mode)s AND dataset = %(dataset)s
+            """
+            clickhouse.execute(delete_query, {'mode': mode, 'dataset': dataset})
+            
+        # Force merge to apply deletes immediately
+        clickhouse.execute("OPTIMIZE TABLE indexing_state FINAL")
+        logger.info(f"Cleaned up {len(datasets_to_remove)} disabled datasets from indexing_state")
+
+
 async def main():
     # Ensure our logger is properly set up
     debug_logger = setup_logger("beacon_scraper", log_level=config.scraper.log_level)
@@ -286,6 +329,16 @@ async def main():
             if hasattr(scraper, 'set_state_manager'):
                 scraper.set_state_manager(state_manager)
         
+        # NEW: Clean up disabled datasets for historical/parallel modes
+        if mode in ["historical", "parallel"]:
+            debug_logger.info("Cleaning up state entries for disabled scrapers...")
+            await cleanup_disabled_datasets(clickhouse, scrapers, "historical")
+            
+            # Reset stale processing jobs after cleanup
+            reset_count = state_manager.reset_stale_processing_jobs()
+            if reset_count > 0:
+                debug_logger.info(f"Reset {reset_count} stale processing jobs")
+        
         debug_logger.debug(f"Using dynamic poll interval of {specs_manager.get_seconds_per_slot()} seconds")
         debug_logger.info(f"Starting service in {mode} mode")
         
@@ -302,8 +355,20 @@ async def main():
             )
             await service.start()
         elif mode == "parallel":
+            # NEW: Import enhanced services if available
+            try:
+                # Try to import enhanced version first
+                from src.services.thread_pool_parallel_service_enhanced import ThreadPoolParallelService as EnhancedParallelService
+                from src.services.worker_pool_service_enhanced import WorkerPoolService as EnhancedWorkerPool
+                debug_logger.info("Using enhanced parallel service with fair worker distribution")
+                ServiceClass = EnhancedParallelService
+            except ImportError:
+                # Fall back to standard version
+                debug_logger.info("Using standard parallel service")
+                ServiceClass = ThreadPoolParallelService
+            
             # Use the thread pool parallel service
-            service = ThreadPoolParallelService(
+            service = ServiceClass(
                 beacon_api=beacon_api,
                 clickhouse=clickhouse,
                 scrapers=scrapers,
