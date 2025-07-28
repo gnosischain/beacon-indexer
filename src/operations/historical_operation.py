@@ -67,9 +67,8 @@ class HistoricalOperation(OperationMode):
                 "total_rows": 0
             }
             
-        # Create initial ranges
-        created = await self._create_initial_ranges(datasets_to_process)
-        logger.info(f"Created {created} new ranges to process")
+        # Bootstrap the process by creating first range for each dataset if none exist
+        await self._bootstrap_ranges(datasets_to_process)
         
         # Reset any stale processing jobs
         self.state_manager.reset_stale_jobs()
@@ -130,34 +129,36 @@ class HistoricalOperation(OperationMode):
             logger.info(f"Selected datasets to process: {valid_datasets}")
             return valid_datasets
             
-    async def _create_initial_ranges(self, datasets: List[str]) -> int:
-        """Create initial ranges for processing using bulk operations."""
-        total_created = 0
+    async def _bootstrap_ranges(self, datasets: List[str]) -> int:
+        """Create first range for each dataset if none exist to bootstrap the process."""
+        created = 0
         
         for dataset_name in datasets:
-            dataset = self.dataset_registry.get_dataset(dataset_name)
-            if not dataset:
-                continue
+            try:
+                # Check if ANY ranges exist for this dataset
+                existing_ranges = self.state_manager.get_dataset_ranges(
+                    "historical", dataset_name, self.start_slot, self.end_slot
+                )
                 
-            # Special handling for sparse datasets
-            if dataset.is_sparse and dataset.scraper_id == "validator_scraper":
-                # Create ranges only where target slots exist
-                created = await self._create_validator_ranges_bulk(dataset_name)
-                total_created += created
-            else:
-                # Use bulk create for regular ranges
-                if hasattr(self.state_manager, 'bulk_create_ranges_for_dataset'):
-                    created = self.state_manager.bulk_create_ranges_for_dataset(
-                        "historical", dataset_name, self.start_slot, self.end_slot
-                    )
+                if not existing_ranges:
+                    # No ranges exist, create the first one as pending
+                    first_end = min(self.start_slot + self.state_manager.range_size, self.end_slot)
+                    
+                    if self.state_manager.create_range("historical", dataset_name, self.start_slot, first_end):
+                        created += 1
+                        logger.info(f"Bootstrapped {dataset_name} with initial range {self.start_slot}-{first_end}")
                 else:
-                    # Fall back to old method if bulk method not available
-                    created = self.state_manager.create_ranges_for_dataset(
-                        "historical", dataset_name, self.start_slot, self.end_slot
-                    )
-                total_created += created
+                    logger.info(f"Dataset {dataset_name} already has {len(existing_ranges)} ranges")
+                    
+            except Exception as e:
+                logger.error(f"Error bootstrapping {dataset_name}: {e}")
                 
-        return total_created
+        if created > 0:
+            logger.info(f"Created {created} bootstrap ranges")
+        else:
+            logger.info("No bootstrap ranges needed")
+            
+        return created
     
     async def _create_validator_ranges_bulk(self, dataset_name: str) -> int:
         """Create ranges for validator dataset with target slots using bulk operations."""
@@ -269,73 +270,72 @@ class HistoricalOperation(OperationMode):
         }
         
     async def _process_sequential(self, datasets: List[str]) -> Dict[str, Any]:
-        """Process sequentially with single worker."""
+        """Sequential processing with lazy range creation."""
+        from src.utils.block_processor import BlockProcessor
+        
         block_processor = BlockProcessor(self.beacon_api)
         
         ranges_processed = 0
         total_rows = 0
         
         while True:
-            # Get next work item
-            work_item = None
+            # Get next work item using lazy creation
+            work_found = False
             
             for dataset_name in datasets:
                 dataset = self.dataset_registry.get_dataset(dataset_name)
                 if not dataset:
                     continue
                     
-                # Get next pending range
-                range_info = self.state_manager.get_next_pending_range(
-                    "historical", dataset_name, self.end_slot
+                # Try to get or create next range
+                range_tuple = self.state_manager.get_or_create_next_range(
+                    scraper_id=dataset.scraper_id,
+                    table_name=dataset.table_name,
+                    target_end_slot=self.end_slot,
+                    worker_id="sequential-worker",
+                    mode="historical"
                 )
                 
-                if range_info:
-                    work_item = (dataset_name, range_info[0], range_info[1])
-                    break
+                if range_tuple:
+                    work_found = True
+                    start_slot, end_slot = range_tuple
                     
-            if not work_item:
+                    # Process range
+                    try:
+                        rows = await self._process_single_range(
+                            dataset_name, start_slot, end_slot
+                        )
+                        
+                        self.state_manager.complete_range(
+                            "historical", dataset_name, start_slot, end_slot, rows
+                        )
+                        
+                        ranges_processed += 1
+                        total_rows += rows
+                        
+                        if ranges_processed % 10 == 0:
+                            logger.info(
+                                f"Progress: {ranges_processed} ranges, "
+                                f"{total_rows} rows indexed"
+                            )
+                            
+                    except Exception as e:
+                        logger.error(f"Error processing range: {e}")
+                        self.state_manager.fail_range(
+                            "historical", dataset_name, start_slot, end_slot, str(e)
+                        )
+                    
+                    break  # Process one range at a time
+                    
+            if not work_found:
                 logger.info("No more ranges to process")
                 break
-                
-            dataset_name, start_slot, end_slot = work_item
-            
-            # Claim range
-            if not self.state_manager.claim_range(
-                "historical", dataset_name, start_slot, end_slot, 
-                "sequential-worker", f"batch-{ranges_processed}"
-            ):
-                continue
-                
-            # Process range
-            try:
-                rows = await self._process_single_range(
-                    dataset_name, start_slot, end_slot
-                )
-                
-                self.state_manager.complete_range(
-                    "historical", dataset_name, start_slot, end_slot, rows
-                )
-                
-                ranges_processed += 1
-                total_rows += rows
-                
-                if ranges_processed % 10 == 0:
-                    logger.info(
-                        f"Progress: {ranges_processed} ranges, "
-                        f"{total_rows} rows indexed"
-                    )
-                    
-            except Exception as e:
-                logger.error(f"Error processing range: {e}")
-                self.state_manager.fail_range(
-                    "historical", dataset_name, start_slot, end_slot, str(e)
-                )
                 
         return {
             "ranges_processed": ranges_processed,
             "total_rows": total_rows
         }
-        
+            
     async def _process_single_range(self, dataset_name: str, 
                                   start_slot: int, end_slot: int) -> int:
         """Process a single range of slots."""

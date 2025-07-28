@@ -1,411 +1,377 @@
 #!/usr/bin/env python3
 import asyncio
 import sys
+import os
+import signal
 import traceback
-from typing import List
-from datetime import datetime
-import traceback
+from typing import List, Optional
 
-from src.config import config
+from src.config import config, OperationType
 from src.utils.logger import logger, setup_logger
 from src.services.beacon_api_service import BeaconAPIService
 from src.services.clickhouse_service import ClickHouseService
 from src.services.state_manager import StateManager
-
-# Import specs manager after services
 from src.utils.specs_manager import SpecsManager
+from src.operations.operation_factory import OperationFactory
 
 # Import scrapers
-from src.scrapers.block_scraper import BlockScraper
 from src.scrapers.core_block_scraper import CoreBlockScraper
-from src.scrapers.attestation_scraper import AttestationScraper
 from src.scrapers.operational_events_scraper import OperationalEventsScraper
-from src.scrapers.transaction_scraper import TransactionScraper
-from src.scrapers.slashing_scraper import SlashingScraper
 from src.scrapers.validator_scraper import ValidatorScraper
 from src.scrapers.blob_sidecar_scraper import BlobSidecarScraper
 from src.scrapers.reward_scraper import RewardScraper
 from src.scrapers.specs_scraper import SpecsScraper
-
-# Import services
-from src.services.historical_service import HistoricalService
-from src.services.realtime_service import RealtimeService
-from src.services.thread_pool_parallel_service import ThreadPoolParallelService
+from src.scrapers.transaction_scraper import TransactionScraper
+from src.scrapers.slashing_scraper import SlashingScraper
+from src.scrapers.attestation_scraper import AttestationScraper
 
 
-def update_time_helpers(clickhouse: ClickHouseService, genesis_time: int, seconds_per_slot: int, slots_per_epoch: int) -> None:
-    """Update the time helpers table with current values."""
-    # First check if we need to clear existing data
-    query = "SELECT COUNT(*) as count FROM time_helpers"
-    result = clickhouse.execute(query)
-    
-    # Convert result to a list if it's a generator
-    if hasattr(result, '__iter__') and not isinstance(result, list):
-        result = list(result)
-    
-    count = result[0].get('count', 0) if result and len(result) > 0 else 0
-    
-    if count > 0:
-        # Update existing data
-        query = """
-        ALTER TABLE time_helpers UPDATE 
-        genesis_time_unix = %(genesis_time)s,
-        seconds_per_slot = %(seconds_per_slot)s,
-        slots_per_epoch = %(slots_per_epoch)s
-        WHERE 1=1
-        """
-        
-        clickhouse.execute(query, {
-            "genesis_time": genesis_time,
-            "seconds_per_slot": seconds_per_slot,
-            "slots_per_epoch": slots_per_epoch
-        })
-    else:
-        # Insert new data
-        query = """
-        INSERT INTO time_helpers (
-            genesis_time_unix, seconds_per_slot, slots_per_epoch
-        ) VALUES (
-            %(genesis_time)s, %(seconds_per_slot)s, %(slots_per_epoch)s
-        )
-        """
-        
-        clickhouse.execute(query, {
-            "genesis_time": genesis_time,
-            "seconds_per_slot": seconds_per_slot,
-            "slots_per_epoch": slots_per_epoch
-        })
-    
-    logger.info("Updated time helpers table with current values")
-    
+# Global shutdown event
+shutdown_event = asyncio.Event()
 
-async def setup_genesis(beacon_api: BeaconAPIService, clickhouse: ClickHouseService):
-    """Setup genesis information if not already exists."""
+
+def signal_handler(signum, frame):
+    """Handle shutdown signals."""
+    logger.info(f"Received signal {signum}, initiating graceful shutdown...")
+    shutdown_event.set()
+
+
+async def setup_genesis(beacon_api: BeaconAPIService, clickhouse: ClickHouseService) -> int:
+    """Setup genesis information if not already exists. Returns genesis time."""
     try:
-        # Check if genesis information already exists
-        query = "SELECT COUNT(*) as count FROM genesis"
+        # Check if genesis data exists
+        query = "SELECT genesis_time FROM genesis LIMIT 1"
         result = clickhouse.execute(query)
         
-        # Convert the result to a list if it's a generator
+        # Convert result to list if needed
         if hasattr(result, '__iter__') and not isinstance(result, list):
             result = list(result)
-        
-        if result and len(result) > 0 and result[0].get('count', 0) > 0:
-            # Get existing genesis time for time_helpers
-            query = "SELECT toUnixTimestamp(genesis_time) as genesis_unix FROM genesis LIMIT 1"
-            result = clickhouse.execute(query)
             
-            # Convert the result to a list if it's a generator
-            if hasattr(result, '__iter__') and not isinstance(result, list):
-                result = list(result)
-                
-            genesis_time = result[0].get('genesis_unix', 0) if result and len(result) > 0 else 0
-            logger.info(f"Genesis information already exists in the database (unix time: {genesis_time})")
+        if result and result[0]['genesis_time']:
+            genesis_time = result[0]['genesis_time']
+            logger.info(f"Genesis time loaded from database: {genesis_time}")
             return genesis_time
-            
-        # If not, fetch and store genesis information
-        genesis_data = await beacon_api.get_genesis()
         
-        # Convert genesis_time from string to timestamp
-        genesis_time = int(genesis_data.get("genesis_time", 0))
+        # No genesis data found, fetch from beacon node
+        logger.info("No genesis data found, fetching from beacon node...")
+        genesis = await beacon_api.get_genesis()
         
-        query = """
+        genesis_time = int(genesis['genesis_time'])
+        
+        # Insert genesis data
+        insert_query = """
         INSERT INTO genesis (
-            genesis_time, genesis_validators_root, genesis_fork_version
+            genesis_time, genesis_fork_version, genesis_validators_root
         ) VALUES (
-            %(genesis_time)s, %(genesis_validators_root)s, %(genesis_fork_version)s
+            %(genesis_time)s, %(genesis_fork_version)s, %(genesis_validators_root)s
         )
         """
         
-        clickhouse.execute(query, {
-            "genesis_time": datetime.fromtimestamp(genesis_time),
-            "genesis_validators_root": genesis_data.get("genesis_validators_root", ""),
-            "genesis_fork_version": genesis_data.get("genesis_fork_version", "")
+        clickhouse.execute(insert_query, {
+            'genesis_time': genesis_time,
+            'genesis_fork_version': genesis['genesis_fork_version'],
+            'genesis_validators_root': genesis['genesis_validators_root']
         })
         
-        logger.info(f"Genesis information stored in the database (unix time: {genesis_time})")
+        logger.info("Genesis data saved to database")
         return genesis_time
-    except Exception as e:
-        logger.error(f"Error setting up genesis information: {e}")
-        logger.debug(traceback.format_exc())
-        return 0
-
-
-async def cleanup_disabled_datasets(clickhouse: ClickHouseService, scrapers: List, mode: str):
-    """Clean up state entries for disabled scrapers."""
-    from src.core.datasets import DatasetRegistry
-    dataset_registry = DatasetRegistry()
-    
-    # Get valid datasets for enabled scrapers
-    valid_datasets = set()
-    for scraper in scrapers:
-        datasets = dataset_registry.get_datasets_for_scraper(scraper.scraper_id)
-        for dataset in datasets:
-            valid_datasets.add(dataset.name)
-    
-    logger.info(f"Valid datasets for enabled scrapers: {valid_datasets}")
-    
-    # Get all datasets currently in indexing_state
-    query = """
-    SELECT DISTINCT dataset
-    FROM indexing_state FINAL
-    WHERE mode = %(mode)s
-    """
-    
-    all_datasets = clickhouse.execute(query, {"mode": mode})
-    all_dataset_names = {row['dataset'] for row in all_datasets}
-    
-    # Find datasets to remove
-    datasets_to_remove = all_dataset_names - valid_datasets
-    
-    if datasets_to_remove:
-        logger.info(f"Removing state entries for disabled datasets: {datasets_to_remove}")
-        
-        for dataset in datasets_to_remove:
-            delete_query = """
-            ALTER TABLE indexing_state
-            DELETE WHERE mode = %(mode)s AND dataset = %(dataset)s
-            """
-            clickhouse.execute(delete_query, {'mode': mode, 'dataset': dataset})
             
-        # Force merge to apply deletes immediately
-        clickhouse.execute("OPTIMIZE TABLE indexing_state FINAL")
-        logger.info(f"Cleaned up {len(datasets_to_remove)} disabled datasets from indexing_state")
+    except Exception as e:
+        logger.error(f"Error setting up genesis: {e}")
+        raise
+
+
+def update_time_helpers(clickhouse: ClickHouseService, genesis_time: int, 
+                       seconds_per_slot: int, slots_per_epoch: int) -> None:
+    """Update the time helpers table with current values."""
+    try:
+        # Check if we need to update
+        query = "SELECT COUNT(*) as count FROM time_helpers"
+        result = clickhouse.execute(query)
+        
+        # Convert result to list if needed
+        if hasattr(result, '__iter__') and not isinstance(result, list):
+            result = list(result)
+            
+        count = result[0]['count'] if result else 0
+        
+        if count > 0:
+            # Update existing data
+            query = """
+            ALTER TABLE time_helpers UPDATE 
+            genesis_time_unix = %(genesis_time)s,
+            seconds_per_slot = %(seconds_per_slot)s,
+            slots_per_epoch = %(slots_per_epoch)s
+            WHERE 1=1
+            """
+        else:
+            # Insert new data
+            query = """
+            INSERT INTO time_helpers (
+                genesis_time_unix, seconds_per_slot, slots_per_epoch
+            ) VALUES (
+                %(genesis_time)s, %(seconds_per_slot)s, %(slots_per_epoch)s
+            )
+            """
+        
+        clickhouse.execute(query, {
+            'genesis_time': genesis_time,
+            'seconds_per_slot': seconds_per_slot,
+            'slots_per_epoch': slots_per_epoch
+        })
+        
+        logger.info("Updated time helpers table with current values")
+        
+    except Exception as e:
+        logger.error(f"Error updating time helpers: {e}")
+
+
+def get_enabled_scrapers(
+    beacon_api: BeaconAPIService,
+    clickhouse: ClickHouseService,
+    enabled_names: List[str]
+) -> List:
+    """Initialize enabled scrapers based on configuration."""
+    scraper_map = {
+        'block': CoreBlockScraper,
+        'core_block': CoreBlockScraper,
+        'operational_events': OperationalEventsScraper,
+        'validator': ValidatorScraper,
+        'blob': BlobSidecarScraper,
+        'reward': RewardScraper,
+        'specs': SpecsScraper,
+        'transaction': TransactionScraper,
+        'slashing': SlashingScraper,
+        'attestation': AttestationScraper,
+    }
+    
+    scrapers = []
+    for name in enabled_names:
+        scraper_class = scraper_map.get(name.lower())
+        if scraper_class:
+            scraper = scraper_class(beacon_api, clickhouse)
+            scrapers.append(scraper)
+            logger.info(f"Enabled scraper: {scraper.scraper_id}")
+        else:
+            logger.warning(f"Unknown scraper: {name}")
+            
+    return scrapers
+
+
+async def cleanup_disabled_scrapers_state(clickhouse: ClickHouseService, 
+                                        enabled_scrapers: List) -> None:
+    """Clean up state entries for disabled scrapers."""
+    try:
+        # Get enabled scraper IDs and their datasets
+        from src.core.datasets import DatasetRegistry
+        registry = DatasetRegistry()
+        
+        valid_datasets = set()
+        for scraper in enabled_scrapers:
+            datasets = registry.get_datasets_for_scraper(scraper.scraper_id)
+            for dataset in datasets:
+                valid_datasets.add(dataset.name)
+                
+        logger.info(f"Valid datasets for enabled scrapers: {valid_datasets}")
+        
+        # Find and remove invalid entries
+        query = """
+        SELECT DISTINCT dataset, COUNT(*) as count
+        FROM indexing_state
+        GROUP BY dataset
+        """
+        
+        result = clickhouse.execute(query)
+        
+        # Convert result to list
+        if hasattr(result, '__iter__') and not isinstance(result, list):
+            result = list(result)
+            
+        for row in result:
+            dataset = row['dataset']
+            count = row['count']
+            
+            if dataset not in valid_datasets:
+                logger.warning(f"Found {count} entries for disabled dataset: {dataset}")
+                # Optionally delete them
+                # delete_query = f"ALTER TABLE indexing_state DELETE WHERE dataset = '{dataset}'"
+                # clickhouse.execute(delete_query)
+                
+    except Exception as e:
+        logger.error(f"Error cleaning up disabled scrapers state: {e}")
 
 
 async def main():
-    # Ensure our logger is properly set up
-    debug_logger = setup_logger("beacon_scraper", log_level=config.scraper.log_level)
-    debug_logger.info("Starting beacon chain scraper")
+    """Main entry point."""
+    # Setup signal handlers
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
     
-    # Get configuration from environment variables
-    mode = config.scraper.mode
-    enabled_scrapers_str = config.scraper.enabled_scrapers
-    start_slot = config.scraper.historical_start_slot
-    end_slot = config.scraper.historical_end_slot
-    batch_size = config.scraper.batch_size
-    parallel_workers = config.scraper.parallel_workers
+    # Get configuration from environment
+    mode = os.getenv("SCRAPER_MODE", "realtime").lower()
+    enabled_scrapers_str = os.getenv("ENABLED_SCRAPERS", "core_block,operational_events,validator")
+    start_slot = int(os.getenv("HISTORICAL_START_SLOT", "0"))
+    end_slot_str = os.getenv("HISTORICAL_END_SLOT", "")
+    end_slot = int(end_slot_str) if end_slot_str else None
+    batch_size = int(os.getenv("BATCH_SIZE", "1000"))
+    parallel_workers = int(os.getenv("PARALLEL_WORKERS", "4"))
     
-    debug_logger.info(f"Configuration loaded from environment:")
-    debug_logger.info(f"  Mode: {mode}")
-    debug_logger.info(f"  Enabled scrapers: {enabled_scrapers_str}")
-    debug_logger.info(f"  Start slot: {start_slot}")
-    debug_logger.info(f"  End slot: {end_slot}")
-    debug_logger.info(f"  Batch size: {batch_size}")
-    debug_logger.info(f"  Parallel workers: {parallel_workers}")
+    logger.info("Starting beacon scraper")
+    logger.info(f"Configuration loaded from environment:")
+    logger.info(f"  Mode: {mode}")
+    logger.info(f"  Enabled scrapers: {enabled_scrapers_str}")
+    logger.info(f"  Start slot: {start_slot}")
+    logger.info(f"  End slot: {end_slot}")
+    logger.info(f"  Batch size: {batch_size}")
+    logger.info(f"  Parallel workers: {parallel_workers}")
     
     # Parse enabled scrapers
-    enabled_scrapers = [s.strip() for s in enabled_scrapers_str.split(',')]
-    debug_logger.info(f"Parsed enabled scrapers: {enabled_scrapers}")
+    enabled_scraper_names = [s.strip() for s in enabled_scrapers_str.split(',')]
     
+    beacon_api = None
     try:
         # Initialize services
-        debug_logger.debug(f"Initializing services with config: {config}")
         beacon_api = BeaconAPIService()
         clickhouse = ClickHouseService()
         
         # Initialize state manager
         state_manager = StateManager(clickhouse)
         
-        # Reset any stale processing jobs at startup
-        debug_logger.info("Resetting stale processing jobs...")
-        try:
-            # Try to use the method if it exists
-            if hasattr(state_manager, 'reset_all_processing_jobs'):
-                state_manager.reset_all_processing_jobs()
-            else:
-                # Fallback: reset processing jobs directly
-                query = """
-                INSERT INTO indexing_state 
-                (mode, dataset, start_slot, end_slot, status, version)
-                SELECT 
-                    mode, dataset, start_slot, end_slot, 
-                    'pending' as status, now() as version
-                FROM indexing_state FINAL
-                WHERE status = 'processing'
-                """
-                clickhouse.execute(query, {})
-                debug_logger.info("Reset stale processing jobs using fallback method")
-        except Exception as e:
-            debug_logger.warning(f"Could not reset processing jobs: {e}")
-            # Continue anyway - this is not critical
-        
-        debug_logger.debug("Starting beacon API service")
-        # Start the beacon API
+        # Start beacon API
         await beacon_api.start()
         
-        # Setup genesis information
-        debug_logger.debug("Setting up genesis information")
-        await setup_genesis(beacon_api, clickhouse)
-        
-        # Get genesis time from database for time calculations
-        genesis_query = "SELECT toUnixTimestamp(genesis_time) as genesis_time FROM genesis LIMIT 1"
-        genesis_results = clickhouse.execute(genesis_query)
-        genesis_time = 0
-        if genesis_results and len(genesis_results) > 0:
-            genesis_time = genesis_results[0].get("genesis_time", 0)
-        
-        # Initialize specs scraper
-        debug_logger.debug("Running specs scraper")
-        specs_scraper = SpecsScraper(beacon_api, clickhouse)
-        
-        # If specs are already in database and the scraper is not explicitly enabled, skip it
-        already_ran = await specs_scraper.get_last_processed_slot() > 0
-        if already_ran and "specs" not in enabled_scrapers:
-            debug_logger.info("Specs already exist in database and specs scraper not explicitly enabled, skipping specs scraper")
-        else:
-            debug_logger.info("Running specs scraper to get current network specs")
-            mock_block = {"data": {"message": {"slot": 0}}}
-            await specs_scraper.process(mock_block)
+        # Setup genesis and get genesis time
+        genesis_time = await setup_genesis(beacon_api, clickhouse)
         
         # Initialize specs manager
-        debug_logger.debug("Initializing specs manager")
         specs_manager = SpecsManager(clickhouse)
         
-        # Update time helpers
-        update_time_helpers(
-            clickhouse,
-            genesis_time,
-            specs_manager.get_seconds_per_slot(),
-            specs_manager.get_slots_per_epoch()
+        # Get enabled scrapers
+        enabled_scrapers = get_enabled_scrapers(
+            beacon_api, clickhouse, enabled_scraper_names
         )
         
-        # Create scraper instances based on enabled scrapers
-        scrapers: List = []
+        if not enabled_scrapers:
+            logger.error("No scrapers enabled!")
+            return
+            
+        # Set specs manager for each scraper
+        for scraper in enabled_scrapers:
+            scraper.set_specs_manager(specs_manager)
+            
+        # Update specs if needed
+        specs_scraper = next(
+            (s for s in enabled_scrapers if isinstance(s, SpecsScraper)), 
+            None
+        )
         
-        # Map of user-friendly names to scraper classes and IDs
-        scraper_mapping = {
-            "core_block": (CoreBlockScraper, "core_block_scraper"),
-            "attestation": (AttestationScraper, "attestation_scraper"),
-            "operational_events": (OperationalEventsScraper, "operational_events_scraper"),
-            "transaction": (TransactionScraper, "transaction_scraper"),
-            "slashing": (SlashingScraper, "slashing_scraper"),
-            "validator": (ValidatorScraper, "validator_scraper"),
-            "reward": (RewardScraper, "reward_scraper"),
-            "blob": (BlobSidecarScraper, "blob_sidecar_scraper"),
-            "specs": (SpecsScraper, "specs_scraper"),
-            # Legacy mapping - uses the old comprehensive BlockScraper
-            "block": (BlockScraper, "block_scraper")
+        if specs_scraper:
+            logger.info("Updating chain specs...")
+            processed, _ = await specs_scraper.process()
+            logger.info(f"Updated {processed} chain spec parameters")
+        else:
+            # Create temporary specs scraper to update specs
+            temp_specs_scraper = SpecsScraper(beacon_api, clickhouse)
+            temp_specs_scraper.set_specs_manager(specs_manager)
+            processed, _ = await temp_specs_scraper.process()
+            logger.info(f"Updated {processed} chain spec parameters")
+            
+        # Get time parameters from specs manager
+        seconds_per_slot = specs_manager.get_seconds_per_slot()
+        slots_per_epoch = specs_manager.get_slots_per_epoch()
+        
+        logger.info(f"Updated time specs: seconds_per_slot={seconds_per_slot}, "
+                   f"slots_per_epoch={slots_per_epoch}")
+                   
+        # Update time helpers with genesis time from database
+        update_time_helpers(clickhouse, genesis_time, seconds_per_slot, slots_per_epoch)
+        
+        # Display active scrapers
+        active_scraper_ids = [s.scraper_id for s in enabled_scrapers]
+        logger.info(f"Active scrapers: {active_scraper_ids}")
+        
+        # Clean up state for disabled scrapers
+        logger.info("Cleaning up state entries for disabled scrapers...")
+        await cleanup_disabled_scrapers_state(clickhouse, enabled_scrapers)
+        
+        # Reset stale processing jobs
+        logger.info("Resetting stale processing jobs...")
+        reset_count = state_manager.reset_stale_processing_jobs()
+        if reset_count > 0:
+            logger.info(f"Reset {reset_count} stale processing jobs")
+            
+        # Map mode string to OperationType
+        operation_type_map = {
+            'realtime': OperationType.CONTINUOUS,
+            'continuous': OperationType.CONTINUOUS,
+            'historical': OperationType.HISTORICAL,
+            'parallel': OperationType.HISTORICAL,  # Parallel is a variant of historical
+            'fill_gaps': OperationType.FILL_GAPS,
+            'validate': OperationType.VALIDATE,
+            'backfill': OperationType.BACKFILL,
+            'consolidate': OperationType.CONSOLIDATE,
+            'process_failed': OperationType.PROCESS_FAILED,
         }
         
-        # Track which scrapers have been added to avoid duplicates
-        added_scraper_ids = set()
-        
-        # Create scrapers based on enabled list
-        for scraper_name in enabled_scrapers:
-            if scraper_name in scraper_mapping:
-                scraper_class, scraper_id = scraper_mapping[scraper_name]
-                
-                # Avoid duplicates
-                if scraper_id not in added_scraper_ids:
-                    # Create the scraper instance
-                    scraper = scraper_class(beacon_api, clickhouse)
-                    # Ensure the scraper_id matches what the dataset registry expects
-                    scraper.scraper_id = scraper_id
-                    scrapers.append(scraper)
-                    added_scraper_ids.add(scraper_id)
-                    debug_logger.debug(f"Added {scraper_class.__name__} with ID: {scraper_id}")
-            else:
-                debug_logger.warning(f"Unknown scraper: {scraper_name}")
-        
-        # Add specs scraper only if explicitly enabled and not already processed
-        if "specs" in enabled_scrapers and not already_ran:
-            if "specs_scraper" not in added_scraper_ids:
-                specs_scraper_instance = SpecsScraper(beacon_api, clickhouse)
-                specs_scraper_instance.scraper_id = "specs_scraper"
-                scrapers.append(specs_scraper_instance)
-                debug_logger.debug("Added SpecsScraper to regular scrapers")
-        
-        if not scrapers:
-            debug_logger.warning("No scrapers enabled. Please enable at least one scraper.")
-            return
-        
-        # Log the scrapers we're using with their IDs
-        debug_logger.info(f"Active scrapers: {[s.scraper_id for s in scrapers]}")
-        
-        # Set specs_manager and state_manager for all scrapers
-        for scraper in scrapers:
-            scraper.set_specs_manager(specs_manager)
-            if hasattr(scraper, 'set_state_manager'):
-                scraper.set_state_manager(state_manager)
-        
-        # NEW: Clean up disabled datasets for historical/parallel modes
-        if mode in ["historical", "parallel"]:
-            debug_logger.info("Cleaning up state entries for disabled scrapers...")
-            await cleanup_disabled_datasets(clickhouse, scrapers, "historical")
+        operation_type = operation_type_map.get(mode)
+        if not operation_type:
+            raise ValueError(f"Unknown mode: {mode}")
             
-            # Reset stale processing jobs after cleanup
-            reset_count = state_manager.reset_stale_processing_jobs()
-            if reset_count > 0:
-                debug_logger.info(f"Reset {reset_count} stale processing jobs")
+        # Create operation configuration
+        operation_config = {
+            'mode': mode,
+            'start_slot': start_slot,
+            'end_slot': end_slot,
+            'batch_size': batch_size,
+            'num_workers': parallel_workers,
+            'datasets': [],  # Let operation determine from scrapers
+            'force': False
+        }
         
-        debug_logger.debug(f"Using dynamic poll interval of {specs_manager.get_seconds_per_slot()} seconds")
-        debug_logger.info(f"Starting service in {mode} mode")
+        # Special handling for parallel mode
+        if mode == 'parallel':
+            operation_config['num_workers'] = parallel_workers
         
-        # Start the appropriate service based on mode
-        if mode == "historical":
-            service = HistoricalService(
-                beacon_api=beacon_api,
-                clickhouse=clickhouse,
-                scrapers=scrapers,
-                specs_manager=specs_manager,
-                start_slot=start_slot,
-                end_slot=end_slot,
-                batch_size=batch_size
-            )
-            await service.start()
-        elif mode == "parallel":
-            # NEW: Import enhanced services if available
-            try:
-                # Try to import enhanced version first
-                from src.services.thread_pool_parallel_service_enhanced import ThreadPoolParallelService as EnhancedParallelService
-                from src.services.worker_pool_service_enhanced import WorkerPoolService as EnhancedWorkerPool
-                debug_logger.info("Using enhanced parallel service with fair worker distribution")
-                ServiceClass = EnhancedParallelService
-            except ImportError:
-                # Fall back to standard version
-                debug_logger.info("Using standard parallel service")
-                ServiceClass = ThreadPoolParallelService
-            
-            # Use the thread pool parallel service
-            service = ServiceClass(
-                beacon_api=beacon_api,
-                clickhouse=clickhouse,
-                scrapers=scrapers,
-                specs_manager=specs_manager,
-                start_slot=start_slot,
-                end_slot=end_slot,
-                num_workers=parallel_workers,
-                worker_batch_size=batch_size
-            )
-            await service.start()
-        else:  # realtime (default)
-            service = RealtimeService(
-                beacon_api=beacon_api,
-                clickhouse=clickhouse,
-                scrapers=scrapers,
-                specs_manager=specs_manager,
-                poll_interval=specs_manager.get_seconds_per_slot()
-            )
-            await service.start()
+        # Create and execute operation
+        operation = OperationFactory.create(
+            operation_type=operation_type,
+            beacon_api=beacon_api,
+            clickhouse=clickhouse,
+            state_manager=state_manager,
+            scrapers=enabled_scrapers,
+            config=operation_config
+        )
+        
+        # Execute operation
+        logger.info(f"Starting service in {mode} mode")
+        result = await operation.execute()
+        
+        # Log results
+        logger.info(f"Operation completed: {result}")
+        
     except KeyboardInterrupt:
-        logger.info("Received keyboard interrupt, shutting down...")
+        logger.info("Received keyboard interrupt")
     except Exception as e:
-        debug_logger.error(f"Error in main process: {e}")
-        debug_logger.error(traceback.format_exc())
-        print(f"ERROR: {e}")
-        print(traceback.format_exc())
+        logger.error(f"Error in main process: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise
     finally:
-        if 'beacon_api' in locals():
-            debug_logger.debug("Stopping beacon API service")
-            await beacon_api.stop()
-        debug_logger.info("Scraper stopped")
+        # Close beacon API properly if it exists and has session
+        if beacon_api and hasattr(beacon_api, 'session') and beacon_api.session:
+            await beacon_api.session.close()
+        logger.info("Scraper stopped")
 
 
 if __name__ == "__main__":
+    # Setup root logger
+    setup_logger("beacon_scraper", log_level=config.scraper.log_level)
+    
+    # Run main
     try:
         asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Exiting...")
+        sys.exit(0)
     except Exception as e:
-        print(f"Fatal error: {e}")
-        print(traceback.format_exc())
+        logger.error(f"Fatal error: {e}")
         sys.exit(1)
