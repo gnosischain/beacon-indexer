@@ -1,4 +1,7 @@
-# Beacon Indexer package
-# Version: 0.1.0
+"""
+Beacon Chain Indexer
 
-__version__ = "0.1.0"
+A simple, minimalistic beacon chain indexer using ELT architecture.
+"""
+
+__version__ = "1.0.0"

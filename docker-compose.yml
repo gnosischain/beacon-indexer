@@ -1,190 +1,77 @@
-# Base environment variables
-x-base-env: &base-env
-  # Beacon node configuration
-  BEACON_NODE_URL: ${BEACON_NODE_URL:-http://your-beacon-node:5052}
-  
-  # ClickHouse configuration
-  CLICKHOUSE_HOST: ${CLICKHOUSE_HOST:-localhost}
-  CLICKHOUSE_PORT: ${CLICKHOUSE_PORT:-9000}
-  CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
-  CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
-  CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-beacon_chain}
-  CLICKHOUSE_SECURE: ${CLICKHOUSE_SECURE:-true}
-  CLICKHOUSE_VERIFY: ${CLICKHOUSE_VERIFY:-false}
-  
-  # Logging
-  LOG_LEVEL: ${LOG_LEVEL:-INFO}
-
-x-complete-env: &complete-env
-  <<: *base-env
-  
-  # Operation mode
-  OPERATION: ${OPERATION:-continuous}
-  
-  # Scraper configuration
-  SCRAPER_MODE: ${SCRAPER_MODE:-realtime}
-  ENABLED_SCRAPERS: ${ENABLED_SCRAPERS:-core_block,operational_events,validator}
-  
-  # Historical mode settings
-  HISTORICAL_START_SLOT: ${HISTORICAL_START_SLOT:-0}
-  HISTORICAL_END_SLOT: ${HISTORICAL_END_SLOT:-}
-  
-  # Performance settings
-  BATCH_SIZE: ${BATCH_SIZE:-1000}
-  MAX_CONCURRENT_REQUESTS: ${MAX_CONCURRENT_REQUESTS:-50}
-  REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-30}
-  
-  # Parallel mode settings
-  PARALLEL_WORKERS: ${PARALLEL_WORKERS:-4}
-  NUM_WORKERS: ${NUM_WORKERS:-4}
-  ENABLE_WORKER_POOL: ${ENABLE_WORKER_POOL:-true}
-  WORKER_POOL_SIZE: ${WORKER_POOL_SIZE:-8}
-  WORKER_BATCH_SIZE: ${WORKER_BATCH_SIZE:-100}
-  WORKER_PROGRESS_LOG_INTERVAL: ${WORKER_PROGRESS_LOG_INTERVAL:-100}
-  
-  # State management settings
-  STATE_RANGE_SIZE: ${STATE_RANGE_SIZE:-50000}
-  STATE_UPDATE_BATCH_SIZE: ${STATE_UPDATE_BATCH_SIZE:-1000}
-  MAX_RETRY_ATTEMPTS: ${MAX_RETRY_ATTEMPTS:-3}
-  STALE_JOB_TIMEOUT_MINUTES: ${STALE_JOB_TIMEOUT_MINUTES:-30}
-  
-  # State manager bulk operations
-  STATE_BULK_INSERT_BATCH_SIZE: ${STATE_BULK_INSERT_BATCH_SIZE:-1000}
-  STATE_BULK_CHECK_BATCH_SIZE: ${STATE_BULK_CHECK_BATCH_SIZE:-1000}
-  STATE_BULK_LOG_INTERVAL: ${STATE_BULK_LOG_INTERVAL:-5000}
-  
-  # State caching
-  ENABLE_STATE_CACHING: ${ENABLE_STATE_CACHING:-true}
-  STATE_CACHE_SIZE: ${STATE_CACHE_SIZE:-10000}
-  STATE_CACHE_TTL: ${STATE_CACHE_TTL:-300}
-  
-  # Gap detection
-  GAP_CHECK_INTERVAL_SECONDS: ${GAP_CHECK_INTERVAL_SECONDS:-300}
-  
-  # Bulk insertion service
-  BULK_INSERT_QUEUE_SIZE: ${BULK_INSERT_QUEUE_SIZE:-10000}
-  BULK_INSERT_MAX_WAIT_TIME: ${BULK_INSERT_MAX_WAIT_TIME:-5}
-  BULK_INSERT_BATCH_SIZE: ${BULK_INSERT_BATCH_SIZE:-5000}
-
 services:
-  # Migration service
-  beacon-migrate:
-    image: beacon-indexer:latest
-    container_name: beacon-migrate
+  # Migration service - Set up database schema
+  migration:
+    image: beacon-indexer-v2:latest
+    container_name: migration
     environment:
-      <<: *base-env
-      CH_DIRECTION: ${CH_DIRECTION:-up}
-      CH_MIGRATIONS_DIR: /app/migrations
-      CH_SECURE: "True"
-      CH_VERIFY: "False"
-    volumes:
-      - ./migrations:/app/migrations
-      - ./scripts/run_clickhouse_migrations.py:/app/scripts/run_clickhouse_migrations.py
-    command: python /app/scripts/run_clickhouse_migrations.py
+      - CLICKHOUSE_HOST=${CLICKHOUSE_HOST}
+      - CLICKHOUSE_PORT=${CLICKHOUSE_PORT}
+      - CLICKHOUSE_USER=${CLICKHOUSE_USER}
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
+      - CLICKHOUSE_DATABASE=${CLICKHOUSE_DATABASE}
+      - CLICKHOUSE_SECURE=${CLICKHOUSE_SECURE}
+      - LOG_LEVEL=${LOG_LEVEL}
+    command: ["python", "scripts/migrate.py"]
     profiles:
-      - migrate
+      - migration
 
-  # Main unified scraper service (realtime mode)
-  beacon-scraper:
-    image: beacon-indexer:latest
-    container_name: beacon-scraper
+  # Backfill service - Load historical raw data
+  backfill:
+    image: beacon-indexer-v2:latest
+    container_name: backfill
     environment:
-      <<: *complete-env
-    volumes:
-      - ./migrations:/app/migrations
-    command: python -m src.main
+      - BEACON_NODE_URL=${BEACON_NODE_URL}
+      - CLICKHOUSE_HOST=${CLICKHOUSE_HOST}
+      - CLICKHOUSE_PORT=${CLICKHOUSE_PORT}
+      - CLICKHOUSE_USER=${CLICKHOUSE_USER}
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
+      - CLICKHOUSE_DATABASE=${CLICKHOUSE_DATABASE}
+      - CLICKHOUSE_SECURE=${CLICKHOUSE_SECURE}
+      - ENABLED_LOADERS=${ENABLED_LOADERS}
+      - VALIDATOR_MODE=${VALIDATOR_MODE}
+      - START_SLOT=${START_SLOT}
+      - END_SLOT=${END_SLOT}
+      - BACKFILL_WORKERS=${BACKFILL_WORKERS}
+      - CHUNK_SIZE=${CHUNK_SIZE}
+      - LOG_LEVEL=${LOG_LEVEL}
+    command: ["python", "-m", "src.main", "load", "backfill"]
+    profiles:
+      - backfill
+
+  # Realtime service - Load new raw data continuously
+  realtime:
+    image: beacon-indexer-v2:latest
+    container_name: realtime
+    environment:
+      - BEACON_NODE_URL=${BEACON_NODE_URL}
+      - CLICKHOUSE_HOST=${CLICKHOUSE_HOST}
+      - CLICKHOUSE_PORT=${CLICKHOUSE_PORT}
+      - CLICKHOUSE_USER=${CLICKHOUSE_USER}
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
+      - CLICKHOUSE_DATABASE=${CLICKHOUSE_DATABASE}
+      - CLICKHOUSE_SECURE=${CLICKHOUSE_SECURE}
+      - ENABLED_LOADERS=${ENABLED_LOADERS}
+      - VALIDATOR_MODE=${VALIDATOR_MODE}
+      - LOG_LEVEL=${LOG_LEVEL}
+    command: ["python", "-m", "src.main", "load", "realtime"]
     restart: unless-stopped
-    networks:
-      - beacon-network
-
-  # Parallel scraper with all optimizations
-  beacon-scraper-parallel:
-    image: beacon-indexer:latest
-    container_name: beacon-scraper-parallel
-    environment:
-      <<: *complete-env
-      OPERATION: historical  # Use historical operation for parallel processing
-      SCRAPER_MODE: parallel
-      # Override with optimized values for parallel processing
-      PARALLEL_WORKERS: ${PARALLEL_WORKERS:-16}
-      NUM_WORKERS: ${NUM_WORKERS:-16}
-      STATE_RANGE_SIZE: ${STATE_RANGE_SIZE:-10000}
-      STATE_BULK_INSERT_BATCH_SIZE: ${STATE_BULK_INSERT_BATCH_SIZE:-5000}
-      STATE_BULK_CHECK_BATCH_SIZE: ${STATE_BULK_CHECK_BATCH_SIZE:-5000}
-      BATCH_SIZE: ${BATCH_SIZE:-2000}
-      MAX_CONCURRENT_REQUESTS: ${MAX_CONCURRENT_REQUESTS:-100}
-      WORKER_BATCH_SIZE: ${WORKER_BATCH_SIZE:-500}
-      BULK_INSERT_BATCH_SIZE: ${BULK_INSERT_BATCH_SIZE:-10000}
-      # Historical operation settings
-      START_SLOT: ${HISTORICAL_START_SLOT:-0}
-      END_SLOT: ${HISTORICAL_END_SLOT:-}
-    volumes:
-      - ./migrations:/app/migrations
-    command: python -m src.main
-    networks:
-      - beacon-network
     profiles:
-      - parallel
+      - realtime
 
-  # Historical scraper
-  beacon-scraper-historical:
-    image: beacon-indexer:latest
-    container_name: beacon-scraper-historical
+  # Transform service - Process raw data into structured tables
+  transform:
+    image: beacon-indexer-v2:latest
+    container_name: transform
     environment:
-      <<: *complete-env
-      SCRAPER_MODE: historical
-    volumes:
-      - ./migrations:/app/migrations
-    command: python -m src.main
-    networks:
-      - beacon-network
-    profiles:
-      - historical
-
-  # Gap detection service
-  beacon-gap-detector:
-    image: beacon-indexer:latest
-    container_name: beacon-gap-detector
-    environment:
-      <<: *complete-env
-    volumes:
-      - ./migrations:/app/migrations
-    command: python -m src.services.gap_detection_service
+      - CLICKHOUSE_HOST=${CLICKHOUSE_HOST}
+      - CLICKHOUSE_PORT=${CLICKHOUSE_PORT}
+      - CLICKHOUSE_USER=${CLICKHOUSE_USER}
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
+      - CLICKHOUSE_DATABASE=${CLICKHOUSE_DATABASE}
+      - CLICKHOUSE_SECURE=${CLICKHOUSE_SECURE}
+      - ENABLED_LOADERS=${ENABLED_LOADERS}
+      - LOG_LEVEL=${LOG_LEVEL}
+    command: ["python", "-m", "src.main", "transform", "run"]
     restart: unless-stopped
-    networks:
-      - beacon-network
     profiles:
-      - gap-detector
-
-  # Performance monitoring
-  beacon-monitor:
-    image: beacon-indexer:latest
-    container_name: beacon-monitor
-    environment:
-      <<: *base-env
-    volumes:
-      - ./scripts:/app/scripts
-    command: python /app/scripts/monitor_performance.py
-    restart: unless-stopped
-    networks:
-      - beacon-network
-    profiles:
-      - monitor
-
-  # State management CLI
-  beacon-state-cli:
-    image: beacon-indexer:latest
-    container_name: beacon-state-cli
-    environment:
-      <<: *base-env
-    volumes:
-      - ./scripts:/app/scripts
-    command: python /app/scripts/manage_state.py
-    networks:
-      - beacon-network
-    profiles:
-      - cli
-    
-networks:
-  beacon-network:
-    driver: bridge
+      - transform
