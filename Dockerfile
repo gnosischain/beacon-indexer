@@ -15,6 +15,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY src/ src/
 COPY migrations/ migrations/
 COPY scripts/ scripts/
+COPY config/ config/
 
 # Create entrypoint script
 COPY docker-entrypoint.sh /entrypoint.sh

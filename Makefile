@@ -30,13 +30,13 @@ transform: ## Process raw data into structured tables
 
 # Monitoring (automatic - no manual fixes needed)
 status: ## Show chunk progress
-	docker run --rm --env-file .env beacon-indexer-v2:latest python scripts/chunks.py overview
+	docker run --rm --env-file .env beacon-indexer:latest python scripts/chunks.py overview
 
 chunks-detail: ## Show detailed chunk status
-	docker run --rm --env-file .env beacon-indexer-v2:latest python scripts/chunks.py status
+	docker run --rm --env-file .env beacon-indexer:latest python scripts/chunks.py status
 
 test-connection: ## Test ClickHouse connection
-	docker run --rm --env-file .env beacon-indexer-v2:latest python scripts/chunks.py test
+	docker run --rm --env-file .env beacon-indexer:latest python scripts/chunks.py test
 
 # Utility targets
 logs: ## Show logs for running services
@@ -48,16 +48,16 @@ clean: ## Clean up Docker resources
 
 # Docker-based development targets
 dev-migration: ## Run migration in Docker
-	docker run --rm --env-file .env beacon-indexer-v2:latest python scripts/migrate.py
+	docker run --rm --env-file .env beacon-indexer:latest python scripts/migrate.py
 
 dev-backfill: ## Run backfill in Docker (uses START_SLOT and END_SLOT from .env)
-	docker run --rm --env-file .env beacon-indexer-v2:latest python -m src.main load backfill
+	docker run --rm --env-file .env beacon-indexer:latest python -m src.main load backfill
 
 dev-realtime: ## Run realtime loader in Docker
-	docker run --rm --env-file .env beacon-indexer-v2:latest python -m src.main load realtime
+	docker run --rm --env-file .env beacon-indexer:latest python -m src.main load realtime
 
 dev-transform: ## Run transformer in Docker
-	docker run --rm --env-file .env beacon-indexer-v2:latest python -m src.main transform run
+	docker run --rm --env-file .env beacon-indexer:latest python -m src.main transform run
 
 # Service management
 restart-backfill: ## Stop and restart backfill service
@@ -74,7 +74,7 @@ restart-transform: ## Stop and restart transform service
 
 # Development helpers
 shell: ## Open interactive shell in Docker container
-	docker run --rm -it --env-file .env beacon-indexer-v2:latest /bin/bash
+	docker run --rm -it --env-file .env beacon-indexer:latest /bin/bash
 
 tail-logs: ## Show recent logs
 	docker compose logs --tail=50

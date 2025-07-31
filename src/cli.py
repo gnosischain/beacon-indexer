@@ -2,6 +2,8 @@ import asyncio
 import argparse
 from src.services.loader import LoaderService
 from src.services.transformer import TransformerService
+from src.services.clickhouse import ClickHouse
+from src.services.fork import ForkDetectionService
 from src.utils.logger import setup_logger, logger
 from src.config import config
 
@@ -40,6 +42,18 @@ def create_parser():
                                  help=f"End slot (default: {config.END_SLOT or 'required'})")
     reprocess_parser.add_argument("--batch-size", type=int, default=100, help="Batch size for processing")
     
+    # Fork command
+    fork_parser = subparsers.add_parser("fork", help="Fork-related operations")
+    fork_subparsers = fork_parser.add_subparsers(dest="fork_command")
+    
+    # Fork info
+    info_parser = fork_subparsers.add_parser("info", help="Show fork information")
+    info_parser.add_argument("--slot", type=int, help="Show fork for specific slot")
+    info_parser.add_argument("--epoch", type=int, help="Show fork for specific epoch")
+    
+    # Fork list
+    list_parser = fork_subparsers.add_parser("list", help="List all configured forks")
+    
     return parser
 
 async def main():
@@ -57,6 +71,8 @@ async def main():
             await handle_load_command(args)
         elif args.command == "transform":
             await handle_transform_command(args)
+        elif args.command == "fork":
+            await handle_fork_command(args)
         else:
             parser.print_help()
     
@@ -131,6 +147,50 @@ async def handle_transform_command(args):
     
     else:
         print("Usage: transform {run|reprocess}")
+
+async def handle_fork_command(args):
+    """Handle fork command with auto-detection."""
+    # Create fork service with auto-detection
+    clickhouse = ClickHouse()
+    fork_service = ForkDetectionService(clickhouse_client=clickhouse)
+    
+    if args.fork_command == "info":
+        if args.slot is not None:
+            fork_info = fork_service.get_fork_at_slot(args.slot)
+            epoch = args.slot // fork_service.slots_per_epoch
+            print(f"Slot {args.slot} (epoch {epoch}): {fork_info.name}")
+            print(f"  Version: {fork_info.version}")
+            print(f"  Activation Epoch: {fork_info.epoch}")
+        
+        elif args.epoch is not None:
+            fork_info = fork_service.get_fork_at_epoch(args.epoch)
+            print(f"Epoch {args.epoch}: {fork_info.name}")
+            print(f"  Version: {fork_info.version}")
+            print(f"  Activation Epoch: {fork_info.epoch}")
+        
+        else:
+            print("Usage: fork info --slot <slot> or --epoch <epoch>")
+    
+    elif args.fork_command == "list":
+        network_name = fork_service.get_network_name()
+        network_suffix = " (auto-detected)" if fork_service.is_auto_detected() else " (unknown)"
+        print(f"\nDetected network: {network_name}{network_suffix}")
+        print("=" * 60)
+        
+        all_forks = fork_service.get_all_forks()
+        if all_forks:
+            for fork_name, fork_info in all_forks.items():
+                print(f"{fork_name.upper():<12} | Epoch: {fork_info.epoch:<8} | Version: {fork_info.version}")
+        else:
+            print("No forks detected (run migration and load data first)")
+        
+        print(f"\nNetwork Configuration:")
+        print(f"  Slots per epoch: {fork_service.slots_per_epoch}")
+        print(f"  Seconds per slot: {fork_service.seconds_per_slot}")
+        print(f"  Genesis time: {fork_service.genesis_time}")
+    
+    else:
+        print("Usage: fork {info|list}")
 
 if __name__ == "__main__":
     asyncio.run(main())

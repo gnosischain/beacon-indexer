@@ -1,7 +1,7 @@
 services:
   # Migration service - Set up database schema
   migration:
-    image: beacon-indexer-v2:latest
+    image: beacon-indexer:latest
     container_name: migration
     environment:
       - CLICKHOUSE_HOST=${CLICKHOUSE_HOST}
@@ -17,7 +17,7 @@ services:
 
   # Backfill service - Load historical raw data
   backfill:
-    image: beacon-indexer-v2:latest
+    image: beacon-indexer:latest
     container_name: backfill
     environment:
       - BEACON_NODE_URL=${BEACON_NODE_URL}
@@ -40,7 +40,7 @@ services:
 
   # Realtime service - Load new raw data continuously
   realtime:
-    image: beacon-indexer-v2:latest
+    image: beacon-indexer:latest
     container_name: realtime
     environment:
       - BEACON_NODE_URL=${BEACON_NODE_URL}
@@ -60,7 +60,7 @@ services:
 
   # Transform service - Process raw data into structured tables
   transform:
-    image: beacon-indexer-v2:latest
+    image: beacon-indexer:latest
     container_name: transform
     environment:
       - CLICKHOUSE_HOST=${CLICKHOUSE_HOST}

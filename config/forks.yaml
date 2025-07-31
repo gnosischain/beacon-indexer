@@ -1,0 +1,34 @@
+# Minimal fork configuration - only what we can't get from raw data
+# Most timing and network info comes from specs/genesis tables
+
+# Network detection from CONFIG_NAME
+network_mapping:
+  mainnet: "mainnet"
+  gnosis: "gnosis" 
+
+# Fork version patterns by network (the only thing we can't derive from raw data)
+fork_versions:
+  mainnet:
+    phase0: "0x00000000"
+    altair: "0x01000000"
+    bellatrix: "0x02000000"
+    capella: "0x03000000"
+    deneb: "0x04000000"
+    electra: "0x05000000"
+  
+  gnosis:
+    phase0: "0x00000064"
+    altair: "0x01000064"
+    bellatrix: "0x02000064"
+    capella: "0x03000064"
+    deneb: "0x04000064"
+    electra: "0x05000064"
+
+# Fork order (used for slot -> fork determination)
+fork_order:
+  - phase0
+  - altair
+  - bellatrix
+  - capella
+  - deneb
+  - electra
