@@ -1,56 +1,78 @@
+import structlog
 import logging
 import sys
+import os
+from src.config import config
 
-def setup_logger(name, log_level=logging.INFO):
-    """Set up a logger with the given name and level.
+def setup_logger():
+    """Configure logging - force human readable format in containers too."""
     
-    Args:
-        name: Logger name
-        log_level: Can be either:
-            - A logging level constant (e.g., logging.INFO)
-            - A string level name (e.g., "INFO", "DEBUG")
-            - A numeric level (e.g., 20 for INFO)
-            - A string containing a number (e.g., "20")
-    """
-    logger = logging.getLogger(name)
+    # Force human-readable format everywhere
+    # You can change this by setting FORCE_JSON_LOGS=true in .env if needed
+    force_json = os.getenv("FORCE_JSON_LOGS", "false").lower() == "true"
     
-    # Clear any existing handlers to prevent duplicates
-    if logger.handlers:
-        logger.handlers = []
-    
-    # Handle different log level formats
-    if isinstance(log_level, str):
-        # Check if it's a numeric string like "20"
-        try:
-            numeric_level = int(log_level)
-            log_level = numeric_level
-        except ValueError:
-            # It's a string level name like "INFO", convert to logging constant
-            try:
-                log_level = getattr(logging, log_level.upper())
-            except AttributeError:
-                # Default to INFO if unknown level
-                log_level = logging.INFO
-    
-    logger.setLevel(log_level)
-    
-    # Create a handler that outputs to stdout
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setLevel(log_level)
-    
-    # Format logs
-    formatter = logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    # Configure standard library logging
+    logging.basicConfig(
+        level=getattr(logging, config.LOG_LEVEL),
+        format="%(message)s"
     )
-    handler.setFormatter(formatter)
     
-    # Add the handler to the logger
-    logger.addHandler(handler)
+    if force_json:
+        # JSON format only if explicitly requested
+        processors = [
+            structlog.stdlib.filter_by_level,
+            structlog.stdlib.add_logger_name,
+            structlog.stdlib.add_log_level,
+            structlog.stdlib.PositionalArgumentsFormatter(),
+            structlog.processors.TimeStamper(fmt="iso"),
+            structlog.processors.JSONRenderer()
+        ]
+    else:
+        # Human readable format (default)
+        processors = [
+            structlog.stdlib.filter_by_level,
+            structlog.stdlib.add_log_level,
+            structlog.stdlib.PositionalArgumentsFormatter(),
+            structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S"),
+            simple_console_renderer
+        ]
     
-    # Prevent propagation to the root logger to avoid duplicate logs
-    logger.propagate = False
-    
-    return logger
+    structlog.configure(
+        processors=processors,
+        context_class=dict,
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        wrapper_class=structlog.stdlib.BoundLogger,
+        cache_logger_on_first_use=True,
+    )
 
-# Create a default logger
-logger = setup_logger('beacon_scraper')
+def simple_console_renderer(logger, method_name, event_dict):
+    """Simple console renderer for development."""
+    timestamp = event_dict.pop("timestamp", "")
+    level = event_dict.pop("level", "INFO").upper()
+    event = event_dict.pop("event", "")
+    
+    # Format main message  
+    msg = f"{timestamp} [{level:<5}] {event}"
+    
+    # Add context if present (but keep it concise)
+    if event_dict:
+        # Skip logger field and prioritize important fields
+        important_fields = ["worker", "loader", "start_slot", "end_slot", "chunk_number", "success_count"]
+        context_parts = []
+        
+        # Add important fields first
+        for field in important_fields:
+            if field in event_dict:
+                context_parts.append(f"{field}={event_dict.pop(field)}")
+        
+        # Add remaining fields (except logger, stack, exception)
+        for k, v in event_dict.items():
+            if k not in ["logger", "stack", "exception"]:
+                context_parts.append(f"{k}={v}")
+        
+        if context_parts:
+            msg += f" | {' '.join(context_parts)}"
+    
+    return msg
+
+logger = structlog.get_logger()

@@ -1,660 +1,305 @@
-![Beacon-Indexer Header](img/header-beacon_indexer.png)
+# Beacon Chain Indexer
 
-A scraper for Beacon Chain that extracts and stores data in a ClickHouse database for analysis.
+![Beacon Indexer](img/header-beacon_indexer.png)
 
-## Overview
+A production-ready beacon chain indexer using the ELT (Extract, Load, Transform) pattern with **fork-aware parsing**. This indexer loads raw data from the beacon API first, then transforms it into structured tables with automatic fork detection and appropriate parsing for each Ethereum consensus layer upgrade.
 
-This project provides a complete solution for scraping data from a beacon chain node and storing it in a ClickHouse database. It supports both historical backfilling and real-time streaming of beacon chain data with multiple processing modes for optimal performance.
+## Features
 
-Key features:
-- Extract data from multiple beacon chain endpoints (blocks, attestations, validators, etc.)
-- Store data in an optimized ClickHouse database schema
-- Support for all consensus layer forks (Phase 0, Altair, Bellatrix, Capella, Deneb, Electra)
-- Multiple processing modes: realtime, historical, and parallel
-- Configurable scrapers - run only what you need
-- Intelligent validator processing (daily snapshots for efficiency)
-- Bulk insertion optimization for high-throughput scenarios
-- Comprehensive data model for all beacon chain components
+- **Fork-Aware Architecture**: Automatic detection and parsing of all Ethereum consensus forks (Phase 0, Altair, Bellatrix, Capella, Deneb, Electra)
+- **ELT Architecture**: Raw data loading and transformation are completely separated for reliability
+- **Multi-Network Support**: Mainnet, Gnosis Chain, Holesky, Sepolia with auto-detected fork schedules
+- **Parallel Processing**: Multi-worker backfill with intelligent chunk distribution
+- **Resilient Design**: Raw data is never lost, transformations can be rerun with different parsers
+- **Range-Based Progress**: Handles gaps and failures gracefully with detailed progress tracking
 
-## Requirements
+## Quick Start
 
-- Python 3.8+
-- ClickHouse database (local or ClickHouse Cloud)
-- Access to a beacon chain node (Lighthouse, Prysm, Teku, Nimbus, or others)
-- Docker and Docker Compose (for containerized deployment)
-
-## Installation
-
-### Option 1: Local Installation
-
-#### 1. Clone the repository
-
-```bash
-git clone https://github.com/yourusername/beacon-indexer.git
-cd beacon-indexer
-```
-
-#### 2. Set up a virtual environment
-
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows, use: venv\Scripts\activate
-```
-
-#### 3. Install dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-### Option 2: Docker Installation
-
-#### 1. Clone the repository
-
-```bash
-git clone https://github.com/yourusername/beacon-indexer.git
-cd beacon-indexer
-```
-
-#### 2. Configure environment
-
-Create a `.env` file by copying the example:
+### 1. Configuration
 
 ```bash
 cp .env.example .env
+# Edit .env with your settings:
+# - BEACON_NODE_URL: Your beacon node API endpoint
+# - CLICKHOUSE_HOST: ClickHouse database host
+# - START_SLOT/END_SLOT: Range for backfill
 ```
 
-Edit the `.env` file with your configuration (see Configuration section below).
-
-#### 3. Build and start the Docker containers
+### 2. Build and Initialize
 
 ```bash
-docker compose build
+make build
+make migration
+```
+
+### 3. Load Data
+
+```bash
+# Load historical data
+make backfill
+
+# Start real-time loading
+make realtime
+
+# Process into structured tables
+make transform
+```
+
+### 4. Monitor Progress
+
+```bash
+make status
+make logs
+```
+
+## Architecture Overview
+
+### ELT Pipeline
+
+1. **Extract & Load**: Raw JSON data from beacon API → `raw_blocks`, `raw_validators` tables
+2. **Transform**: Fork-aware parsing → structured tables (`blocks`, `attestations`, `execution_payloads`, etc.)
+
+### Fork-Aware Processing
+
+The indexer automatically detects and handles all Ethereum consensus forks:
+
+| Fork | Key Features | New Tables |
+|------|--------------|------------|
+| **Phase 0** | Basic blocks, attestations | `blocks`, `attestations`, `deposits` |
+| **Altair** | Sync committees | `sync_aggregates`, `sync_committees` |
+| **Bellatrix** | Execution payloads (The Merge) | `execution_payloads`, `transactions` |
+| **Capella** | Withdrawals (Shanghai) | `withdrawals`, `bls_changes` |
+| **Deneb** | Blob transactions (Cancun) | `blob_sidecars`, `blob_commitments` |
+| **Electra** | Execution requests | `execution_requests` |
+
+### Network Support
+
+- **Mainnet**: Full production support
+- **Gnosis Chain**: Different slot timing (5s vs 12s) and fork schedule
+- **Testnets**: Holesky, Sepolia with appropriate configurations
+
+## Essential Commands
+
+```bash
+# Build Docker images
+make build
+
+# Set up database schema
+make migration
+
+# Load historical data (set START_SLOT/END_SLOT in .env)
+make backfill
+
+# Start continuous data loading
+make realtime
+
+# Process raw data into structured tables
+make transform
+
+# Check progress
+make status
+
+# View logs
+make logs
+
+# Clean up
+make clean
 ```
 
 ## Configuration
 
-### Local ClickHouse Setup
-
-If you're using a local ClickHouse instance, you can set it up with:
+Key environment variables in `.env`:
 
 ```bash
-# Using the provided script
-./scripts/setup_clickhouse.sh
+# Beacon Node
+BEACON_NODE_URL=http://localhost:5052
 
-# Or manually run migrations
-./run_migrations.sh
-```
-
-### ClickHouse Cloud Setup
-
-For ClickHouse Cloud, you'll need to:
-
-1. Create a ClickHouse Cloud account and instance
-2. Configure your `.env` file with your ClickHouse Cloud credentials
-3. Run migrations using the provided script:
-
-```bash
-./run_migrations.sh
-```
-
-### Environment Configuration
-
-Create a `.env` file by copying the example:
-
-```bash
-cp .env.example .env
-```
-
-Edit the `.env` file with your configuration:
-
-```ini
-# Beacon Node configuration
-BEACON_NODE_URL=http://your-beacon-node:5052
-
-# ClickHouse configuration
-CLICKHOUSE_HOST=your-instance.cloud.clickhouse.com  # For ClickHouse Cloud
-CLICKHOUSE_PORT=443  # Use 443 for ClickHouse Cloud or 9000 for local
+# ClickHouse Database
+CLICKHOUSE_HOST=localhost
+CLICKHOUSE_PORT=9000
 CLICKHOUSE_USER=default
-CLICKHOUSE_PASSWORD=your_password
+CLICKHOUSE_PASSWORD=
 CLICKHOUSE_DATABASE=beacon_chain
 
-# Scraper configuration
-SCRAPER_MODE=realtime  # Options: realtime, historical, parallel
-HISTORICAL_START_SLOT=0
-HISTORICAL_END_SLOT=  # Leave empty to use latest slot
-BATCH_SIZE=100
-MAX_CONCURRENT_REQUESTS=5
-PARALLEL_WORKERS=4  # For parallel mode
-LOG_LEVEL=20  # 10=DEBUG, 20=INFO, 30=WARNING, 40=ERROR, 50=CRITICAL
-ENABLED_SCRAPERS=block,validator,reward,blob,specs  # Comma-separated list of scrapers to enable
+# Data Loading
+START_SLOT=0
+END_SLOT=1000000
+BACKFILL_WORKERS=4
+CHUNK_SIZE=1000
+
+# Validator Processing
+VALIDATOR_MODE=daily  # or all_slots
+
+# Network (auto-detected from beacon node)
+# NETWORK_NAME=mainnet  # optional override
 ```
 
-## Running the Indexer
+### Validator Processing Modes
 
-### Using Docker (Recommended)
+| Mode | Description | Use Case |
+|------|-------------|----------|
+| `daily` | Process validators only on the last slot of each day | Production efficiency |
+| `all_slots` | Process validators for every slot | Complete data requirements |
 
-First, run migrations to prepare the database:
+## Database Schema
 
+### Raw Tables (Fork-Agnostic)
+- `raw_blocks`: Raw beacon block JSON data
+- `raw_validators`: Raw validator data  
+- `raw_specs`: Chain specifications
+- `raw_genesis`: Genesis information
+
+### Structured Tables (Fork-Aware)
+
+**Core Tables**
+- `blocks`: Processed beacon blocks with fork-specific fields
+- `attestations`: Block attestations
+- `validators`: Validator information and states
+
+**Fork-Specific Tables**
+- `sync_aggregates`, `sync_committees` (Altair+)
+- `execution_payloads`, `transactions` (Bellatrix+)
+- `withdrawals`, `bls_changes` (Capella+)
+- `blob_sidecars`, `blob_commitments` (Deneb+)
+- `execution_requests` (Electra+)
+
+**System Tables**
+- `genesis`: Genesis time and configuration
+- `specs`: Chain timing parameters
+- `load_state_chunks`: Backfill progress tracking
+- `transformer_progress`: Processing progress
+
+## Network Examples
+
+### Mainnet
 ```bash
-# Run migrations
-docker compose run --rm beacon-migrate
+# Uses default settings
+make migration && make backfill && make realtime && make transform
 ```
 
-Then start the indexer in your chosen mode:
+### Gnosis Chain
+```bash
+export BEACON_NODE_URL=https://beacon-chain.gnosis.io
+make migration && make backfill && make realtime && make transform
+```
+
+### Holesky Testnet
+```bash
+export BEACON_NODE_URL=https://ethereum-holesky-beacon-api.publicnode.com
+export START_SLOT=0
+export END_SLOT=100000
+make migration && make backfill
+```
+
+## CLI Usage
+
+The indexer also supports direct CLI usage:
 
 ```bash
-# Start in detached mode
-docker compose up -d beacon-scraper
+# Fork information
+python -m src.main fork list
+python -m src.main fork info --slot 5000000
+
+# Load operations
+python -m src.main load realtime
+python -m src.main load backfill --start-slot 0 --end-slot 1000000
+
+# Transform operations
+python -m src.main transform run --continuous
+python -m src.main transform reprocess --start-slot 0 --end-slot 1000
+```
+
+## Monitoring
+
+### Progress Tracking
+```bash
+# Overall progress
+make status
 
 # View logs
-docker compose logs -f beacon-scraper
+make logs
+
+# Detailed monitoring
+docker run --rm --env-file .env beacon-indexer:latest python scripts/transformer_status.py
 ```
 
-### Using Python Directly
+### Key Metrics
+- **Chunk Progress**: Backfill completion by loader
+- **Transform Status**: Raw data processing progress  
+- **Fork Detection**: Active fork per slot/epoch
+- **Error Tracking**: Failed ranges and retry status
 
-The scraper can be run in three different modes with configurable components:
+## Development
 
-#### Real-time Mode
-
-This mode continuously processes new blocks as they are produced on the chain:
-
-```bash
-python -m src.main --mode realtime --scrapers block,validator,reward,blob,specs
-```
-
-or using environment variables:
-
-```bash
-SCRAPER_MODE=realtime ENABLED_SCRAPERS=block,validator,reward,blob,specs python -m src.main
-```
-
-#### Historical Mode
-
-This mode backfills data from a specified slot range:
-
-```bash
-python -m src.main --mode historical --scrapers block,validator,reward,blob,specs --start-slot 0 --end-slot 1000000 --batch-size 100
-```
-
-or using environment variables:
-
-```bash
-SCRAPER_MODE=historical HISTORICAL_START_SLOT=0 HISTORICAL_END_SLOT=1000000 BATCH_SIZE=100 ENABLED_SCRAPERS=block,validator,reward,blob,specs python -m src.main
-```
-
-If you don't specify an end slot, it will use the latest slot on the beacon chain.
-
-#### Parallel Mode (NEW!)
-
-This mode uses multiple workers to process historical data in parallel for maximum throughput:
-
-```bash
-python -m src.main --mode parallel --scrapers block,validator,reward,blob,specs --start-slot 0 --end-slot 1000000 --parallel-workers 8 --batch-size 1000
-```
-
-or using environment variables:
-
-```bash
-SCRAPER_MODE=parallel HISTORICAL_START_SLOT=0 HISTORICAL_END_SLOT=1000000 PARALLEL_WORKERS=8 BATCH_SIZE=1000 ENABLED_SCRAPERS=block,validator,reward,blob,specs python -m src.main
-```
-
-#### Selective Component Execution
-
-You can choose which scrapers to enable by using the `--scrapers` parameter or the `ENABLED_SCRAPERS` environment variable:
-
-```bash
-# Run only block and validator scrapers in realtime mode
-python -m src.main --mode realtime --scrapers block,validator
-
-# Run only block data backfill in historical mode
-python -m src.main --mode historical --scrapers block --start-slot 1000000 --end-slot 2000000
-```
-
-Available scrapers:
-- `block`: Basic block data and components (attestations, deposits, etc.)
-- `validator`: Validator information (daily snapshots for efficiency)
-- `reward`: Block rewards and attestation rewards
-- `blob`: Blob sidecars for data availability (Deneb+ only)
-- `specs`: Chain specifications (runs once)
-
-### Processing Modes Comparison
-
-| Mode | Use Case | Performance | Resource Usage | Best For |
-|------|----------|-------------|----------------|----------|
-| **Realtime** | Live monitoring | Low-moderate | Low | Production monitoring |
-| **Historical** | Single-threaded backfill | Moderate | Low-moderate | Initial sync, gap filling |
-| **Parallel** | Multi-threaded backfill | High | High | Large historical ranges |
-
-### Command Line Arguments
-
-- `--mode`: Scraper mode (realtime, historical, or parallel)
-- `--scrapers`: Comma-separated list of scrapers to enable (block,validator,reward,blob,specs)
-- `--start-slot`: Starting slot for historical/parallel mode
-- `--end-slot`: Ending slot for historical/parallel mode
-- `--batch-size`: Number of slots to process in each batch
-- `--parallel-workers`: Number of parallel workers (parallel mode only)
-
-## Project Structure
-
+### Project Structure
 ```
 beacon-indexer/
-├── README.md                   # Project documentation
-├── docker-compose.yml          # Docker Compose configuration
-├── Dockerfile                  # Docker image definition
-├── requirements.txt            # Python dependencies
-├── pyproject.toml              # Project metadata
-├── run_clickhouse_migrations.py # Database migration script
-├── run_migrations.sh           # Migration helper script
-├── setup.py                    # Package installation script
-├── .env.example                # Example environment variables
-├── migrations/                 # Database migrations
-│   ├── 001_initial_schema.up.sql
-│   ├── 001_initial_schema.down.sql
-│   ├── 002_add_indices.up.sql
-│   └── 002_add_indices.down.sql
-├── scripts/                    # Utility scripts
-│   ├── docker-entrypoint.sh    # Docker entrypoint
-│   └── update_specs.py         # Specs updater script
-├── src/                        # Source code
-│   ├── __init__.py
-│   ├── config.py               # Configuration management
-│   ├── main.py                 # Main entry point
-│   ├── models/                 # Data models
-│   ├── repositories/           # Database access layer
-│   ├── scrapers/               # Data extraction components
-│   ├── services/               # Core services
-│   └── utils/                  # Utility functions
-└── tests/                      # Test suite
+├── src/
+│   ├── services/          # Core services
+│   │   ├── beacon_api.py  # Beacon node client
+│   │   ├── clickhouse.py  # Database client
+│   │   ├── fork.py        # Fork detection
+│   │   ├── loader.py      # Data loading service
+│   │   └── transformer.py # Data transformation
+│   ├── loaders/           # Data loaders
+│   │   ├── blocks.py      # Block data loader
+│   │   ├── validators.py  # Validator data loader
+│   │   ├── specs.py       # Chain specs loader
+│   │   └── genesis.py     # Genesis loader
+│   └── parsers/           # Fork-aware parsers
+│       ├── factory.py     # Parser factory
+│       ├── phase0.py      # Phase 0 parser
+│       ├── altair.py      # Altair parser
+│       ├── bellatrix.py   # Bellatrix parser
+│       ├── capella.py     # Capella parser
+│       ├── deneb.py       # Deneb parser
+│       └── electra.py     # Electra parser
+├── migrations/            # Database migrations
+├── config/               # Fork configurations
+├── scripts/              # Utility scripts
+└── docker-compose.yml    # Docker services
 ```
 
-## Components
+### Adding New Forks
 
-### Scrapers
-
-The project includes specialized scrapers for each type of beacon chain data:
-
-- `BlockScraper`: Extracts block information and embedded components (attestations, deposits, slashings, etc.)
-- `ValidatorScraper`: Extracts validator information with intelligent daily snapshot processing
-- `BlobSidecarScraper`: Processes blob sidecars (Deneb+)
-- `RewardScraper`: Extracts reward calculations for blocks, attestations, and sync committees
-- `SpecsScraper`: Extracts chain specifications (runs once)
-
-### Services
-
-- `BeaconAPIService`: Interface with the beacon chain node API
-- `ClickHouseService`: Database interaction layer with bulk insertion optimization
-- `HistoricalService`: Coordinates historical data scraping
-- `RealtimeService`: Manages real-time data processing
-- `ParallelService`: Manages multi-worker parallel processing (NEW!)
-- `BulkInsertionService`: Optimizes database insertions for high throughput
-
-### Models
-
-The project uses Pydantic models to ensure data integrity:
-
-- `BeaconBlock`, `Attestation`, `Validator`, etc.
-- Models include methods for conversion between API response and database formats
-
-### Repositories
-
-Database access layer with specialized repositories for each data type:
-
-- `BeaconBlockRepository`, `AttestationRepository`, `ValidatorRepository`, etc.
-- Provides CRUD operations and specialized queries
-
-## Running Modes
-
-### Realtime Mode
-
-Realtime mode continuously processes new blocks as they are produced on the beacon chain:
-
-- Polls the beacon node at regular intervals
-- Processes one block at a time as they are created
-- Maintains state to track the last processed slot
-- Runs as a daemon process
-- Validator scraper only processes target slots (last slot of each day)
-
-This mode is ideal for keeping a database continuously updated with the current state of the chain.
-
-### Historical Mode
-
-Historical mode backfills data by processing past blocks:
-
-- Processes a defined range of slots from a start to end point
-- Uses batch processing for efficiency
-- Terminates when the specified range is completed
-- Intelligent slot targeting for validator scraper
-
-This mode is ideal for initial database population or filling gaps in data.
-
-### Parallel Mode (NEW!)
-
-Parallel mode uses multiple workers to process historical data simultaneously:
-
-- Spawns multiple worker processes to handle different slot ranges
-- Optimized for maximum throughput on large historical ranges
-- Uses bulk insertion for database efficiency
-- Automatically manages worker coordination and range assignment
-- Each worker processes its assigned range independently
-
-This mode is ideal for rapidly processing large amounts of historical data.
-
-## Validator Processing Optimization
-
-The validator scraper has been optimized for efficiency:
-
-- **Daily Snapshots**: Only processes the last slot of each day to reduce storage requirements
-- **Smart Slot Detection**: Automatically identifies target slots based on UTC day boundaries
-- **Batch Processing**: Processes validators in configurable batch sizes
-- **Memory Optimization**: Uses streaming processing to handle large validator sets
-
-This approach reduces database size by ~99% while maintaining essential validator state information.
-
-## Database Migration Details
-
-The migration system is designed to work with both local ClickHouse instances and ClickHouse Cloud.
-
-### File Structure for Migrations
-
-```
-beacon-indexer/
-├── docker-compose.yml           # Configuration for Docker services
-├── Dockerfile                   # Instructions to build the Docker image
-├── run_clickhouse_migrations.py # The migration script that can be run directly or via Docker
-├── run_migrations.sh            # Helper script to run migrations in various environments
-└── migrations/                  # Directory containing SQL migration files
-    ├── 001_initial_schema.up.sql
-    └── 002_add_indices.up.sql
-```
-
-### Running Migrations
-
-You can run migrations in several ways:
-
-1. **Using Docker Compose**:
-   ```bash
-   docker compose run --rm beacon-migrate
-   ```
-
-2. **Using the helper script** (which will choose the best method automatically):
-   ```bash
-   ./run_migrations.sh
-   ```
-
-3. **Directly with the Python script** (if running outside Docker):
-   ```bash
-   ./run_clickhouse_migrations.py \
-     host=your-instance.cloud.clickhouse.com \
-     port=443 \
-     user=default \
-     password=your_password \
-     db=beacon_chain \
-     dir=./migrations \
-     direction=up \
-     secure=True \
-     verify=False
-   ```
-
-### Advanced Migration Usage
-
-#### Running Migrations Down
-
-To revert migrations (rarely needed):
-
-```bash
-# Using Docker Compose with custom direction
-docker compose run --rm -e CH_DIRECTION=down beacon-migrate
-
-# Using the Python script directly
-./run_clickhouse_migrations.py \
-  host=your-instance.cloud.clickhouse.com \
-  port=443 \
-  user=default \
-  password=your_password \
-  db=beacon_chain \
-  dir=./migrations \
-  direction=down \
-  secure=True \
-  verify=False
-```
-
-#### Custom Migration Directory
-
-If your migrations are in a different location:
-
-```bash
-# With Docker Compose
-docker compose run --rm -e CH_MIGRATIONS_DIR=/custom/path beacon-migrate
-
-# With Python script
-./run_clickhouse_migrations.py dir=/custom/path
-```
-
-## Performance Optimization
-
-### Bulk Insertion
-
-The indexer uses sophisticated bulk insertion strategies:
-
-- **Batched Inserts**: Groups multiple records into single database operations
-- **Parallel Processing**: Multiple insertion queues for different table types
-- **Adaptive Batch Sizing**: Automatically adjusts batch sizes based on table characteristics
-- **Memory Management**: Streaming processing to handle large datasets
-
-### Concurrency Control
-
-- **Semaphore-based Rate Limiting**: Prevents overwhelming the beacon node API
-- **Worker Coordination**: Intelligent range assignment in parallel mode
-- **Database Connection Pooling**: Efficient database resource utilization
-
-### Memory Optimization
-
-- **Streaming Processing**: Processes data without loading entire datasets into memory
-- **Cache Management**: LRU-style caching for frequently accessed data
-- **Garbage Collection**: Automatic cleanup of processed data
+1. **Update Fork Config** (`config/forks.yaml`)
+2. **Create Migration** (`migrations/XXX_fork_name.sql`)
+3. **Create Parser** (`src/parsers/fork_name.py`)
+4. **Register Parser** (update `factory.py`)
 
 ## Troubleshooting
 
-### Checking Migration Status
+### Common Issues
 
-To check which migrations have been applied:
+**Fork Detection Failed**
+- Ensure genesis and specs data are loaded
+- Check network configuration
 
-```sql
-SELECT * FROM beacon_chain.migrations ORDER BY executed_at;
-```
+**Processing Stuck**
+- Check `make status` for failed chunks
+- Failed chunks are automatically retried
 
-### Connection Issues
+**Schema Errors**
+- Run `make migration` to update schema
+- Reprocess data: `python -m src.main transform reprocess`
 
-If you have trouble connecting to ClickHouse Cloud:
+### Performance
 
-1. Verify your connection details in `.env`
-2. Make sure `secure=True` for ClickHouse Cloud
-3. Check for any firewalls blocking outbound connections on port 443
-4. Try connecting with the ClickHouse client directly:
-   ```bash
-   clickhouse-client --host=your-instance.cloud.clickhouse.com \
-     --port=443 \
-     --user=default \
-     --password=your_password \
-     --secure
-   ```
+- **Backfill**: Adjust `BACKFILL_WORKERS` and `CHUNK_SIZE`
+- **Transform**: Increase batch size for better throughput
+- **Database**: Fork-specific indexes improve query performance
 
-### Docker Issues
+## Docker Services
 
-If you encounter issues with Docker:
+The indexer runs as separate Docker services:
 
-1. Make sure all containers are properly stopped and removed:
-   ```bash
-   docker compose down --rmi all --volumes --remove-orphans
-   ```
+- **migration**: Database schema setup
+- **backfill**: Historical data loading  
+- **realtime**: Continuous data loading
+- **transform**: Data processing
 
-2. Rebuild from scratch:
-   ```bash
-   docker compose build --no-cache
-   ```
-
-3. Check if the changes to your code are being properly included in the built images by examining the container:
-   ```bash
-   docker compose run --rm --entrypoint bash beacon-scraper
-   cat /app/src/main.py | grep "scrapers"
-   ```
-
-### Performance Issues
-
-If you're experiencing slow processing:
-
-1. **Increase Parallel Workers**: For historical/parallel mode, increase `PARALLEL_WORKERS`
-2. **Adjust Batch Size**: Increase `BATCH_SIZE` for better throughput
-3. **Tune Concurrency**: Adjust `MAX_CONCURRENT_REQUESTS` based on your beacon node capacity
-4. **Monitor Resources**: Check CPU, memory, and network usage
-5. **Database Optimization**: Ensure ClickHouse has sufficient resources
-
-### Log Level Configuration
-
-You can adjust the verbosity of logging by setting the `LOG_LEVEL` environment variable:
-
-```bash
-# Set to DEBUG level for maximum verbosity
-LOG_LEVEL=10 docker compose up beacon-scraper
-
-# Set to INFO level (default)
-LOG_LEVEL=20 docker compose up beacon-scraper
-
-# Set to WARNING level for minimal logs
-LOG_LEVEL=30 docker compose up beacon-scraper
-```
-
-### Migration Script Errors
-
-If you encounter errors with the migration script:
-
-1. Check the error message for specific SQL issues
-2. Verify that your migrations directory contains valid SQL files
-3. Run with more detailed logging to see specifics of the error
-
-### Validator Processing Issues
-
-If validator processing is slow or failing:
-
-1. **Reduce Batch Size**: Lower the validator batch size in the scraper configuration
-2. **Check Memory Usage**: Validator processing can be memory-intensive
-3. **Verify Target Slots**: Ensure the validator scraper is correctly identifying target slots
-4. **Monitor API Timeouts**: Increase timeout values if the beacon node is slow
-
-## Example Workflows
-
-### Initial Setup and Full Historical Sync
-
-```bash
-# 1. Run migrations
-./run_migrations.sh
-
-# 2. Start with parallel mode for fast historical sync
-SCRAPER_MODE=parallel \
-HISTORICAL_START_SLOT=0 \
-PARALLEL_WORKERS=8 \
-BATCH_SIZE=1000 \
-ENABLED_SCRAPERS=block,validator,reward,blob,specs \
-python -m src.main
-
-# 3. Switch to realtime mode for ongoing monitoring
-SCRAPER_MODE=realtime \
-ENABLED_SCRAPERS=block,validator,reward,blob \
-python -m src.main
-```
-
-### Gap Filling
-
-```bash
-# Fill missing data between specific slots
-SCRAPER_MODE=historical \
-HISTORICAL_START_SLOT=5000000 \
-HISTORICAL_END_SLOT=5100000 \
-ENABLED_SCRAPERS=block,reward \
-python -m src.main
-```
-
-### Validator-Only Processing
-
-```bash
-# Process only validator data for a specific period
-SCRAPER_MODE=historical \
-HISTORICAL_START_SLOT=4000000 \
-HISTORICAL_END_SLOT=5000000 \
-ENABLED_SCRAPERS=validator \
-python -m src.main
-```
-
-## State Management
-
-The beacon indexer now includes comprehensive state management to track indexing progress and enable efficient restarts.
-
-### Key Features
-
-- **Range-based tracking**: Indexes data in configurable ranges (default: 10,000 slots)
-- **Per-table state**: Each scraper tracks progress for each table it writes to
-- **Automatic gap detection**: Continuously monitors for gaps in indexed data
-- **Retry mechanism**: Failed ranges are automatically retried with exponential backoff
-- **Worker coordination**: Multiple workers can process different ranges in parallel
-- **Progress monitoring**: Real-time visibility into indexing progress
-
-### State Tables
-
-- `beacon_indexing_state`: Tracks the state of each range being processed
-- `beacon_sync_position`: Tracks the latest synced position for real-time mode
-- `beacon_indexing_progress`: View showing aggregated progress statistics
-- `beacon_indexing_gaps`: View showing detected gaps in indexed data
-
-### Monitoring Tools
-
-#### Check Progress
-```bash
-python scripts/check_indexing_progress.py
-```
-
-#### Real-time Performance Monitor
-```bash
-python scripts/monitor_performance.py
-```
-
-#### State Management CLI
-```bash
-# Show progress
-python scripts/manage_state.py progress
-
-# Reset failed ranges
-python scripts/manage_state.py reset-failed --scraper block_scraper
-
-# Show gaps
-python scripts/manage_state.py gaps
-
-# Reset stale jobs
-python scripts/manage_state.py reset-stale --timeout 60
-
-# Create ranges manually
-python scripts/manage_state.py create-ranges block_scraper blocks 0 1000000
-```
-
-### Configuration
-
-New environment variables for state management:
-
-- `STATE_RANGE_SIZE`: Size of each indexing range (default: 10000)
-- `MAX_RETRY_ATTEMPTS`: Maximum retry attempts for failed ranges (default: 3)
-- `STALE_JOB_TIMEOUT_MINUTES`: Timeout for marking jobs as stale (default: 30)
-- `GAP_CHECK_INTERVAL_SECONDS`: Interval for gap detection (default: 300)
-- `ENABLE_STATE_CACHING`: Enable caching of completed ranges (default: true)
-
-### Benefits
-
-1. **Efficient Restarts**: No need to re-query already indexed data
-2. **Granular Progress Tracking**: Know exactly what's been indexed for each table
-3. **Automatic Recovery**: Failed ranges are retried automatically
-4. **Parallel Processing**: Multiple workers coordinate through the database
-5. **Gap Prevention**: Continuous monitoring ensures no data is missed
-
+Each service can be scaled and monitored independently.
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+This project is licensed under the [MIT License](LICENSE)
