@@ -71,7 +71,3 @@ CREATE TABLE IF NOT EXISTS transactions (
 ) ENGINE = ReplacingMergeTree(insert_version)
 ORDER BY (slot, transaction_index, transaction_hash)
 PARTITION BY toStartOfMonth(slot_timestamp);
-
--- Update schema version
-INSERT INTO sync_progress (process_name, last_processed_slot) 
-VALUES ('schema_version', 3);

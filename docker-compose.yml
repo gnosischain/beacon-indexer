@@ -58,7 +58,7 @@ services:
     profiles:
       - realtime
 
-  # Transform service - Process raw data into structured tables
+  # Transform service - Process raw data into structured tables (BATCH MODE - exits when done)
   transform:
     image: beacon-indexer:latest
     container_name: transform
@@ -71,7 +71,24 @@ services:
       - CLICKHOUSE_SECURE=${CLICKHOUSE_SECURE}
       - ENABLED_LOADERS=${ENABLED_LOADERS}
       - LOG_LEVEL=${LOG_LEVEL}
-    command: ["python", "-m", "src.main", "transform", "run"]
-    restart: unless-stopped
+    command: ["python", "-m", "src.main", "transform", "batch"]
     profiles:
       - transform
+
+  # Transform continuous service - Process raw data continuously (stays running)
+  transform-continuous:
+    image: beacon-indexer:latest
+    container_name: transform-continuous
+    environment:
+      - CLICKHOUSE_HOST=${CLICKHOUSE_HOST}
+      - CLICKHOUSE_PORT=${CLICKHOUSE_PORT}
+      - CLICKHOUSE_USER=${CLICKHOUSE_USER}
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
+      - CLICKHOUSE_DATABASE=${CLICKHOUSE_DATABASE}
+      - CLICKHOUSE_SECURE=${CLICKHOUSE_SECURE}
+      - ENABLED_LOADERS=${ENABLED_LOADERS}
+      - LOG_LEVEL=${LOG_LEVEL}
+    command: ["python", "-m", "src.main", "transform", "run", "--continuous"]
+    restart: unless-stopped
+    profiles:
+      - transform-continuous

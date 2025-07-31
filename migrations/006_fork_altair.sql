@@ -32,7 +32,3 @@ CREATE TABLE IF NOT EXISTS sync_committees (
 ) ENGINE = ReplacingMergeTree(insert_version)
 ORDER BY period
 PARTITION BY intDiv(period, 100);
-
--- Update schema version
-INSERT INTO sync_progress (process_name, last_processed_slot) 
-VALUES ('schema_version', 2);

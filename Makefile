@@ -1,7 +1,7 @@
-.PHONY: help install build clean migration backfill realtime transform logs \
+.PHONY: help install build clean migration backfill realtime transform transform-continuous \
          status chunks-detail test-connection \
-         dev-migration dev-backfill dev-realtime dev-transform \
-         restart-backfill restart-realtime restart-transform shell
+         dev-migration dev-backfill dev-realtime dev-transform-batch dev-transform-continuous \
+         restart-backfill restart-realtime restart-transform shell transformer-status
 
 help: ## Show this help message
 	@echo 'Usage: make [target]'
@@ -25,8 +25,14 @@ backfill: ## Load historical raw data
 realtime: ## Load new raw data continuously  
 	docker compose --profile realtime up -d
 
-transform: ## Process raw data into structured tables
-	docker compose --profile transform up -d
+transform: ## Process raw data into structured tables (BATCH - exits when done)
+	docker compose --profile transform up
+
+# Additional transform modes
+transform-continuous: ## Process raw data continuously (stays running)
+	docker compose --profile transform-continuous up -d
+
+transform-batch: transform ## Alias for batch transform (same as transform)
 
 # Monitoring (automatic - no manual fixes needed)
 status: ## Show chunk progress
@@ -37,6 +43,9 @@ chunks-detail: ## Show detailed chunk status
 
 test-connection: ## Test ClickHouse connection
 	docker run --rm --env-file .env beacon-indexer:latest python scripts/chunks.py test
+
+transformer-status: ## Show transformer processing status with failure details
+	docker run --rm --env-file .env beacon-indexer:latest python scripts/transformer_status.py
 
 # Utility targets
 logs: ## Show logs for running services
@@ -56,8 +65,11 @@ dev-backfill: ## Run backfill in Docker (uses START_SLOT and END_SLOT from .env)
 dev-realtime: ## Run realtime loader in Docker
 	docker run --rm --env-file .env beacon-indexer:latest python -m src.main load realtime
 
-dev-transform: ## Run transformer in Docker
-	docker run --rm --env-file .env beacon-indexer:latest python -m src.main transform run
+dev-transform-batch: ## Run batch transform in Docker (exits when done)
+	docker run --rm --env-file .env beacon-indexer:latest python -m src.main transform batch
+
+dev-transform-continuous: ## Run continuous transform in Docker
+	docker run --rm --env-file .env beacon-indexer:latest python -m src.main transform run --continuous
 
 # Service management
 restart-backfill: ## Stop and restart backfill service
@@ -70,7 +82,11 @@ restart-realtime: ## Stop and restart realtime service
 
 restart-transform: ## Stop and restart transform service
 	docker compose --profile transform down
-	docker compose --profile transform up -d
+	docker compose --profile transform up
+
+restart-transform-continuous: ## Stop and restart continuous transform service
+	docker compose --profile transform-continuous down
+	docker compose --profile transform-continuous up -d
 
 # Development helpers
 shell: ## Open interactive shell in Docker container

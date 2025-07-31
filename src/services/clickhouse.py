@@ -148,20 +148,6 @@ class ClickHouse:
             logger.error("Sample data", sample=data[0] if data else "empty")
             raise
     
-    def get_last_processed_slot(self, process_name: str) -> int:
-        """Get the last processed slot for a process."""
-        query = "SELECT last_processed_slot FROM sync_progress WHERE process_name = {process_name:String}"
-        result = self.execute(query, {"process_name": process_name})
-        return result[0]["last_processed_slot"] if result else 0
-    
-    def update_last_processed_slot(self, process_name: str, slot: int):
-        """Update the last processed slot for a process."""
-        query = """
-        INSERT INTO sync_progress (process_name, last_processed_slot) 
-        VALUES ({process_name:String}, {slot:UInt64})
-        """
-        self.execute(query, {"process_name": process_name, "slot": slot})
-    
     def claim_chunk(self, worker_id: str, loader_name: str) -> Optional[tuple]:
         """Worker-specific chunk claiming with better distribution."""
         try:

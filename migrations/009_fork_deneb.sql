@@ -37,7 +37,3 @@ CREATE TABLE IF NOT EXISTS blob_sidecars (
 ) ENGINE = ReplacingMergeTree(insert_version)
 ORDER BY (slot, blob_index)
 PARTITION BY toStartOfMonth(slot_timestamp);
-
--- Update schema version
-INSERT INTO sync_progress (process_name, last_processed_slot) 
-VALUES ('schema_version', 5);

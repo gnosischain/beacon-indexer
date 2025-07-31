@@ -166,7 +166,3 @@ CREATE TABLE IF NOT EXISTS validators (
 ) ENGINE = ReplacingMergeTree(insert_version)
 ORDER BY (slot, validator_index)
 PARTITION BY toStartOfMonth(slot_timestamp);
-
--- Update schema version for Phase 0
-INSERT INTO sync_progress (process_name, last_processed_slot) 
-VALUES ('schema_version', 1);

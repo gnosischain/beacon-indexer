@@ -30,9 +30,14 @@ def create_parser():
     transform_parser = subparsers.add_parser("transform", help="Process raw data into structured tables")
     transform_subparsers = transform_parser.add_subparsers(dest="transform_command")
     
-    # Transform run
-    run_parser = transform_subparsers.add_parser("run", help="Run transformer continuously")
+    # Transform run (with optional continuous mode)
+    run_parser = transform_subparsers.add_parser("run", help="Run transformer")
     run_parser.add_argument("--batch-size", type=int, default=100, help="Batch size for processing")
+    run_parser.add_argument("--continuous", action="store_true", help="Run continuously (default: batch mode)")
+    
+    # Transform batch (explicit batch mode)
+    batch_parser = transform_subparsers.add_parser("batch", help="Process all available data and exit")
+    batch_parser.add_argument("--batch-size", type=int, default=100, help="Batch size for processing")
     
     # Transform reprocess
     reprocess_parser = transform_subparsers.add_parser("reprocess", help="Reprocess specific slot range")
@@ -124,7 +129,13 @@ async def handle_transform_command(args):
     transformer_service = TransformerService()
     
     if args.transform_command == "run":
-        await transformer_service.run(args.batch_size)
+        # Determine mode based on --continuous flag
+        continuous = getattr(args, 'continuous', False)
+        await transformer_service.run(args.batch_size, continuous=continuous)
+    
+    elif args.transform_command == "batch":
+        # Explicit batch mode - process all available data and exit
+        await transformer_service.run(args.batch_size, continuous=False)
     
     elif args.transform_command == "reprocess":
         start_slot = args.start_slot
@@ -146,7 +157,7 @@ async def handle_transform_command(args):
         )
     
     else:
-        print("Usage: transform {run|reprocess}")
+        print("Usage: transform {run|batch|reprocess}")
 
 async def handle_fork_command(args):
     """Handle fork command with auto-detection."""

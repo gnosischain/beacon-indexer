@@ -1,5 +1,7 @@
 # Beacon Chain Indexer
 
+![Beacon Indexer](img/header-beacon_indexer.png)
+
 A simple, minimalistic beacon chain indexer using the ELT (Extract, Load, Transform) pattern with **fork-aware parsing**. This indexer loads raw data from the beacon API first, then transforms it into structured tables with automatic fork detection and appropriate parsing for each Ethereum consensus layer upgrade.
 
 ## Features
@@ -525,4 +527,4 @@ python -m src.main transform reprocess --start-slot 4700000 --end-slot 4800000
 
 ## License
 
-MIT License
+This project is licensed under the [MIT License](LICENSE)
