@@ -45,8 +45,8 @@ class LoaderService:
         # First, ensure specs and genesis are loaded
         await self._ensure_foundation_data()
         
-        # Get last processed slot
-        last_slot = self.clickhouse.get_last_processed_slot("loader_realtime")
+        # Get the last slot we have in raw data (instead of using sync_progress)
+        last_slot = self._get_last_raw_slot()
         
         while True:
             try:
@@ -58,13 +58,16 @@ class LoaderService:
                     continue
                 
                 # Process new slots
+                processed_any = False
                 for slot in range(last_slot + 1, head_slot + 1):
                     await self._process_slot(slot)
                     last_slot = slot
+                    processed_any = True
                 
-                # Update progress
-                if head_slot > last_slot:
-                    self.clickhouse.update_last_processed_slot("loader_realtime", head_slot)
+                if processed_any:
+                    logger.info("Processed realtime slots", 
+                               last_processed=last_slot,
+                               head_slot=head_slot)
                 
                 # Wait before next check
                 await asyncio.sleep(6)  # Half slot time
@@ -72,6 +75,37 @@ class LoaderService:
             except Exception as e:
                 logger.error("Error in realtime loader", error=str(e))
                 await asyncio.sleep(12)
+    
+    def _get_last_raw_slot(self) -> int:
+        """Get the highest slot we have in raw data across all tables."""
+        try:
+            # Check both raw_blocks and raw_validators for the highest slot
+            blocks_query = "SELECT max(slot) as max_slot FROM raw_blocks"
+            validators_query = "SELECT max(slot) as max_slot FROM raw_validators FINAL"
+            
+            blocks_result = self.clickhouse.execute(blocks_query)
+            validators_result = self.clickhouse.execute(validators_query)
+            
+            max_blocks_slot = 0
+            max_validators_slot = 0
+            
+            if blocks_result and blocks_result[0]["max_slot"] is not None:
+                max_blocks_slot = blocks_result[0]["max_slot"]
+            
+            if validators_result and validators_result[0]["max_slot"] is not None:
+                max_validators_slot = validators_result[0]["max_slot"]
+            
+            last_slot = max(max_blocks_slot, max_validators_slot)
+            logger.info("Starting realtime from last raw slot", 
+                       last_slot=last_slot,
+                       max_blocks=max_blocks_slot,
+                       max_validators=max_validators_slot)
+            
+            return last_slot
+            
+        except Exception as e:
+            logger.warning("Could not determine last raw slot, starting from 0", error=str(e))
+            return 0
     
     async def _process_slot(self, slot: int):
         """Process a single slot with all enabled loaders."""
