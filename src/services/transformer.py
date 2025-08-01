@@ -201,7 +201,7 @@ class TransformerService:
             return False
     
     def _get_chunk_data(self, loader_name: str, start_slot: int, end_slot: int) -> List[Dict]:
-        """Get raw data for a specific chunk range."""
+        """Get raw data for a specific chunk range with fork handling."""
         
         config = self.loader_configs[loader_name]
         raw_table = config["raw_table"]
@@ -209,18 +209,39 @@ class TransformerService:
         
         final_clause = "FINAL" if use_final else ""
         
-        query = f"""
-        SELECT slot, payload 
-        FROM {raw_table} {final_clause}
-        WHERE slot >= {{start_slot:UInt64}} AND slot <= {{end_slot:UInt64}}
-        ORDER BY slot
-        """
+        if loader_name in ["blocks", "validators", "rewards"]:
+            # Tables with payload_hash - get the latest payload per slot
+            # This is not the way to handle fork protection, but let's keep it for now
+            query = f"""
+            SELECT slot, payload, payload_hash
+            FROM (
+                SELECT 
+                    slot, 
+                    payload, 
+                    payload_hash,
+                    retrieved_at,
+                    ROW_NUMBER() OVER (PARTITION BY slot ORDER BY retrieved_at DESC) as rn
+                FROM {raw_table} {final_clause}
+                WHERE slot >= {{start_slot:UInt64}} AND slot <= {{end_slot:UInt64}}
+            )
+            WHERE rn = 1
+            ORDER BY slot
+            """
+        else:
+            # Legacy tables without payload_hash
+            query = f"""
+            SELECT slot, payload 
+            FROM {raw_table} {final_clause}
+            WHERE slot >= {{start_slot:UInt64}} AND slot <= {{end_slot:UInt64}}
+            ORDER BY slot
+            """
         
         result = self.clickhouse.execute(query, {
             "start_slot": start_slot,
             "end_slot": end_slot
         })
         
+        # Return consistent format (slot, payload)
         return [{"slot": row["slot"], "payload": row["payload"]} for row in result]
     
     async def _process_fork_aware_batch(self, raw_data: List[Dict], loader_name: str) -> Tuple[int, int]:

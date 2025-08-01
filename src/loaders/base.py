@@ -1,3 +1,5 @@
+import hashlib
+import json
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional
 from src.services.beacon_api import BeaconAPI
@@ -5,13 +7,29 @@ from src.services.clickhouse import ClickHouse
 from src.utils.logger import logger
 
 class BaseLoader(ABC):
-    """Base class for all loaders."""
+    """Base class for all loaders with payload hash support."""
     
     def __init__(self, name: str, beacon_api: BeaconAPI, clickhouse: ClickHouse):
         self.name = name
         self.beacon_api = beacon_api
         self.clickhouse = clickhouse
         self.table_name = f"raw_{name}"
+    
+    @staticmethod
+    def calculate_payload_hash(data: Dict[str, Any]) -> str:
+        """Calculate a deterministic hash of the payload for deduplication."""
+        try:
+            # Convert to JSON with sorted keys for deterministic hashing
+            payload_json = json.dumps(data, sort_keys=True, separators=(',', ':'))
+            
+            # Calculate SHA256 hash and take first 16 characters (64 bits)
+            # This gives us 1 in 18 quintillion chance of collision, which is acceptable
+            hash_full = hashlib.sha256(payload_json.encode('utf-8')).hexdigest()
+            return hash_full[:16]
+        except Exception as e:
+            logger.error("Error calculating payload hash", error=str(e))
+            # Fallback to timestamp-based hash if JSON serialization fails
+            return hashlib.sha256(str(data).encode('utf-8')).hexdigest()[:16]
     
     @abstractmethod
     async def fetch_data(self, identifier: Any) -> Optional[Dict[str, Any]]:

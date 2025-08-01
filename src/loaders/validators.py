@@ -6,11 +6,11 @@ from src.config import config
 from src.utils.logger import logger
 
 class ValidatorsLoader(BaseLoader):
-    """Loader for validator data with String payload storage and support for daily snapshots or all slots."""
+    """Loader for validator data with payload hash for fork protection."""
     
     def __init__(self, beacon_api, clickhouse):
         super().__init__("validators", beacon_api, clickhouse)
-        self.mode = config.VALIDATOR_MODE  # 'daily' or 'all_slots'
+        self.mode = config.VALIDATOR_MODE
         # Cache timing parameters at instance level
         self._cached_genesis_time = None
         self._cached_seconds_per_slot = None
@@ -18,13 +18,17 @@ class ValidatorsLoader(BaseLoader):
     
     async def fetch_data(self, slot: int) -> Optional[Dict[str, Any]]:
         """Fetch validators data from beacon API using slot number."""
-        return await self.beacon_api.get_validators(str(slot))  # Use slot as state_id
+        return await self.beacon_api.get_validators(str(slot))
     
     def prepare_row(self, slot: int, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Prepare validators data for database insertion with String payload."""
+        """Prepare validators data for database insertion with payload hash."""
+        # Calculate payload hash for deduplication (handles large validator payloads efficiently)
+        payload_hash = self.calculate_payload_hash(data)
+        
         return {
-            "slot": slot,  # Direct slot value
-            "payload": json.dumps(data),  # Convert dict to JSON string
+            "slot": slot,
+            "payload": json.dumps(data),
+            "payload_hash": payload_hash,   
             "retrieved_at": datetime.now()
         }
     

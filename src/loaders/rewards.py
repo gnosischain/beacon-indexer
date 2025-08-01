@@ -4,7 +4,7 @@ from typing import Dict, Any, Optional
 from .base import BaseLoader
 
 class RewardsLoader(BaseLoader):
-    """Loader for rewards data with String payload storage."""
+    """Loader for rewards data with payload hash for fork protection."""
     
     def __init__(self, beacon_api, clickhouse):
         super().__init__("rewards", beacon_api, clickhouse)
@@ -14,9 +14,13 @@ class RewardsLoader(BaseLoader):
         return await self.beacon_api.get_rewards(str(slot))
     
     def prepare_row(self, slot: int, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Prepare rewards data for database insertion with String payload."""
+        """Prepare rewards data for database insertion with payload hash."""
+        # Calculate payload hash for deduplication
+        payload_hash = self.calculate_payload_hash(data)
+        
         return {
             "slot": slot,
             "payload": json.dumps(data),
+            "payload_hash": payload_hash, 
             "retrieved_at": datetime.now()
         }
