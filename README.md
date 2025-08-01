@@ -2,30 +2,33 @@
 
 ![Beacon Indexer](img/header-beacon_indexer.png)
 
-A simple, minimalistic beacon chain indexer using the ELT (Extract, Load, Transform) pattern with **fork-aware parsing**. This indexer loads raw data from the beacon API first, then transforms it into structured tables with automatic fork detection and appropriate parsing for each Ethereum consensus layer upgrade.
+A simple, minimalistic beacon chain indexer using the ELT (Extract, Load, Transform) pattern with **fork-aware parsing** and **automatic network detection**. This indexer loads raw data from the beacon API first, then transforms it into structured tables with automatic fork detection and appropriate parsing for each Ethereum consensus layer upgrade.
 
 ## Features
 
+- **Dynamic Network Detection**: Automatically detects network type (mainnet, Gnosis Chain, Holesky, Sepolia) from beacon chain data
 - **Fork-Aware Architecture**: Automatic detection and parsing of all Ethereum consensus forks (Phase 0, Altair, Bellatrix, Capella, Deneb, Electra)
 - **ELT Architecture**: Raw data loading and transformation are completely separated
+- **Range-Based Processing**: Enhanced transformer with gap-aware processing and progress tracking
 - **Modular Design**: Easy to add new loaders, parsers, and support for future forks
 - **Multiple Processing Modes**: Realtime sync, backfill with multiple workers
 - **Resilient**: Raw data is never lost, transformations can be rerun with different fork parsers
-- **Network Agnostic**: Supports mainnet, Gnosis Chain, Holesky, Sepolia with configurable fork schedules
-- **Simple Configuration**: Minimal environment variables with external fork configuration
+- **Network Agnostic**: Supports mainnet, Gnosis Chain, Holesky, Sepolia with auto-detected fork schedules
+- **Minimal Configuration**: Auto-detection reduces configuration requirements
 
 ## Architecture
 
 ### Load Stage
 - **LoaderService**: Fetches raw JSON data from beacon API
-- **Loaders**: Modular components for different endpoints (blocks, validators, specs, genesis)
+- **Loaders**: Modular components for different endpoints (blocks, validators, rewards, specs, genesis)
 - **Raw Tables**: Store unprocessed JSON data (fork-agnostic)
 
 ### Transform Stage (Fork-Aware)
-- **ForkDetectionService**: Automatically detects active fork based on slot/epoch
-- **ParserFactory**: Creates appropriate parser for each fork
+- **ForkDetectionService**: Automatically detects network and active fork based on beacon chain data
+- **ParserFactory**: Creates appropriate parser for each fork with network-aware fork versions
 - **Fork-Specific Parsers**: Extract structured data according to fork specifications
 - **Structured Tables**: Final destination for processed data with fork-specific fields
+- **Range-Based Processing**: Gap-aware transformation with progress tracking
 
 ### Supported Forks
 
@@ -33,10 +36,24 @@ A simple, minimalistic beacon chain indexer using the ELT (Extract, Load, Transf
 |------|---------------|---------------|--------------|------------|
 | **Phase 0** | 0 | 0 | Basic blocks, attestations | `blocks`, `attestations` |
 | **Altair** | 74240 | 512 | Sync committees | `sync_aggregates`, `sync_committees` |
-| **Bellatrix** | 144896 | 385536 | Execution payloads (The Merge) | `execution_payloads`, `execution_transactions` |
-| **Capella** | 194048 | 648704 | Withdrawals (Shanghai) | `withdrawals`, `bls_to_execution_changes` |
-| **Deneb** | 269568 | 889856 | Blob transactions (Cancun) | `blob_sidecars`, `kzg_commitments` |
-| **Electra** | 364032 | 1337856 | Execution requests | `deposit_requests`, `withdrawal_requests`, `consolidation_requests` |
+| **Bellatrix** | 144896 | 385536 | Execution payloads (The Merge) | `execution_payloads`, `transactions` |
+| **Capella** | 194048 | 648704 | Withdrawals (Shanghai) | `withdrawals`, `bls_changes` |
+| **Deneb** | 269568 | 889856 | Blob transactions (Cancun) | `blob_sidecars`, `blob_commitments` |
+| **Electra** | 364032 | 1337856 | Execution requests | `execution_requests` |
+
+### Network Auto-Detection
+
+The indexer automatically detects your network by analyzing:
+- `CONFIG_NAME` parameter from beacon chain specs
+- Genesis time and timing parameters
+- Fork version patterns in historical blocks
+- Network-specific fork activation epochs
+
+Supported networks:
+- **Mainnet**: 12s slots, 32 slots/epoch
+- **Gnosis Chain**: 5s slots, 16 slots/epoch  
+- **Holesky**: Testnet with mainnet timing
+- **Sepolia**: Testnet with mainnet timing
 
 ## Quick Start
 
@@ -44,7 +61,8 @@ A simple, minimalistic beacon chain indexer using the ELT (Extract, Load, Transf
 
 ```bash
 cp .env.example .env
-# Edit .env with your configuration
+# Edit .env with your beacon node URL and database settings
+# Network detection is automatic - no network configuration needed!
 ```
 
 ### 2. Run Database Migration
@@ -71,7 +89,7 @@ make realtime
 ### 5. Start Fork-Aware Data Transformation
 
 ```bash
-make transform
+make transform-continuous
 # or locally: make dev-transform
 ```
 
@@ -112,20 +130,24 @@ python -m src.main load realtime
 ### 4. Transform
 **Purpose**: Process raw data into structured tables with fork-aware parsing
 ```bash
-# Docker
+# Docker - Continuous processing
+make transform-continuous
+
+# Docker - Batch mode (process all and exit)
 make transform
 
 # Local
 make dev-transform
-python -m src.main transform run
+python -m src.main transform run --continuous
 ```
 
 **What Fork-Aware Transform Does**:
-- Automatically detects the fork for each slot based on network configuration
+- Automatically detects the network and fork for each slot
 - Uses appropriate parser (Phase0Parser, AltairParser, BellatrixParser, etc.)
 - Extracts fork-specific fields (sync aggregates, execution payloads, blobs, etc.)
 - Inserts data into correct tables with proper schema versioning
 - Handles fork transitions seamlessly within batches
+- Processes data with gap-aware range tracking
 - Can reprocess historical data: `python -m src.main transform reprocess --start-slot 0 --end-slot 1000`
 
 ## Adding New API Endpoints
@@ -224,6 +246,7 @@ LOADER_REGISTRY = {
     "validators": ValidatorsLoader,
     "specs": SpecsLoader,
     "genesis": GenesisLoader,
+    "rewards": RewardsLoader,
     "committees": CommitteesLoader  # Add new loader
 }
 ```
@@ -317,23 +340,6 @@ if loader_name in ["blocks", "rewards", "committees"]:  # Add your new loader he
     # Blocks, Rewards, Committees: process all slots (slot-based loaders)
 ```
 
-**Also update the logging to track your new loader:**
-
-```python
-# Add counting for your new loader
-blocks_chunks = len([c for c in chunks_to_create if c["loader_name"] == "blocks"])
-validator_chunks = len([c for c in chunks_to_create if c["loader_name"] == "validators"])
-rewards_chunks = len([c for c in chunks_to_create if c["loader_name"] == "rewards"])
-committees_chunks = len([c for c in chunks_to_create if c["loader_name"] == "committees"])
-
-logger.info("Generated new chunks for backfill", 
-           new_chunks=len(chunks_to_create),
-           blocks_chunks=blocks_chunks,
-           validator_chunks=validator_chunks,
-           rewards_chunks=rewards_chunks,
-           committees_chunks=committees_chunks)
-```
-
 **⚠️ Important**: If you skip this step, your loader will not generate any chunks and workers will have no work to do, resulting in empty `status_counts={}` in the logs.
 
 ### Step 9: Update Transformer Service
@@ -368,7 +374,7 @@ Add the new loader to your environment configuration. Update `.env`:
 
 ```bash
 # Add committees to enabled loaders
-ENABLED_LOADERS=blocks,validators,specs,genesis,committees
+ENABLED_LOADERS=blocks,validators,specs,genesis,rewards,committees
 ```
 
 ### Step 11: Test and Deploy
@@ -402,62 +408,6 @@ ENABLED_LOADERS=blocks,validators,specs,genesis,committees
    SELECT * FROM committees ORDER BY slot DESC LIMIT 5;
    ```
 
-### Advanced: Fork-Specific Behavior
-
-If your endpoint behavior changes across forks, you can extend specific fork parsers:
-
-```python
-# In src/parsers/altair.py
-class AltairParser(Phase0Parser):
-    def parse_fork_specific(self, slot: int, data: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
-        result = super().parse_fork_specific(slot, data)
-        
-        # Add Altair-specific committee parsing
-        # For example, sync committees introduced in Altair
-        
-        return result
-```
-
-### Processing Modes for New Endpoints
-
-Consider how your new endpoint should be processed:
-
-1. **Per-Slot** (like blocks): Process for every slot
-2. **Daily Snapshots** (like current validators): Process once per day
-3. **Epoch-Based**: Process once per epoch
-4. **One-Time** (like specs/genesis): Load once and done
-
-Implement the appropriate logic in your loader's `should_process_slot()` method or `get_target_slots_in_range()` method.
-
-### Example: Epoch-Based Processing
-
-```python
-class CommitteesLoader(BaseLoader):
-    def should_process_slot(self, slot: int) -> bool:
-        """Only process first slot of each epoch."""
-        # Get slots per epoch from cache or database
-        slots_per_epoch = 32  # This should come from timing cache
-        return slot % slots_per_epoch == 0
-    
-    def get_target_slots_in_range(self, start_slot: int, end_slot: int) -> List[int]:
-        """Get first slot of each epoch in range."""
-        target_slots = []
-        slots_per_epoch = 32
-        
-        # Find the first epoch start in range
-        start_epoch = start_slot // slots_per_epoch
-        if start_slot % slots_per_epoch != 0:
-            start_epoch += 1
-        
-        # Generate epoch start slots
-        for epoch in range(start_epoch, (end_slot // slots_per_epoch) + 1):
-            epoch_start_slot = epoch * slots_per_epoch
-            if start_slot <= epoch_start_slot < end_slot:
-                target_slots.append(epoch_start_slot)
-        
-        return target_slots
-```
-
 This modular approach ensures that new endpoints integrate seamlessly with the existing fork-aware architecture, worker-based backfilling, and real-time processing systems.
 
 ## Fork Management
@@ -465,7 +415,7 @@ This modular approach ensures that new endpoints integrate seamlessly with the e
 ### Fork Information Commands
 
 ```bash
-# List all configured forks for current network
+# List all auto-detected forks for current network
 python -m src.main fork list
 
 # Get fork information for specific slot
@@ -475,29 +425,33 @@ python -m src.main fork info --slot 5000000
 python -m src.main fork info --epoch 150000
 ```
 
-### Network Configuration
+### Network Auto-Detection
 
-The indexer supports multiple networks with different fork schedules and timing parameters:
+The indexer automatically detects your network from beacon chain data:
 
 ```bash
-# Mainnet (default)
-export NETWORK_NAME=mainnet
-
-# Gnosis Chain
-export NETWORK_NAME=gnosis
-
-# Holesky testnet  
-export NETWORK_NAME=holesky
-
-# Sepolia testnet
-export NETWORK_NAME=sepolia
+# Check detected network and fork schedule
+python -m src.main fork list
 ```
 
-Each network has its own configuration in `config/forks.yaml` including:
-- **Genesis time**: Network start timestamp
-- **Slot timing**: Seconds per slot (12s for Ethereum, 5s for Gnosis)
-- **Epoch size**: Slots per epoch (32 for Ethereum, 16 for Gnosis)
-- **Fork schedule**: Exact activation epochs for each fork
+**Detection Process:**
+1. **Network Type**: Reads `CONFIG_NAME` from beacon chain specs
+2. **Timing Parameters**: Extracts `SECONDS_PER_SLOT`, `SLOTS_PER_EPOCH` from specs
+3. **Genesis Time**: Gets network start time from genesis data
+4. **Fork Epochs**: Analyzes version changes in historical blocks
+5. **Fork Versions**: Maps to network-specific fork versions
+
+**Supported Networks:**
+- **mainnet**: Auto-detected from `CONFIG_NAME = "mainnet"`
+- **gnosis**: Auto-detected from `CONFIG_NAME = "gnosis"`
+- **holesky**: Auto-detected from beacon chain characteristics
+- **sepolia**: Auto-detected from beacon chain characteristics
+
+Each network has its own automatically detected configuration:
+- **Genesis time**: Network start timestamp (from genesis data)
+- **Slot timing**: Seconds per slot (from specs: 12s for Ethereum, 5s for Gnosis)
+- **Epoch size**: Slots per epoch (from specs: 32 for Ethereum, 16 for Gnosis)
+- **Fork schedule**: Activation epochs detected from historical blocks
 
 ## Usage
 
@@ -509,16 +463,16 @@ python -m src.main load realtime
 
 # Backfill historical data
 python -m src.main load backfill --start-slot 0 --end-slot 1000000
-
-# Load one-time data (specs, genesis)
-python -m src.main load onetime
 ```
 
 ### Transform Commands
 
 ```bash
 # Run fork-aware transformer continuously
-python -m src.main transform run --batch-size 100
+python -m src.main transform run --continuous --batch-size 100
+
+# Run batch mode (process all available data and exit)
+python -m src.main transform batch --batch-size 100
 
 # Reprocess specific range with current fork parsers
 python -m src.main transform reprocess --start-slot 0 --end-slot 1000 --batch-size 100
@@ -527,7 +481,7 @@ python -m src.main transform reprocess --start-slot 0 --end-slot 1000 --batch-si
 ### Fork Commands
 
 ```bash
-# List all forks and their activation epochs
+# List all auto-detected forks and their activation epochs
 python -m src.main fork list
 
 # Check which fork is active for a specific slot
@@ -551,10 +505,13 @@ docker compose --profile migration up
 # Start realtime loader
 docker compose --profile realtime up -d
 
-# Start fork-aware transformer
-docker compose --profile transform up -d
+# Start fork-aware transformer (continuous mode)
+docker compose --profile transform-continuous up -d
 
-# Run backfill (edit end-slot in docker-compose.yml)
+# Start fork-aware transformer (batch mode)
+docker compose --profile transform up
+
+# Run backfill (edit START_SLOT/END_SLOT in .env)
 docker compose --profile backfill up
 ```
 
@@ -571,14 +528,15 @@ Environment variables in `.env`:
 | `CLICKHOUSE_PASSWORD` | ClickHouse password | `` |
 | `CLICKHOUSE_DATABASE` | ClickHouse database | `beacon_chain` |
 | `CLICKHOUSE_SECURE` | Use secure connection | `false` |
-| `ENABLED_LOADERS` | Comma-separated loader names | `blocks,validators,specs,genesis` |
+| `ENABLED_LOADERS` | Comma-separated loader names | `blocks,validators,specs,genesis,rewards` |
 | `VALIDATOR_MODE` | Validator processing mode | `daily` |
 | `START_SLOT` | Default start slot for backfill | `0` |
 | `END_SLOT` | Default end slot for backfill | `` (current head) |
 | `BACKFILL_WORKERS` | Number of backfill workers | `4` |
 | `CHUNK_SIZE` | Slots per chunk in backfill | `1000` |
-| `NETWORK_NAME` | Network for fork schedule | `mainnet` (mainnet, gnosis, holesky, sepolia) |
 | `LOG_LEVEL` | Logging level | `INFO` |
+
+**Network Detection**: No manual network configuration required! The indexer automatically detects your network from beacon chain data.
 
 ### Validator Processing Modes
 
@@ -589,17 +547,25 @@ Environment variables in `.env`:
 
 ## Adding Support for New Forks
 
-### 1. Update Fork Configuration
+### 1. Update Fork Configuration (Optional)
+
+The indexer auto-detects most fork information, but you can override in `config/forks.yaml`:
 
 ```yaml
-# config/forks.yaml
-networks:
+fork_versions:
   mainnet:
-    forks:
-      new_fork:
-        version: "0x06000000"
-        epoch: 500000
-        schema_version: 7
+    new_fork: "0x06000000"
+  gnosis:
+    new_fork: "0x06000064"
+
+fork_order:
+  - phase0
+  - altair
+  - bellatrix
+  - capella
+  - deneb
+  - electra
+  - new_fork  # Add to end of list
 ```
 
 ### 2. Create Database Migration
@@ -633,6 +599,10 @@ class NewForkParser(PreviousForkParser):
     def parse_fork_specific(self, slot, data):
         # Parse new fork-specific data
         pass
+
+    def _get_fallback_fork_version(self) -> str:
+        """Get fallback fork version for new fork (mainnet)."""
+        return "0x06000000"
 ```
 
 ### 4. Register Parser
@@ -650,6 +620,7 @@ self.parser_cache["new_fork"] = NewForkParser()
 ### Raw Data Tables (Fork-Agnostic)
 - `raw_blocks`: Raw beacon block data
 - `raw_validators`: Raw validator data  
+- `raw_rewards`: Raw reward data
 - `raw_specs`: Raw chain specifications
 - `raw_genesis`: Raw genesis information
 
@@ -659,17 +630,18 @@ self.parser_cache["new_fork"] = NewForkParser()
 - `blocks`: Processed beacon blocks with fork-specific fields
 - `attestations`: Block attestations
 - `validators`: Validator information
+- `rewards`: Block reward information
 
 #### Fork-Specific Tables
 - `sync_aggregates`, `sync_committees` (Altair+)
-- `execution_payloads`, `execution_transactions` (Bellatrix+)
-- `withdrawals`, `bls_to_execution_changes` (Capella+)
-- `blob_sidecars`, `kzg_commitments` (Deneb+)
-- `deposit_requests`, `withdrawal_requests`, `consolidation_requests` (Electra+)
+- `execution_payloads`, `transactions` (Bellatrix+)
+- `withdrawals`, `bls_changes` (Capella+)
+- `blob_sidecars`, `blob_commitments` (Deneb+)
+- `execution_requests` (Electra+)
 
 ### State Management
 - `load_state_chunks`: Tracks backfill progress
-- `sync_progress`: Tracks processing progress and schema version
+- `transformer_progress`: Tracks range-based transformation progress with gap handling
 
 ## Development
 
@@ -678,7 +650,7 @@ self.parser_cache["new_fork"] = NewForkParser()
 ```
 beacon-indexer/
 ├── config/
-│   └── forks.yaml                # Fork configuration for all networks
+│   └── forks.yaml                # Minimal fork configuration (auto-detection fallback)
 ├── src/
 │   ├── config.py                 # Configuration
 │   ├── cli.py                    # Command line interface with fork commands
@@ -688,19 +660,20 @@ beacon-indexer/
 │   ├── services/
 │   │   ├── beacon_api.py         # Beacon API client
 │   │   ├── clickhouse.py         # ClickHouse client
-│   │   ├── fork.py               # Fork detection service
+│   │   ├── fork.py               # Auto-detecting fork service
 │   │   ├── loader.py             # Load service (fork-agnostic)
-│   │   └── transformer.py        # Transform service (fork-aware)
+│   │   └── transformer.py        # Transform service (fork-aware, range-based)
 │   ├── loaders/
 │   │   ├── __init__.py           # Loader registry
 │   │   ├── base.py               # Base loader class
 │   │   ├── blocks.py             # Blocks loader
 │   │   ├── validators.py         # Validators loader
+│   │   ├── rewards.py            # Rewards loader
 │   │   ├── specs.py              # Specs loader
 │   │   └── genesis.py            # Genesis loader
 │   └── parsers/
 │       ├── __init__.py           # Parser registry
-│       ├── factory.py            # Parser factory
+│       ├── factory.py            # Network-aware parser factory
 │       ├── fork_base.py          # Base fork parser
 │       ├── phase0.py             # Phase 0 parser
 │       ├── altair.py             # Altair parser
@@ -716,7 +689,9 @@ beacon-indexer/
 │   ├── 009_fork_deneb.sql        # Deneb fork tables
 │   └── 010_fork_electra.sql      # Electra fork tables
 ├── scripts/
-│   └── migrate.py                # Migration script
+│   ├── migrate.py                # Migration script
+│   ├── chunks.py                 # Chunk status checker
+│   └── transformer_status.py     # Transformer progress checker
 ├── docker-compose.yml            # Docker composition
 ├── Dockerfile                    # Docker image
 └── README.md                     # This file
@@ -728,7 +703,7 @@ beacon-indexer/
 # Install development dependencies
 pip install -r requirements.txt
 
-# Test fork detection
+# Test auto-detection
 python -m src.main fork list
 
 # Test specific fork parsing
@@ -743,118 +718,119 @@ The indexer provides detailed logging for fork detection and parsing:
 
 ```bash
 # View fork detection logs
-docker compose logs transform | grep fork
+docker compose logs transform-continuous | grep fork
 
 # Monitor chunk progress
 python scripts/chunks.py overview
 
-# Check schema version
-python -c "
-from src.services.clickhouse import ClickHouse
-ch = ClickHouse()
-result = ch.execute('SELECT last_processed_slot FROM sync_progress WHERE process_name = \"schema_version\"')
-print(f'Schema version: {result[0][\"last_processed_slot\"] if result else \"unknown\"}')
-"
+# Monitor transformer progress
+python scripts/transformer_status.py
+
+# Check auto-detected network
+python -m src.main fork list
 ```
 
 Key log fields for fork-aware operations:
 - `fork`: Active fork name for the slot being processed
 - `parser`: Parser class being used
-- `schema_version`: Database schema version
+- `network`: Auto-detected network name
 - `tables`: Number of tables populated by fork parser
 
 ## Troubleshooting
 
 ### Common Issues
 
-1. **Fork Detection Failed**
-   - Check `config/forks.yaml` exists and is valid
-   - Verify `NETWORK_NAME` environment variable
-   - Ensure genesis and specs data are loaded
+1. **Network Auto-Detection Failed**
+   - Ensure genesis and specs data are loaded: `make migration`
+   - Check that foundation data exists: `SELECT COUNT(*) FROM genesis; SELECT COUNT(*) FROM specs;`
+   - Verify beacon node is accessible and returning valid data
 
-2. **Parser Not Found for Fork**
-   - Verify parser is registered in `ParserFactory`
-   - Check fork name spelling in configuration
-   - Ensure parser class is imported
+2. **Fork Detection Failed**
+   - Check that raw blocks contain version information
+   - Ensure `CONFIG_NAME` is present in specs table
+   - Verify timing parameters in `time_helpers` table
 
-3. **Schema Version Mismatch**
-   - Run migrations: `make migration`
-   - Check `sync_progress` table for schema version
-   - Verify all fork migrations have been applied
+3. **Parser Not Found for Fork**
+   - Check that all fork parsers are registered in `ParserFactory`
+   - Verify parser class is imported and instantiated correctly
+   - Check fork name spelling in auto-detection
 
-4. **Fork Transition Issues**
-   - Fork transitions are handled automatically
-   - Check logs for parser switching messages
-   - Verify fork activation epochs in configuration
+4. **Range Processing Issues**
+   - Use transformer status script: `python scripts/transformer_status.py`
+   - Check for failed ranges in `transformer_progress` table
+   - Verify raw data exists before transformation
 
 ### Performance Tuning
 
-- **Fork Detection**: Fork lookups are cached per service instance
+- **Auto-Detection**: Network and fork detection is cached per service instance
 - **Parser Selection**: Parsers are instantiated once and reused
 - **Batch Processing**: Fork grouping minimizes parser switching overhead
+- **Range Processing**: Gap-aware processing optimizes transformer efficiency
 - **Database**: Fork-specific indexes on new tables improve query performance
 
-### Adding New Networks
+### Manual Network Override
 
-1. Add network configuration to `config/forks.yaml`:
+If auto-detection fails, you can add manual override in `config/forks.yaml`:
+
 ```yaml
-networks:
-  my_network:
-    genesis_time: 1234567890
-    seconds_per_slot: 12
-    slots_per_epoch: 32
-    slots_per_historical_root: 8192
-    genesis_fork_version: "0x00000000"
-    forks:
-      phase0: { version: "0x00000000", epoch: 0, schema_version: 1 }
-      # ... other forks
+# Force specific network (bypasses auto-detection)
+network_mapping:
+  mainnet: "mainnet"
+  gnosis: "gnosis"
+  
+# Override fork versions if needed
+fork_versions:
+  mainnet:
+    phase0: "0x00000000"
+    altair: "0x01000000"
+    # ... other forks
 ```
-
-2. Set `NETWORK_NAME` environment variable
-3. Run migrations to create tables
-4. Start indexing with network-specific fork schedule
 
 ## Examples
 
-### Mainnet Usage
+### Mainnet Usage (Auto-Detection)
 ```bash
-export NETWORK_NAME=mainnet
-make migration && make backfill && make realtime && make transform
+# No network configuration needed - auto-detected!
+make migration && make backfill && make realtime && make transform-continuous
 ```
 
-### Testnet Usage
+### Gnosis Chain Usage (Auto-Detection)
 ```bash
-export NETWORK_NAME=holesky
-export START_SLOT=0
-export END_SLOT=1000000
-make migration && make backfill
-```
-
-### Gnosis Chain Usage
-```bash
-export NETWORK_NAME=gnosis
+# Auto-detects Gnosis Chain from beacon data
 export BEACON_NODE_URL=https://beacon-chain.gnosis.io
-make migration && make backfill && make realtime && make transform
+make migration && make backfill && make realtime && make transform-continuous
 ```
 
 ### Fork Analysis Examples
 ```bash
-# Check current mainnet forks
+# Check auto-detected network and forks
 python -m src.main fork list
 
-# Check Gnosis Chain forks (different timing)
-export NETWORK_NAME=gnosis
-python -m src.main fork list
-
-# Analyze Deneb activation on mainnet
+# Analyze specific fork activation (auto-detected network)
 python -m src.main fork info --epoch 269568
 
-# Analyze Deneb activation on Gnosis Chain
-export NETWORK_NAME=gnosis  
-python -m src.main fork info --epoch 889856
-
-# Reprocess Merge transition on mainnet
+# Reprocess fork transition with current parsers
 python -m src.main transform reprocess --start-slot 4700000 --end-slot 4800000
+
+# Check transformer processing status
+python scripts/transformer_status.py
+
+# Monitor chunk progress
+python scripts/chunks.py overview
+```
+
+### Development Examples
+```bash
+# Test auto-detection with different beacon nodes
+export BEACON_NODE_URL=https://your-beacon-node.com
+python -m src.main fork list
+
+# Process small range for testing
+python -m src.main load backfill --start-slot 9000000 --end-slot 9000100
+python -m src.main transform batch --batch-size 50
+
+# Check range-based processing
+python scripts/transformer_status.py
 ```
 
 ## License
