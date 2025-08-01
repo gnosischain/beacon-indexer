@@ -35,7 +35,6 @@ CREATE TABLE IF NOT EXISTS execution_payloads (
     extra_data String DEFAULT '',
     transactions_count UInt64 DEFAULT 0,
     withdrawals_count UInt64 DEFAULT 0,
-    timestamp_utc DateTime DEFAULT toDateTime(0),
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time_unix, 'UTC') FROM time_helpers LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
@@ -62,7 +61,6 @@ CREATE TABLE IF NOT EXISTS transactions (
     gas_price UInt64 DEFAULT 0,
     nonce UInt64 DEFAULT 0,
     input String DEFAULT '',
-    timestamp_utc DateTime DEFAULT toDateTime(0),
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time_unix, 'UTC') FROM time_helpers LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)

@@ -10,7 +10,6 @@ CREATE TABLE IF NOT EXISTS blob_commitments (
     slot UInt64,
     commitment_index UInt64,
     commitment String DEFAULT '',
-    timestamp_utc DateTime DEFAULT toDateTime(0),
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time_unix, 'UTC') FROM time_helpers LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
@@ -28,7 +27,6 @@ CREATE TABLE IF NOT EXISTS blob_sidecars (
     kzg_proof String DEFAULT '',
     blob_size UInt64 DEFAULT 0,
     blob_hash String DEFAULT '',
-    timestamp_utc DateTime DEFAULT toDateTime(0),
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time_unix, 'UTC') FROM time_helpers LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)

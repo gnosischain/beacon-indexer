@@ -14,7 +14,6 @@ CREATE TABLE IF NOT EXISTS withdrawals (
     validator_index UInt64,
     address String,
     amount UInt64,
-    timestamp_utc DateTime DEFAULT toDateTime(0),
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time_unix, 'UTC') FROM time_helpers LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
@@ -32,7 +31,6 @@ CREATE TABLE IF NOT EXISTS bls_changes (
     validator_index UInt64 DEFAULT 0,
     from_bls_pubkey String DEFAULT '',
     to_execution_address String DEFAULT '',
-    timestamp_utc DateTime DEFAULT toDateTime(0),
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time_unix, 'UTC') FROM time_helpers LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)

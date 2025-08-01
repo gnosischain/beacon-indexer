@@ -13,7 +13,6 @@ CREATE TABLE IF NOT EXISTS blocks (
     eth1_deposit_root String DEFAULT '',
     eth1_deposit_count UInt64 DEFAULT 0,
     eth1_block_hash String DEFAULT '',
-    timestamp_utc DateTime DEFAULT toDateTime(0),
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time_unix, 'UTC') FROM time_helpers LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
@@ -36,7 +35,6 @@ CREATE TABLE IF NOT EXISTS attestations (
     source_root String DEFAULT '',
     target_epoch UInt64 DEFAULT 0,
     target_root String DEFAULT '',
-    timestamp_utc DateTime DEFAULT toDateTime(0),
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time_unix, 'UTC') FROM time_helpers LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
@@ -55,7 +53,6 @@ CREATE TABLE IF NOT EXISTS deposits (
     amount UInt64 DEFAULT 0,
     signature String DEFAULT '',
     proof Array(String) DEFAULT [],
-    timestamp_utc DateTime DEFAULT toDateTime(0),
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time_unix, 'UTC') FROM time_helpers LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
@@ -72,7 +69,6 @@ CREATE TABLE IF NOT EXISTS voluntary_exits (
     signature String DEFAULT '',
     epoch UInt64 DEFAULT 0,
     validator_index UInt64 DEFAULT 0,
-    timestamp_utc DateTime DEFAULT toDateTime(0),
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time_unix, 'UTC') FROM time_helpers LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
@@ -98,7 +94,6 @@ CREATE TABLE IF NOT EXISTS proposer_slashings (
     header_2_state_root String DEFAULT '',
     header_2_body_root String DEFAULT '',
     header_2_signature String DEFAULT '',
-    timestamp_utc DateTime DEFAULT toDateTime(0),
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time_unix, 'UTC') FROM time_helpers LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
@@ -133,7 +128,6 @@ CREATE TABLE IF NOT EXISTS attester_slashings (
     att_2_attesting_indices Array(UInt64) DEFAULT [],
     att_2_validator_count UInt32 DEFAULT 0,
     total_slashed_validators UInt32 DEFAULT 0,
-    timestamp_utc DateTime DEFAULT toDateTime(0),
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time_unix, 'UTC') FROM time_helpers LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
@@ -157,7 +151,6 @@ CREATE TABLE IF NOT EXISTS validators (
     activation_epoch UInt64,
     exit_epoch UInt64,
     withdrawable_epoch UInt64,
-    timestamp_utc DateTime DEFAULT toDateTime(0),
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time_unix, 'UTC') FROM time_helpers LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
@@ -176,7 +169,6 @@ CREATE TABLE IF NOT EXISTS rewards (
     sync_aggregate UInt64,
     proposer_slashings UInt64,
     attester_slashings UInt64,
-    timestamp_utc DateTime DEFAULT toDateTime(0),
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time_unix, 'UTC') FROM time_helpers LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
