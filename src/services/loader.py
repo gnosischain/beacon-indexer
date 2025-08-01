@@ -1,4 +1,5 @@
 import asyncio
+import math 
 import multiprocessing as mp
 from datetime import datetime
 from typing import List
@@ -172,40 +173,68 @@ class LoaderService:
                 task.get()
         
         logger.info("Backfill completed")
-    
+
     def _generate_smart_chunks(self, start_slot: int, end_slot: int, enabled_loaders: list):
-        """Generate chunks with unique IDs, preserving existing completed chunks. Range is [start_slot, end_slot)."""
+        """Generate chunks with bulk existing chunk detection to avoid memory issues."""
         chunks_to_create = []
         current_time = datetime.now()
         
+        # Pre-load existing completed chunks for all loaders to avoid repeated FINAL queries
+        existing_chunks_cache = {}
+        for loader_name in enabled_loaders:
+            if loader_name in ["blocks", "validators", "rewards"]:
+                try:
+                    logger.info("Pre-loading existing chunks", loader=loader_name)
+                    
+                    # Use a single FINAL query per loader instead of thousands of individual queries
+                    existing_query = """
+                    SELECT DISTINCT start_slot, end_slot 
+                    FROM load_state_chunks FINAL
+                    WHERE loader_name = {loader_name:String}
+                    AND status = 'completed'
+                    AND start_slot >= {start_slot:UInt64}
+                    AND end_slot < {end_slot:UInt64}
+                    """
+                    existing_results = self.clickhouse.execute(existing_query, {
+                        "loader_name": loader_name,
+                        "start_slot": start_slot,
+                        "end_slot": end_slot
+                    })
+                    
+                    # Cache as set of (start_slot, end_slot) tuples for fast lookup
+                    existing_chunks_cache[loader_name] = {
+                        (row["start_slot"], row["end_slot"]) for row in existing_results
+                    }
+                    logger.info("Cached existing chunks", 
+                            loader=loader_name, 
+                            existing_count=len(existing_chunks_cache[loader_name]))
+                    
+                except Exception as e:
+                    logger.warning("Failed to pre-load existing chunks, assuming none exist", 
+                                loader=loader_name, error=str(e))
+                    existing_chunks_cache[loader_name] = set()
+            else:
+                # For non-slot based loaders, no caching needed
+                existing_chunks_cache[loader_name] = set()
+        
+        # Now generate chunks using the cache (no more individual database queries)
         for loader_name in enabled_loaders:
             logger.info("Generating chunks for loader", loader=loader_name)
             
-            if loader_name == "blocks":
-                # Blocks: process all slots (FIXED: end_slot is now exclusive)
+            if loader_name in ["blocks", "rewards"]:  # Both are slot-based
+                existing_chunks = existing_chunks_cache.get(loader_name, set())
+                
+                # Blocks and Rewards: process all slots (FIXED: end_slot is now exclusive)
                 for i in range(start_slot, end_slot, config.CHUNK_SIZE):
                     chunk_end = min(i + config.CHUNK_SIZE - 1, end_slot - 1)
                     chunk_id = f"{loader_name}_{i}_{chunk_end}"
                     
-                    # Check if this range already has a completed chunk (any chunk_id)
-                    existing_query = """
-                    SELECT status FROM load_state_chunks FINAL
-                    WHERE loader_name = {loader_name:String}
-                      AND start_slot = {start_slot:UInt64} 
-                      AND end_slot = {end_slot:UInt64}
-                      AND status = 'completed'
-                    """
-                    existing = self.clickhouse.execute(existing_query, {
-                        "loader_name": loader_name,
-                        "start_slot": i,
-                        "end_slot": chunk_end
-                    })
-                    
-                    if existing:
+                    # Fast cache lookup instead of expensive database query
+                    if (i, chunk_end) in existing_chunks:
                         logger.debug("Range already completed, skipping", 
-                                   loader=loader_name, 
-                                   start_slot=i, 
-                                   end_slot=chunk_end)
+                                loader=loader_name, 
+                                start_slot=i, 
+                                end_slot=chunk_end)
                         continue
                     
                     # New chunk - add to creation list
@@ -221,6 +250,8 @@ class LoaderService:
                     })
             
             elif loader_name == "validators":
+                existing_chunks = existing_chunks_cache.get(loader_name, set())
+                
                 # Validators: only create chunks for target slots based on mode
                 if config.VALIDATOR_MODE == "all_slots":
                     # Process all slots (FIXED: end_slot is now exclusive)
@@ -228,25 +259,12 @@ class LoaderService:
                         chunk_end = min(i + config.CHUNK_SIZE - 1, end_slot - 1)
                         chunk_id = f"{loader_name}_{i}_{chunk_end}"
                         
-                        # Check if this range already has a completed chunk
-                        existing_query = """
-                        SELECT status FROM load_state_chunks FINAL
-                        WHERE loader_name = {loader_name:String}
-                          AND start_slot = {start_slot:UInt64} 
-                          AND end_slot = {end_slot:UInt64}
-                          AND status = 'completed'
-                        """
-                        existing = self.clickhouse.execute(existing_query, {
-                            "loader_name": loader_name,
-                            "start_slot": i,
-                            "end_slot": chunk_end
-                        })
-                        
-                        if existing:
+                        # Fast cache lookup instead of database query
+                        if (i, chunk_end) in existing_chunks:
                             logger.debug("Range already completed, skipping", 
-                                       loader=loader_name, 
-                                       start_slot=i, 
-                                       end_slot=chunk_end)
+                                    loader=loader_name, 
+                                    start_slot=i, 
+                                    end_slot=chunk_end)
                             continue
                         
                         chunks_to_create.append({
@@ -268,24 +286,11 @@ class LoaderService:
                         for target_slot in target_slots:
                             chunk_id = f"{loader_name}_{target_slot}_{target_slot}"
                             
-                            # Check if this slot already has a completed chunk
-                            existing_query = """
-                            SELECT status FROM load_state_chunks FINAL
-                            WHERE loader_name = {loader_name:String}
-                              AND start_slot = {start_slot:UInt64} 
-                              AND end_slot = {end_slot:UInt64}
-                              AND status = 'completed'
-                            """
-                            existing = self.clickhouse.execute(existing_query, {
-                                "loader_name": loader_name,
-                                "start_slot": target_slot,
-                                "end_slot": target_slot
-                            })
-                            
-                            if existing:
+                            # Fast cache lookup for single-slot chunks
+                            if (target_slot, target_slot) in existing_chunks:
                                 logger.debug("Slot already completed, skipping", 
-                                           loader=loader_name, 
-                                           slot=target_slot)
+                                        loader=loader_name, 
+                                        slot=target_slot)
                                 continue
                             
                             chunks_to_create.append({
@@ -300,43 +305,107 @@ class LoaderService:
                             })
                             
                         logger.info("Generated validator chunks for daily mode", 
-                                   total_target_slots=len(target_slots),
-                                   chunks_created=len([c for c in chunks_to_create if c["loader_name"] == "validators"]))
+                                total_target_slots=len(target_slots),
+                                chunks_created=len([c for c in chunks_to_create if c["loader_name"] == "validators"]))
+            
+            else:
+                # Unknown loader - treat as slot-based by default with cache lookup
+                existing_chunks = existing_chunks_cache.get(loader_name, set())
+                logger.warning("Unknown loader type, treating as slot-based", loader=loader_name)
+                
+                for i in range(start_slot, end_slot, config.CHUNK_SIZE):
+                    chunk_end = min(i + config.CHUNK_SIZE - 1, end_slot - 1)
+                    chunk_id = f"{loader_name}_{i}_{chunk_end}"
+                    
+                    # Fast cache lookup
+                    if (i, chunk_end) in existing_chunks:
+                        logger.debug("Range already completed, skipping", 
+                                loader=loader_name, 
+                                start_slot=i, 
+                                end_slot=chunk_end)
+                        continue
+                    
+                    chunks_to_create.append({
+                        "chunk_id": chunk_id,
+                        "start_slot": i,
+                        "end_slot": chunk_end,
+                        "loader_name": loader_name,
+                        "status": "pending",
+                        "worker_id": "",
+                        "created_at": current_time,
+                        "updated_at": current_time
+                    })
         
-        # Insert only new chunks
+        # Insert only new chunks in batches to avoid memory limits
         if chunks_to_create:
-            self.clickhouse.insert_batch("load_state_chunks", chunks_to_create)
+            batch_size = 10000  # Insert 10K chunks at a time
+            total_chunks = len(chunks_to_create)
+            
+            logger.info("Inserting chunks in batches", 
+                    total_chunks=total_chunks, 
+                    batch_size=batch_size,
+                    batches=math.ceil(total_chunks / batch_size))
+            
+            for i in range(0, total_chunks, batch_size):
+                batch = chunks_to_create[i:i + batch_size]
+                try:
+                    self.clickhouse.insert_batch("load_state_chunks", batch)
+                    logger.info("Inserted chunk batch", 
+                            batch_num=i//batch_size + 1,
+                            batch_size=len(batch),
+                            progress=f"{min(i + batch_size, total_chunks)}/{total_chunks}")
+                except Exception as e:
+                    logger.error("Failed to insert chunk batch", 
+                                batch_num=i//batch_size + 1,
+                                batch_size=len(batch),
+                                error=str(e))
+                    raise
+            
             blocks_chunks = len([c for c in chunks_to_create if c["loader_name"] == "blocks"])
             validator_chunks = len([c for c in chunks_to_create if c["loader_name"] == "validators"])
+            rewards_chunks = len([c for c in chunks_to_create if c["loader_name"] == "rewards"])
             
             logger.info("Generated new chunks for backfill", 
-                       new_chunks=len(chunks_to_create),
-                       blocks_chunks=blocks_chunks,
-                       validator_chunks=validator_chunks)
+                    new_chunks=len(chunks_to_create),
+                    blocks_chunks=blocks_chunks,
+                    validator_chunks=validator_chunks,
+                    rewards_chunks=rewards_chunks)
         else:
             logger.info("No new chunks needed - all chunks in range already exist")
         
-        # Show summary of chunk status
+        # Show summary of chunk status using cache counts + database counts
         for loader_name in enabled_loaders:
-            status_query = """
-            SELECT status, count() as count
-            FROM load_state_chunks FINAL
-            WHERE loader_name = {loader_name:String}
-              AND start_slot >= {start_slot:UInt64}
-              AND end_slot < {end_slot:UInt64}
-            GROUP BY status
-            ORDER BY status
-            """
-            status_result = self.clickhouse.execute(status_query, {
-                "loader_name": loader_name,
-                "start_slot": start_slot,
-                "end_slot": end_slot
-            })
-            
-            status_summary = {row["status"]: row["count"] for row in status_result}
-            logger.info("Chunk status summary", 
-                       loader=loader_name,
-                       status_counts=status_summary)
+            try:
+                # Use a simple non-FINAL query for status summary
+                status_query = """
+                SELECT status, count() as count
+                FROM load_state_chunks
+                WHERE loader_name = {loader_name:String}
+                AND start_slot >= {start_slot:UInt64}
+                AND end_slot < {end_slot:UInt64}
+                GROUP BY status
+                ORDER BY status
+                """
+                status_result = self.clickhouse.execute(status_query, {
+                    "loader_name": loader_name,
+                    "start_slot": start_slot,
+                    "end_slot": end_slot
+                })
+                
+                status_summary = {row["status"]: row["count"] for row in status_result}
+                
+                # Add cached completed count for more accurate reporting
+                cached_completed = len(existing_chunks_cache.get(loader_name, set()))
+                if cached_completed > 0:
+                    status_summary["completed_cached"] = cached_completed
+                
+                logger.info("Chunk status summary", 
+                        loader=loader_name,
+                        status_counts=status_summary)
+                        
+            except Exception as e:
+                logger.warning("Failed to get chunk status summary", 
+                            loader=loader_name, error=str(e))
 
     def _get_validator_target_slots(self, start_slot: int, end_slot: int) -> list:
         """Get target slots for validators based on mode."""
@@ -434,7 +503,9 @@ class LoaderService:
             )
             
             # Get only slot-based loaders for backfill (exclude genesis, specs)
-            relevant_loaders = [l for l in loaders if l.name in ["blocks", "validators"]]
+            slot_based_loader_names = [name for name in config.ENABLED_LOADERS 
+                          if name not in ["genesis", "specs"]]
+            relevant_loaders = [l for l in loaders if l.name in slot_based_loader_names]
             if not relevant_loaders:
                 logger.warning("No relevant loaders found for backfill", worker=worker_id)
                 return

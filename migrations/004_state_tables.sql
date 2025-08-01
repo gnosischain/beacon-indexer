@@ -1,5 +1,5 @@
 -- Chunk management for backfill workers
-CREATE TABLE load_state_chunks (
+CREATE TABLE IF NOT EXISTS load_state_chunks (
     chunk_id String,
     start_slot UInt64,
     end_slot UInt64,

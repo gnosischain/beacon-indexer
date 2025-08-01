@@ -56,6 +56,9 @@ class TransformerService:
                 # Process validators (NOT fork-aware)
                 if await self._process_table_batch("raw_validators", "validators", batch_size):
                     processed_any = True
+
+                if await self._process_table_batch("raw_rewards", "rewards", batch_size):
+                    processed_any = True
                 
                 if processed_any:
                     consecutive_empty_rounds = 0  # Reset counter

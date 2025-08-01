@@ -123,3 +123,7 @@ class BeaconAPI:
         if data and "data" in data:
             return int(data["data"]["header"]["message"]["slot"])
         return None
+    
+    async def get_rewards(self, slot: str = "head") -> Optional[Dict[str, Any]]:
+        """Get rewards by slot."""
+        return await self.get(f"/eth/v1/beacon/rewards/blocks/{slot}")

@@ -14,7 +14,7 @@ migration: ## Set up database schema and tables
 	docker compose --profile migration up
 
 backfill: ## Load historical raw data (uses START_SLOT/END_SLOT from .env)
-	docker compose --profile backfill up
+	docker compose --profile backfill up -d
 
 realtime: ## Load new raw data continuously
 	docker compose --profile realtime up -d

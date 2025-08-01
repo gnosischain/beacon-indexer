@@ -166,3 +166,22 @@ CREATE TABLE IF NOT EXISTS validators (
 ) ENGINE = ReplacingMergeTree(insert_version)
 ORDER BY (slot, validator_index)
 PARTITION BY toStartOfMonth(slot_timestamp);
+
+
+CREATE TABLE IF NOT EXISTS rewards (
+    slot UInt64,
+    proposer_index UInt64,
+    total UInt64,
+    attestations UInt64,
+    sync_aggregate UInt64,
+    proposer_slashings UInt64,
+    attester_slashings UInt64,
+    timestamp_utc DateTime DEFAULT toDateTime(0),
+    slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
+        (SELECT toDateTime(genesis_time_unix, 'UTC') FROM time_helpers LIMIT 1),
+        slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
+    ),
+    insert_version UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9))
+) ENGINE = ReplacingMergeTree(insert_version)
+ORDER BY (slot)
+PARTITION BY toStartOfMonth(slot_timestamp);

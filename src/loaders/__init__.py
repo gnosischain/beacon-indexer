@@ -2,12 +2,14 @@ from .blocks import BlocksLoader
 from .validators import ValidatorsLoader
 from .specs import SpecsLoader
 from .genesis import GenesisLoader
+from .rewards import RewardsLoader
 
 LOADER_REGISTRY = {
     "blocks": BlocksLoader,
     "validators": ValidatorsLoader,
     "specs": SpecsLoader,
-    "genesis": GenesisLoader
+    "genesis": GenesisLoader,
+    "rewards": RewardsLoader
 }
 
 def get_enabled_loaders(enabled_names, beacon_api, clickhouse):
