@@ -17,14 +17,12 @@ def connect_clickhouse(
     verify: bool = False
 ) -> Client:
     """
-    Connect to ClickHouse using clickhouse_connect and return a Client.
-    Raises an exception if connection fails.
+    Connect to ClickHouse Cloud with settings that work within cloud constraints.
     """
-    logger.info("Connecting to ClickHouse", 
+    logger.info("Connecting to ClickHouse Cloud with optimized settings", 
                host=host, 
                port=port, 
-               secure=secure, 
-               verify=verify)
+               secure=secure)
     try:
         client = clickhouse_connect.get_client(
             host=host,
@@ -32,22 +30,52 @@ def connect_clickhouse(
             username=user,
             password=password,
             database=database,
-            secure=secure,   # Enable TLS
-            verify=verify,   # Verify certificate if True
-            # Simple timeout fix for large validator payloads
-            send_receive_timeout=600,  # 10 minutes instead of default
-            connect_timeout=120        # 2 minutes for connection
+            secure=secure,
+            verify=verify,
+            # Increased timeouts for large payloads
+            send_receive_timeout=1800,  # 30 minutes
+            connect_timeout=300,        # 5 minutes
+            # Cloud-friendly settings (no memory limits - those are fixed by cloud)
+            settings={
+                # Insert optimization - smaller blocks to avoid memory spikes
+                'max_insert_block_size': '10000',           # Much smaller blocks
+                'min_insert_block_size_rows': '1000',       # Smaller minimum
+                'min_insert_block_size_bytes': '10485760',  # 10MB instead of 256MB
+                'max_insert_threads': '1',                  # Single thread to avoid memory competition
+                
+                # JSON processing - minimal memory usage
+                'input_format_parallel_parsing': '0',        # Disable parallel parsing
+                'min_chunk_bytes_for_parallel_parsing': '0', # No parallel parsing threshold
+                'output_format_json_quote_64bit_integers': '0',
+                'input_format_skip_unknown_fields': '1',
+                'input_format_import_nested_json': '1',
+                
+                # Reduce logging and overhead
+                'log_queries': '0',
+                'log_query_threads': '0',
+                'log_processors_profiles': '0',
+                
+                # Timeouts
+                'max_execution_time': '3600',  # 1 hour max execution
+                'send_timeout': '1800',        # 30 min send timeout
+                'receive_timeout': '1800',     # 30 min receive timeout
+                
+                # Compression to reduce network usage
+                'network_compression_method': 'lz4'
+            }
         )
-        # Quick test
+        
+        # Test connection
         client.command("SELECT 1")
-        logger.info("ClickHouse connection established successfully")
+        logger.info("ClickHouse Cloud connection established")
         return client
+        
     except Exception as e:
-        logger.error("Error connecting to ClickHouse", error=str(e))
+        logger.error("Error connecting to ClickHouse Cloud", error=str(e))
         raise
 
 class ClickHouse:
-    """ClickHouse database client using clickhouse-connect."""
+    """ClickHouse Cloud client optimized for memory-constrained environments."""
     
     def __init__(self):
         self.client = connect_clickhouse(
@@ -64,17 +92,212 @@ class ClickHouse:
         self._genesis_time = None
         self._seconds_per_slot = None
     
+    def insert_batch(self, table: str, data: List[Dict[str, Any]]):
+        """Cloud-optimized batch insert with aggressive chunking for large payloads."""
+        if not data:
+            return
+        
+        # Calculate total data size
+        total_size_mb = self._calculate_data_size_mb(data)
+        
+        logger.info("Processing batch for cloud insert", 
+                   table=table,
+                   rows=len(data),
+                   estimated_size_mb=round(total_size_mb, 2))
+        
+        if total_size_mb < 10:  # Very small batch - insert normally
+            self._insert_single_batch(table, data)
+        elif total_size_mb < 50:  # Medium batch - chunk conservatively
+            self._insert_chunked_by_size(table, data, max_chunk_size_mb=5)
+        else:
+            # Large batch - aggressive chunking for cloud memory limits
+            self._insert_chunked_by_size(table, data, max_chunk_size_mb=2)
+    
+    def _calculate_data_size_mb(self, data: List[Dict[str, Any]]) -> float:
+        """Calculate approximate size of data in MB."""
+        if not data:
+            return 0
+        
+        # Estimate size based on JSON serialization of first few rows
+        sample_size = min(3, len(data))  # Smaller sample to reduce overhead
+        sample_data = data[:sample_size]
+        
+        total_sample_size = 0
+        for row in sample_data:
+            json_str = json.dumps(row, separators=(',', ':'))
+            total_sample_size += len(json_str.encode('utf-8'))
+        
+        # Estimate total size with 20% buffer for safety
+        avg_row_size = total_sample_size / sample_size
+        total_size_bytes = avg_row_size * len(data) * 1.2  # 20% buffer
+        return total_size_bytes / (1024 * 1024)
+    
+    def _insert_chunked_by_size(self, table: str, data: List[Dict[str, Any]], max_chunk_size_mb: float):
+        """Insert data in very small chunks to avoid cloud memory limits."""
+        current_chunk = []
+        current_size_mb = 0
+        chunks_inserted = 0
+        
+        for i, row in enumerate(data):
+            # Estimate row size (cache for efficiency)
+            if i % 100 == 0 or not hasattr(self, '_cached_row_size_mb'):
+                row_json = json.dumps(row, separators=(',', ':'))
+                self._cached_row_size_mb = len(row_json.encode('utf-8')) / (1024 * 1024)
+            
+            row_size_mb = self._cached_row_size_mb
+            
+            # If adding this row would exceed limit, insert current chunk
+            if current_chunk and (current_size_mb + row_size_mb) > max_chunk_size_mb:
+                success = self._insert_single_batch_safe(table, current_chunk)
+                
+                if success:
+                    chunks_inserted += 1
+                    logger.debug("Inserted cloud-safe chunk", 
+                               table=table,
+                               chunk_num=chunks_inserted,
+                               rows=len(current_chunk),
+                               size_mb=round(current_size_mb, 2))
+                else:
+                    # If even a small chunk fails, we need to go smaller
+                    logger.warning("Chunk failed, splitting further", 
+                                 table=table,
+                                 chunk_size=len(current_chunk))
+                    self._insert_micro_chunks(table, current_chunk)
+                    chunks_inserted += 1
+                
+                current_chunk = []
+                current_size_mb = 0
+            
+            current_chunk.append(row)
+            current_size_mb += row_size_mb
+        
+        # Insert final chunk
+        if current_chunk:
+            success = self._insert_single_batch_safe(table, current_chunk)
+            if success:
+                chunks_inserted += 1
+            else:
+                self._insert_micro_chunks(table, current_chunk)
+                chunks_inserted += 1
+        
+        logger.info("Completed cloud-safe chunked insertion", 
+                   table=table,
+                   total_chunks=chunks_inserted,
+                   total_rows=len(data))
+    
+    def _insert_micro_chunks(self, table: str, data: List[Dict[str, Any]]):
+        """Insert data in micro chunks (single rows if necessary)."""
+        logger.info("Using micro-chunk insertion", table=table, rows=len(data))
+        
+        # Try progressively smaller chunk sizes
+        chunk_sizes = [50, 20, 10, 5, 1]
+        
+        for chunk_size in chunk_sizes:
+            failed_rows = []
+            
+            for i in range(0, len(data), chunk_size):
+                chunk = data[i:i + chunk_size]
+                success = self._insert_single_batch_safe(table, chunk)
+                
+                if not success:
+                    failed_rows.extend(chunk)
+                else:
+                    logger.debug("Micro-chunk succeeded", 
+                               table=table,
+                               chunk_size=len(chunk))
+            
+            if not failed_rows:
+                logger.info("All micro-chunks succeeded", 
+                           table=table,
+                           chunk_size=chunk_size)
+                return
+            else:
+                data = failed_rows  # Retry with smaller chunks
+                logger.debug("Retrying failed rows with smaller chunks", 
+                           table=table,
+                           failed_count=len(failed_rows),
+                           next_chunk_size=chunk_sizes[chunk_sizes.index(chunk_size) + 1] if chunk_size != 1 else 1)
+        
+        # If we get here, even single rows are failing
+        logger.error("Unable to insert data even with single-row chunks", 
+                   table=table, 
+                   failed_rows=len(data))
+        raise Exception(f"Failed to insert {len(data)} rows into {table} even with micro-chunking")
+    
+    def _insert_single_batch_safe(self, table: str, data: List[Dict[str, Any]]) -> bool:
+        """Insert a single batch with cloud-safe error handling."""
+        try:
+            # Prepare data with datetime handling
+            json_rows = []
+            for row in data:
+                processed_row = {}
+                for key, value in row.items():
+                    if isinstance(value, datetime):
+                        dt_without_tz = value.replace(tzinfo=None) if value.tzinfo else value
+                        processed_row[key] = dt_without_tz.strftime('%Y-%m-%d %H:%M:%S')
+                    elif isinstance(value, bool):
+                        processed_row[key] = 1 if value else 0
+                    elif value is None:
+                        processed_row[key] = None
+                    else:
+                        processed_row[key] = value
+                json_rows.append(json.dumps(processed_row, separators=(',', ':')))
+            
+            json_data = '\n'.join(json_rows)
+            data_size_mb = len(json_data.encode('utf-8')) / (1024 * 1024)
+            
+            query = f"INSERT INTO {table} FORMAT JSONEachRow"
+            
+            # Cloud-safe settings - no memory limits, just processing optimization
+            insert_settings = {
+                'max_insert_block_size': '5000',     # Very small blocks
+                'max_insert_threads': '1',           # Single thread
+                'input_format_parallel_parsing': '0', # No parallel processing
+                'log_queries': '0'                   # Reduce overhead
+            }
+            
+            self.client.command(query, data=json_data, settings=insert_settings)
+            
+            logger.debug("Cloud batch inserted successfully", 
+                       table=table, 
+                       rows=len(data),
+                       size_mb=round(data_size_mb, 2))
+            
+            return True
+            
+        except Exception as e:
+            # Check if it's a memory error
+            error_str = str(e).lower()
+            if 'memory' in error_str or 'limit exceeded' in error_str:
+                logger.warning("Memory limit hit, will retry with smaller chunks", 
+                              table=table, 
+                              rows=len(data),
+                              error=str(e)[:200])
+                return False
+            else:
+                # Other errors should be raised
+                logger.error("Non-memory batch insert error", 
+                            table=table, 
+                            rows=len(data), 
+                            error=str(e))
+                raise
+    
+    def _insert_single_batch(self, table: str, data: List[Dict[str, Any]]):
+        """Legacy method for compatibility - delegates to safe version."""
+        success = self._insert_single_batch_safe(table, data)
+        if not success:
+            raise Exception("Batch insert failed due to memory limits")
+    
+    # Keep all existing methods for compatibility
     async def init_cache(self):
         """Initialize cache for frequently accessed configuration."""
         if self._genesis_time is None:
-            # Get genesis time
             query = "SELECT toUnixTimestamp(genesis_time) as genesis_time FROM genesis LIMIT 1"
             result = self.execute(query)
             if result and len(result) > 0:
                 self._genesis_time = result[0].get("genesis_time")
                 
         if self._seconds_per_slot is None:
-            # Get seconds per slot from specs
             query = """
             SELECT parameter_value 
             FROM specs 
@@ -89,12 +312,10 @@ class ClickHouse:
         """Execute a query and return results as list of dictionaries."""
         try:
             if params:
-                # Use parameterized query
                 result = self.client.query(query, parameters=params)
             else:
                 result = self.client.query(query)
             
-            # Convert to list of dictionaries
             if result.result_rows:
                 columns = result.column_names
                 return [dict(zip(columns, row)) for row in result.result_rows]
@@ -104,61 +325,15 @@ class ClickHouse:
             logger.error("ClickHouse query failed", query=query, error=str(e))
             raise
     
-    def insert_batch(self, table: str, data: List[Dict[str, Any]]):
-        """Insert a batch of data using JSONEachRow format consistently."""
-        if not data:
-            return
-        
-        try:
-            # Use JSONEachRow format for all tables with proper datetime handling
-            json_rows = []
-            for row in data:
-                # Convert datetime objects to strings for JSON serialization
-                processed_row = {}
-                for key, value in row.items():
-                    if isinstance(value, datetime):
-                        if value.tzinfo is not None:
-                            dt_without_tz = value.replace(tzinfo=None)
-                        else:
-                            dt_without_tz = value
-                        processed_row[key] = dt_without_tz.strftime('%Y-%m-%d %H:%M:%S')
-                    elif isinstance(value, bool):
-                        processed_row[key] = 1 if value else 0
-                    elif value is None:
-                        processed_row[key] = None
-                    else:
-                        processed_row[key] = value
-                json_rows.append(json.dumps(processed_row))
-            
-            # Create the data payload
-            json_data = '\n'.join(json_rows)
-            
-            # Use the client's command method with data parameter
-            query = f"INSERT INTO {table} FORMAT JSONEachRow"
-            
-            self.client.command(query, data=json_data, settings={
-                'min_chunk_bytes_for_parallel_parsing': 200000000  # 200MB instead of 10MB default
-            })
-            
-            logger.info("Batch inserted", table=table, rows=len(data))
-            
-        except Exception as e:
-            logger.error("Batch insert failed", table=table, rows=len(data), error=str(e))
-            # Log the actual data being inserted for debugging
-            logger.error("Sample data", sample=data[0] if data else "empty")
-            raise
-    
     def claim_chunk(self, worker_id: str, loader_name: str) -> Optional[tuple]:
         """Worker-specific chunk claiming with better distribution."""
         try:
-            # Extract worker number from worker_id (e.g., "worker_5" -> 5)
             try:
                 worker_num = int(worker_id.split('_')[1])
             except (IndexError, ValueError):
                 logger.error("Invalid worker_id format", worker_id=worker_id)
                 return None
             
-            # Use chunk ordering (ROW_NUMBER) instead of start_slot for even distribution
             get_chunks_query = """
             SELECT chunk_id, start_slot, end_slot, chunk_row_num
             FROM (
@@ -195,7 +370,6 @@ class ClickHouse:
             start_slot = chunk["start_slot"]
             end_slot = chunk["end_slot"]
             
-            # Since only this worker can claim this chunk, claiming is now safe
             claim_query = """
             INSERT INTO load_state_chunks 
             (chunk_id, start_slot, end_slot, loader_name, status, worker_id, created_at, updated_at)
@@ -231,7 +405,6 @@ class ClickHouse:
     def update_chunk_status(self, start_slot: int, end_slot: int, loader_name: str, status: str):
         """Update chunk status using chunk_id for atomic updates."""
         try:
-            # Generate the same chunk_id used during creation
             chunk_id = f"{loader_name}_{start_slot}_{end_slot}"
             
             query = """
