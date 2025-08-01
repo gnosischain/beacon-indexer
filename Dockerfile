@@ -17,6 +17,9 @@ COPY migrations/ migrations/
 COPY scripts/ scripts/
 COPY config/ config/
 
+# Create parquet data directory
+RUN mkdir -p /app/parquet_data
+
 # Create entrypoint script
 COPY docker-entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
