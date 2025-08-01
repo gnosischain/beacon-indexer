@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS raw_blocks (
         (SELECT toDateTime(genesis_time_unix, 'UTC') FROM time_helpers LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
     )
-) ENGINE = MergeTree()
+) ENGINE = ReplacingMergeTree()
 ORDER BY slot
 PARTITION BY toStartOfMonth(slot_timestamp);
 

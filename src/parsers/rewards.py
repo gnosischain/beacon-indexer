@@ -26,19 +26,16 @@ class RewardsParser(BaseParser):
             return {}
         
         rewards_data = payload["data"]
-        reward_rows = []
         
-        for reward in rewards_data:
-            reward_rows.append({
-                "slot": slot,
-                "proposer_index": int(reward.get("proposer_index", 0)),
-                "total": int(reward.get("total", 0)),
-                "attestations": int(reward.get("attestations", 0)),
-                "sync_aggregate": int(reward.get("sync_aggregate", 0)),
-                "proposer_slashings": int(reward.get("proposer_slashings", 0)),
-                "attester_slashings": int(reward.get("attester_slashings", 0))
-            })
+        # rewards_data is a single dictionary, not a list
+        reward_row = {
+            "slot": slot,
+            "proposer_index": int(rewards_data.get("proposer_index", 0)),
+            "total": int(rewards_data.get("total", 0)),
+            "attestations": int(rewards_data.get("attestations", 0)),
+            "sync_aggregate": int(rewards_data.get("sync_aggregate", 0)),
+            "proposer_slashings": int(rewards_data.get("proposer_slashings", 0)),
+            "attester_slashings": int(rewards_data.get("attester_slashings", 0))
+        }
         
-        return {"rewards": reward_rows}
-    
-
+        return {"rewards": [reward_row]}
