@@ -4,7 +4,7 @@ import multiprocessing as mp
 from datetime import datetime
 from typing import List
 from src.services.beacon_api import BeaconAPI
-from src.services.clickhouse import ClickHouse
+from src.services.storage_factory import create_storage
 from src.loaders import get_enabled_loaders
 from src.config import config
 from src.utils.logger import logger
@@ -14,7 +14,7 @@ class LoaderService:
     
     def __init__(self):
         self.beacon_api = None
-        self.clickhouse = None
+        self.storage = None
         self.loaders = []
     
     async def initialize(self):
@@ -22,17 +22,18 @@ class LoaderService:
         self.beacon_api = BeaconAPI()
         await self.beacon_api.start()
         
-        self.clickhouse = ClickHouse()
+        self.storage = create_storage()
         
         # Get enabled loaders
         self.loaders = get_enabled_loaders(
             config.ENABLED_LOADERS,
             self.beacon_api,
-            self.clickhouse
+            self.storage
         )
         
         logger.info("Loader service initialized", 
-                   loaders=[loader.name for loader in self.loaders])
+                   loaders=[loader.name for loader in self.loaders],
+                   storage_backend=config.STORAGE_BACKEND)
     
     async def cleanup(self):
         """Clean up resources."""
@@ -46,7 +47,7 @@ class LoaderService:
         # First, ensure specs and genesis are loaded
         await self._ensure_foundation_data()
         
-        # Get the last slot we have in raw data (instead of using sync_progress)
+        # Get the last slot we have in raw data
         last_slot = self._get_last_raw_slot()
         
         while True:
@@ -84,8 +85,8 @@ class LoaderService:
             blocks_query = "SELECT max(slot) as max_slot FROM raw_blocks"
             validators_query = "SELECT max(slot) as max_slot FROM raw_validators FINAL"
             
-            blocks_result = self.clickhouse.execute(blocks_query)
-            validators_result = self.clickhouse.execute(validators_query)
+            blocks_result = self.storage.execute(blocks_query)
+            validators_result = self.storage.execute(validators_query)
             
             max_blocks_slot = 0
             max_validators_slot = 0
@@ -141,15 +142,62 @@ class LoaderService:
                            error=str(e))
     
     async def backfill(self, start_slot: int, end_slot: int):
-        """Run backfill loading with multiple workers."""
+        """Run backfill loading with backend-specific approach."""
         logger.info("Starting backfill loader", 
                    start_slot=start_slot, 
                    end_slot=end_slot,
-                   workers=config.BACKFILL_WORKERS)
+                   storage_backend=config.STORAGE_BACKEND)
         
         # FIRST: Ensure foundation data is loaded
         await self._ensure_foundation_data()
         
+        # For Parquet backend, use simple sequential processing instead of chunks
+        if config.STORAGE_BACKEND.lower() == "parquet":
+            await self._simple_backfill(start_slot, end_slot)
+        else:
+            # Use existing chunk-based approach for ClickHouse
+            await self._chunk_based_backfill(start_slot, end_slot)
+        
+        logger.info("Backfill completed")
+    
+    async def _simple_backfill(self, start_slot: int, end_slot: int):
+        """Simple sequential backfill for Parquet backend."""
+        logger.info("Using simple sequential backfill for Parquet backend")
+        
+        batch_size = 1000
+        current_slot = start_slot
+        
+        while current_slot < end_slot:
+            batch_end = min(current_slot + batch_size, end_slot)
+            slot_range = list(range(current_slot, batch_end))
+            
+            logger.info("Processing slot batch", 
+                       start=current_slot, 
+                       end=batch_end-1, 
+                       total_progress=f"{current_slot-start_slot}/{end_slot-start_slot}")
+            
+            # Process each loader
+            for loader in self.loaders:
+                if loader.name in ["genesis", "specs"]:
+                    continue  # Already loaded in foundation data
+                
+                try:
+                    success_count = await loader.load_batch(slot_range)
+                    logger.info("Batch completed", 
+                               loader=loader.name,
+                               slots=len(slot_range),
+                               success_count=success_count)
+                except Exception as e:
+                    logger.error("Batch failed", 
+                               loader=loader.name,
+                               start_slot=current_slot,
+                               end_slot=batch_end-1,
+                               error=str(e))
+            
+            current_slot = batch_end
+    
+    async def _chunk_based_backfill(self, start_slot: int, end_slot: int):
+        """Existing chunk-based backfill for ClickHouse."""
         # Generate chunks intelligently for each loader
         slot_based_loaders = [name for name in config.ENABLED_LOADERS 
                              if name not in ["genesis", "specs"]]
@@ -171,11 +219,9 @@ class LoaderService:
             # Wait for all workers to complete
             for task in tasks:
                 task.get()
-        
-        logger.info("Backfill completed")
 
     def _generate_smart_chunks(self, start_slot: int, end_slot: int, enabled_loaders: list):
-        """Generate chunks with bulk existing chunk detection to avoid memory issues."""
+        """Generate chunks with bulk existing chunk detection."""
         chunks_to_create = []
         current_time = datetime.now()
         
@@ -195,7 +241,7 @@ class LoaderService:
                     AND start_slot >= {start_slot:UInt64}
                     AND end_slot < {end_slot:UInt64}
                     """
-                    existing_results = self.clickhouse.execute(existing_query, {
+                    existing_results = self.storage.execute(existing_query, {
                         "loader_name": loader_name,
                         "start_slot": start_slot,
                         "end_slot": end_slot
@@ -349,7 +395,7 @@ class LoaderService:
             for i in range(0, total_chunks, batch_size):
                 batch = chunks_to_create[i:i + batch_size]
                 try:
-                    self.clickhouse.insert_batch("load_state_chunks", batch)
+                    self.storage.insert_batch("load_state_chunks", batch)
                     logger.info("Inserted chunk batch", 
                             batch_num=i//batch_size + 1,
                             batch_size=len(batch),
@@ -386,7 +432,7 @@ class LoaderService:
                 GROUP BY status
                 ORDER BY status
                 """
-                status_result = self.clickhouse.execute(status_query, {
+                status_result = self.storage.execute(status_query, {
                     "loader_name": loader_name,
                     "start_slot": start_slot,
                     "end_slot": end_slot
@@ -412,14 +458,14 @@ class LoaderService:
         try:
             # Get a validators loader instance to calculate target slots
             from src.loaders.validators import ValidatorsLoader
-            validators_loader = ValidatorsLoader(self.beacon_api, self.clickhouse)
+            validators_loader = ValidatorsLoader(self.beacon_api, self.storage)
             return validators_loader.get_target_slots_in_range(start_slot, end_slot)
         except Exception as e:
             logger.error("Error getting validator target slots", error=str(e))
             return []
     
     async def _ensure_foundation_data(self):
-        """Ensure genesis and specs data are loaded before processing slots - regardless of enabled loaders."""
+        """Ensure genesis and specs data are loaded before processing slots."""
         logger.info("Ensuring foundation data is loaded (required for all operations)")
         
         # Always create genesis and specs loaders, regardless of ENABLED_LOADERS
@@ -427,8 +473,8 @@ class LoaderService:
         from src.loaders.genesis import GenesisLoader
         from src.loaders.specs import SpecsLoader
         
-        genesis_loader = GenesisLoader(self.beacon_api, self.clickhouse)
-        specs_loader = SpecsLoader(self.beacon_api, self.clickhouse)
+        genesis_loader = GenesisLoader(self.beacon_api, self.storage)
+        specs_loader = SpecsLoader(self.beacon_api, self.storage)
         
         # Load genesis first (required for timing calculations)
         try:
@@ -452,32 +498,25 @@ class LoaderService:
         
         # Verify foundation data is properly loaded
         try:
-            genesis_count = self.clickhouse.execute("SELECT COUNT(*) as count FROM genesis")[0]["count"]
-            time_helpers_count = self.clickhouse.execute("SELECT COUNT(*) as count FROM time_helpers")[0]["count"]
+            genesis_count = self.storage.execute("SELECT COUNT(*) as count FROM genesis")[0]["count"]
+            time_helpers_count = self.storage.execute("SELECT COUNT(*) as count FROM time_helpers")[0]["count"]
             
             if genesis_count == 0:
                 raise Exception("Genesis table is empty after loading")
             if time_helpers_count == 0:
                 raise Exception("Time helpers table is empty after loading")
             
-            # Get timing parameters to verify they're valid
-            time_helpers = self.clickhouse.execute("SELECT genesis_time_unix, seconds_per_slot FROM time_helpers ORDER BY genesis_time_unix DESC LIMIT 1")
-            if not time_helpers or not time_helpers[0]["genesis_time_unix"]:
-                raise Exception("Invalid timing parameters in time_helpers")
-            
             logger.info("Foundation data verified and available for all loaders", 
                        genesis_count=genesis_count,
-                       time_helpers_count=time_helpers_count,
-                       genesis_time_unix=time_helpers[0]["genesis_time_unix"],
-                       seconds_per_slot=time_helpers[0]["seconds_per_slot"])
+                       time_helpers_count=time_helpers_count)
                        
         except Exception as e:
             logger.error("Foundation data verification failed", error=str(e))
             raise
         
         # Initialize cache after loading foundation data
-        await self.clickhouse.init_cache()
-        logger.info("ClickHouse cache initialized with timing parameters")
+        await self.storage.init_cache()
+        logger.info("Storage cache initialized with timing parameters")
     
     @staticmethod
     def _worker_process(worker_id: str):
@@ -488,7 +527,7 @@ class LoaderService:
             # Initialize services in worker
             beacon_api = BeaconAPI()
             await beacon_api.start()
-            clickhouse = ClickHouse()
+            storage = create_storage()
             
             logger.info("Worker started", worker=worker_id)
             
@@ -499,7 +538,7 @@ class LoaderService:
             loaders = get_enabled_loaders(
                 config.ENABLED_LOADERS,
                 beacon_api,
-                clickhouse
+                storage
             )
             
             # Get only slot-based loaders for backfill (exclude genesis, specs)
@@ -526,7 +565,7 @@ class LoaderService:
                                    loader=loader.name)
                         
                         # Claim a chunk for this specific loader
-                        chunk = clickhouse.claim_chunk(worker_id, loader.name)
+                        chunk = storage.claim_chunk(worker_id, loader.name)
                         if chunk is None:
                             logger.debug("No chunks available for loader", 
                                        worker=worker_id, 
@@ -553,7 +592,7 @@ class LoaderService:
                             success_count = await loader.load_batch(list(range(start_slot, end_slot + 1)))
                             
                             # Mark as completed
-                            clickhouse.update_chunk_status(start_slot, end_slot, loader.name, "completed")
+                            storage.update_chunk_status(start_slot, end_slot, loader.name, "completed")
                             
                             logger.info("Chunk completed", 
                                        worker=worker_id,
@@ -574,7 +613,7 @@ class LoaderService:
                                         error=str(e))
                             
                             # Mark as failed
-                            clickhouse.update_chunk_status(start_slot, end_slot, loader.name, "failed")
+                            storage.update_chunk_status(start_slot, end_slot, loader.name, "failed")
                             claimed_chunks.remove((start_slot, end_slot, loader.name))
                     
                     # If no work was found this round, increment counter
@@ -603,7 +642,7 @@ class LoaderService:
                     for start_slot, end_slot, loader_name in claimed_chunks:
                         try:
                             # Reset to pending so another worker can pick it up
-                            clickhouse.update_chunk_status(start_slot, end_slot, loader_name, "pending")
+                            storage.update_chunk_status(start_slot, end_slot, loader_name, "pending")
                             logger.info("Reset uncompleted chunk to pending", 
                                        worker=worker_id,
                                        loader=loader_name,

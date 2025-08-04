@@ -1,61 +1,281 @@
 import asyncio
+import pandas as pd
 from typing import List, Dict, Tuple, Optional
-from src.services.clickhouse import ClickHouse
-from src.services.fork import ForkDetectionService
-from src.parsers.factory import ParserFactory
+from src.config import config
+from src.services.storage_factory import create_storage
 from src.parsers.validators import ValidatorsParser
 from src.parsers.rewards import RewardsParser
 from src.utils.logger import logger
 
 class TransformerService:
-    """Service for transforming raw data into structured tables using load_state_chunks."""
+    """Service for transforming raw data into structured tables using storage backend."""
     
     def __init__(self):
-        self.clickhouse = ClickHouse()
-        self.fork_service = ForkDetectionService(clickhouse_client=self.clickhouse)
-        self.parser_factory = ParserFactory(self.fork_service)
+        self.storage = create_storage()
+        
+        # Only initialize fork detection for ClickHouse backend
+        if config.STORAGE_BACKEND.lower() == "clickhouse":
+            from src.services.fork import ForkDetectionService
+            from src.parsers.factory import ParserFactory
+            self.fork_service = ForkDetectionService(clickhouse_client=self.storage)
+            self.parser_factory = ParserFactory(self.fork_service)
+            
+            # Define loader configurations for ClickHouse
+            self.loader_configs = {
+                "blocks": {
+                    "raw_table": "raw_blocks",
+                    "use_final": False,
+                    "fork_aware": True
+                },
+                "validators": {
+                    "raw_table": "raw_validators", 
+                    "use_final": True,
+                    "fork_aware": False
+                },
+                "rewards": {
+                    "raw_table": "raw_rewards",
+                    "use_final": True, 
+                    "fork_aware": False
+                }
+            }
+        else:
+            # For Parquet, use simpler approach without fork detection
+            self.fork_service = None
+            self.parser_factory = None
+            self.loader_configs = {}
+        
+        # Non-fork-aware parsers (always available)
         self.validator_parser = ValidatorsParser()
         self.rewards_parser = RewardsParser()
         
-        # Define loader configurations
-        self.loader_configs = {
-            "blocks": {
-                "raw_table": "raw_blocks",
-                "use_final": False,
-                "fork_aware": True
-            },
-            "validators": {
-                "raw_table": "raw_validators", 
-                "use_final": True,
-                "fork_aware": False
-            },
-            "rewards": {
-                "raw_table": "raw_rewards",
-                "use_final": True, 
-                "fork_aware": False
-            }
-        }
-        
-        logger.info("Transformer initialized with chunk-based processing")
+        logger.info("Transformer initialized", 
+                   storage_backend=config.STORAGE_BACKEND,
+                   fork_aware=self.fork_service is not None)
     
     async def initialize(self):
         """Initialize the transformer service."""
-        network_info = " (auto-detected)" if self.fork_service.is_auto_detected() else ""
-        
-        logger.info("Fork service initialized", 
-                   network=self.fork_service.get_network_name() + network_info,
-                   slots_per_epoch=self.fork_service.slots_per_epoch,
-                   seconds_per_slot=self.fork_service.seconds_per_slot,
-                   genesis_time=self.fork_service.genesis_time)
+        if self.fork_service:
+            network_info = " (auto-detected)" if self.fork_service.is_auto_detected() else ""
+            
+            logger.info("Fork service initialized", 
+                       network=self.fork_service.get_network_name() + network_info,
+                       slots_per_epoch=self.fork_service.slots_per_epoch,
+                       seconds_per_slot=self.fork_service.seconds_per_slot,
+                       genesis_time=self.fork_service.genesis_time)
+        else:
+            logger.info("Simple transformer initialized for Parquet backend")
     
     async def run(self, batch_size: int = 100, continuous: bool = False):
-        """Run transformer by processing completed load chunks that haven't been transformed yet."""
+        """Run transformer with backend-specific processing."""
         
         mode = "continuous" if continuous else "batch"
-        logger.info("Starting chunk-based transformer", mode=mode, batch_size=batch_size)
+        logger.info("Starting transformer", 
+                   mode=mode, 
+                   batch_size=batch_size,
+                   storage_backend=config.STORAGE_BACKEND)
         
         await self.initialize()
         
+        if config.STORAGE_BACKEND.lower() == "parquet":
+            await self._run_parquet_transformer(batch_size, continuous)
+        else:
+            await self._run_clickhouse_transformer(batch_size, continuous)
+    
+    async def _run_parquet_transformer(self, batch_size: int, continuous: bool):
+        """Simple transformer for Parquet backend - processes raw files directly."""
+        logger.info("Running Parquet transformer - processing raw data files")
+        
+        consecutive_empty_rounds = 0
+        max_empty_rounds = 3 if not continuous else float('inf')
+        
+        while consecutive_empty_rounds < max_empty_rounds:
+            try:
+                processed_any = False
+                
+                # Process raw data files
+                for table_type in ["blocks", "validators", "rewards"]:
+                    raw_table = f"raw_{table_type}"
+                    processed = await self._process_parquet_table(raw_table, table_type, batch_size)
+                    if processed:
+                        processed_any = True
+                
+                if processed_any:
+                    consecutive_empty_rounds = 0
+                else:
+                    consecutive_empty_rounds += 1
+                    if continuous:
+                        logger.info("No new data to transform, waiting...")
+                        await asyncio.sleep(10)
+                    else:
+                        await asyncio.sleep(1)
+                        
+            except Exception as e:
+                logger.error("Error in Parquet transformer", error=str(e))
+                if continuous:
+                    await asyncio.sleep(30)
+                else:
+                    break
+        
+        if not continuous:
+            logger.info("Parquet transformation completed")
+    
+    async def _process_parquet_table(self, raw_table: str, table_type: str, batch_size: int) -> bool:
+        """Process a raw Parquet table into structured format."""
+        try:
+            raw_dir = self.storage.output_dir / raw_table
+            if not raw_dir.exists():
+                return False
+            
+            # Find unprocessed files (simple approach - look for .parquet files)
+            parquet_files = list(raw_dir.rglob("*.parquet"))
+            if not parquet_files:
+                return False
+            
+            # Filter out already processed files
+            unprocessed_files = []
+            for parquet_file in parquet_files:
+                processed_dir = parquet_file.parent / "processed"
+                if not (processed_dir / parquet_file.name).exists():
+                    unprocessed_files.append(parquet_file)
+            
+            if not unprocessed_files:
+                return False
+            
+            processed_any = False
+            
+            for parquet_file in unprocessed_files[:5]:  # Process up to 5 files at a time
+                try:
+                    # Read raw data
+                    df = pd.read_parquet(parquet_file)
+                    if df.empty:
+                        continue
+                    
+                    # Convert to list of dictionaries for processing
+                    raw_data = df.to_dict('records')
+                    
+                    # Process based on table type
+                    if table_type == "blocks":
+                        processed_count, failed_count = await self._process_blocks_simple(raw_data)
+                    elif table_type == "validators":
+                        processed_count, failed_count = await self._process_validators_simple(raw_data)
+                    elif table_type == "rewards":
+                        processed_count, failed_count = await self._process_rewards_simple(raw_data)
+                    else:
+                        continue
+                    
+                    if processed_count > 0:
+                        processed_any = True
+                        logger.info("Processed Parquet file", 
+                                   file=parquet_file.name,
+                                   table_type=table_type,
+                                   processed=processed_count,
+                                   failed=failed_count)
+                        
+                        # Mark file as processed by moving it to a processed subdirectory
+                        processed_dir = parquet_file.parent / "processed"
+                        processed_dir.mkdir(exist_ok=True)
+                        parquet_file.rename(processed_dir / parquet_file.name)
+                    
+                except Exception as e:
+                    logger.error("Failed to process Parquet file", 
+                               file=parquet_file, 
+                               error=str(e))
+            
+            return processed_any
+            
+        except Exception as e:
+            logger.error("Failed to process Parquet table", 
+                        raw_table=raw_table, 
+                        error=str(e))
+            return False
+    
+    async def _process_blocks_simple(self, raw_data: List[Dict]) -> Tuple[int, int]:
+        """Process blocks with simple parsing (no fork awareness for Parquet)."""
+        from src.parsers.blocks import BlocksParser
+        parser = BlocksParser()
+        
+        processed_count = 0
+        failed_count = 0
+        all_blocks = []
+        all_attestations = []
+        
+        for raw_item in raw_data:
+            try:
+                parsed_data = parser.parse(raw_item)
+                
+                if parsed_data:
+                    if "blocks" in parsed_data:
+                        all_blocks.extend(parsed_data["blocks"])
+                    if "attestations" in parsed_data:
+                        all_attestations.extend(parsed_data["attestations"])
+                    processed_count += 1
+                    
+            except Exception as e:
+                logger.error("Block parsing failed", 
+                           slot=raw_item.get("slot"), 
+                           error=str(e))
+                failed_count += 1
+        
+        # Insert data
+        if all_blocks:
+            self.storage.insert_batch("blocks", all_blocks)
+        if all_attestations:
+            self.storage.insert_batch("attestations", all_attestations)
+        
+        return processed_count, failed_count
+    
+    async def _process_validators_simple(self, raw_data: List[Dict]) -> Tuple[int, int]:
+        """Process validators with simple parsing."""
+        processed_count = 0
+        failed_count = 0
+        all_rows = []
+        
+        for raw_item in raw_data:
+            try:
+                parsed_data = self.validator_parser.parse(raw_item)
+                
+                if parsed_data and "validators" in parsed_data:
+                    all_rows.extend(parsed_data["validators"])
+                    processed_count += 1
+                    
+            except Exception as e:
+                logger.error("Validator parsing failed", 
+                           slot=raw_item.get("slot"), 
+                           error=str(e))
+                failed_count += 1
+        
+        if all_rows:
+            self.storage.insert_batch("validators", all_rows)
+        
+        return processed_count, failed_count
+    
+    async def _process_rewards_simple(self, raw_data: List[Dict]) -> Tuple[int, int]:
+        """Process rewards with simple parsing."""
+        processed_count = 0
+        failed_count = 0
+        all_rows = []
+        
+        for raw_item in raw_data:
+            try:
+                parsed_data = self.rewards_parser.parse(raw_item)
+                
+                if parsed_data and "rewards" in parsed_data:
+                    all_rows.extend(parsed_data["rewards"])
+                    processed_count += 1
+                    
+            except Exception as e:
+                logger.error("Reward parsing failed", 
+                           slot=raw_item.get("slot"), 
+                           error=str(e))
+                failed_count += 1
+        
+        if all_rows:
+            self.storage.insert_batch("rewards", all_rows)
+        
+        return processed_count, failed_count
+    
+    async def _run_clickhouse_transformer(self, batch_size: int, continuous: bool):
+        """Existing ClickHouse transformer logic."""
         consecutive_empty_rounds = 0
         max_empty_rounds = 3 if not continuous else float('inf')
         
@@ -114,25 +334,34 @@ class TransformerService:
         raw_table = config["raw_table"]
         
         query = """
-        SELECT chunk_id, start_slot, end_slot, loader_name
-        FROM load_state_chunks FINAL
-        WHERE loader_name = {loader_name:String}
-          AND status = 'completed'
-          AND chunk_id NOT IN (
-              SELECT CONCAT(raw_table_name, '_', toString(start_slot), '_', toString(end_slot))
-              FROM transformer_progress FINAL
-              WHERE raw_table_name = {raw_table:String}
-                AND status = 'completed'
-          )
-        ORDER BY start_slot
+        SELECT 
+            lsc.chunk_id, 
+            lsc.start_slot, 
+            lsc.end_slot, 
+            lsc.loader_name
+        FROM load_state_chunks lsc FINAL
+        LEFT JOIN (
+            SELECT DISTINCT raw_table_name, start_slot, end_slot, status
+            FROM transformer_progress FINAL
+            WHERE status = 'completed'
+            AND raw_table_name = {raw_table:String}
+        ) tp ON (
+            tp.start_slot = lsc.start_slot
+            AND tp.end_slot = lsc.end_slot
+        )
+        WHERE lsc.loader_name = {loader_name:String}
+        AND lsc.status = 'completed'
+        AND tp.start_slot IS NULL
+        ORDER BY lsc.start_slot
         LIMIT 20
+        SETTINGS join_use_nulls = 1
         """
         
-        return self.clickhouse.execute(query, {
+        return self.storage.execute(query, {
             "loader_name": loader_name,
             "raw_table": raw_table
         })
-    
+
     async def _process_chunk(self, loader_name: str, chunk: Dict) -> bool:
         """Process a single chunk."""
         
@@ -211,7 +440,6 @@ class TransformerService:
         
         if loader_name in ["blocks", "validators", "rewards"]:
             # Tables with payload_hash - get the latest payload per slot
-            # This is not the way to handle fork protection, but let's keep it for now
             query = f"""
             SELECT slot, payload, payload_hash
             FROM (
@@ -236,7 +464,7 @@ class TransformerService:
             ORDER BY slot
             """
         
-        result = self.clickhouse.execute(query, {
+        result = self.storage.execute(query, {
             "start_slot": start_slot,
             "end_slot": end_slot
         })
@@ -299,7 +527,7 @@ class TransformerService:
                     for table_name, rows in tables_data.items():
                         if rows:
                             try:
-                                self.clickhouse.insert_batch(table_name, rows)
+                                self.storage.insert_batch(table_name, rows)
                                 logger.debug("Inserted fork-aware data", 
                                            table=table_name, 
                                            rows=len(rows),
@@ -378,7 +606,7 @@ class TransformerService:
         # Insert all data
         if all_rows:
             try:
-                self.clickhouse.insert_batch(target_table, all_rows)
+                self.storage.insert_batch(target_table, all_rows)
                 logger.info(f"Inserted {loader_name} data", 
                            rows=len(all_rows),
                            processed_items=processed_count)
@@ -401,10 +629,10 @@ class TransformerService:
             "processed_count": 0,
             "failed_count": 0,
             "error_message": "",
-            "processed_at": self.clickhouse.execute("SELECT now() as now")[0]["now"]
+            "processed_at": self.storage.execute("SELECT now() as now")[0]["now"]
         }
         
-        self.clickhouse.insert_batch("transformer_progress", [row])
+        self.storage.insert_batch("transformer_progress", [row])
         logger.debug("Started processing range", 
                     table=raw_table,
                     start_slot=start_slot,
@@ -422,10 +650,10 @@ class TransformerService:
             "processed_count": processed_count,
             "failed_count": failed_count,
             "error_message": error_message,
-            "processed_at": self.clickhouse.execute("SELECT now() as now")[0]["now"]
+            "processed_at": self.storage.execute("SELECT now() as now")[0]["now"]
         }
         
-        self.clickhouse.insert_batch("transformer_progress", [row])
+        self.storage.insert_batch("transformer_progress", [row])
         logger.debug("Recorded processing result", 
                     table=raw_table,
                     start_slot=start_slot,
@@ -436,16 +664,21 @@ class TransformerService:
     
     async def reprocess(self, start_slot: int, end_slot: int, batch_size: int = 100):
         """Reprocess a specific range of slots."""
-        logger.info("Starting chunk-based reprocessing", 
+        logger.info("Starting reprocessing", 
                    start_slot=start_slot, 
-                   end_slot=end_slot)
+                   end_slot=end_slot,
+                   storage_backend=config.STORAGE_BACKEND)
         
         await self.initialize()
         
+        if config.STORAGE_BACKEND.lower() == "parquet":
+            logger.info("Reprocessing not implemented for Parquet backend")
+            return
+        
         # Find all chunks in the range that need reprocessing
         for loader_name in self.loader_configs.keys():
-            config = self.loader_configs[loader_name]
-            raw_table = config["raw_table"]
+            config_item = self.loader_configs[loader_name]
+            raw_table = config_item["raw_table"]
             
             # Find chunks in range
             chunks_query = """
@@ -458,7 +691,7 @@ class TransformerService:
             ORDER BY start_slot
             """
             
-            chunks = self.clickhouse.execute(chunks_query, {
+            chunks = self.storage.execute(chunks_query, {
                 "loader_name": loader_name,
                 "start_slot": start_slot,
                 "end_slot": end_slot
@@ -476,10 +709,13 @@ class TransformerService:
     
     def get_processing_status(self) -> Dict[str, Dict]:
         """Get processing status for all configured loaders."""
+        if config.STORAGE_BACKEND.lower() == "parquet":
+            return {"message": "Status tracking not implemented for Parquet backend"}
+        
         status = {}
         
-        for loader_name, config in self.loader_configs.items():
-            raw_table = config["raw_table"]
+        for loader_name, config_item in self.loader_configs.items():
+            raw_table = config_item["raw_table"]
             
             stats_query = """
             SELECT 
@@ -495,7 +731,7 @@ class TransformerService:
             WHERE raw_table_name = {table:String}
             """
             
-            result = self.clickhouse.execute(stats_query, {"table": raw_table})
+            result = self.storage.execute(stats_query, {"table": raw_table})
             if result:
                 row = result[0]
                 status[raw_table] = {
@@ -524,6 +760,9 @@ class TransformerService:
     
     def get_failed_ranges(self, limit: int = 10) -> List[Dict]:
         """Get recent failed processing ranges for debugging."""
+        if config.STORAGE_BACKEND.lower() == "parquet":
+            return []
+        
         query = """
         SELECT raw_table_name, start_slot, end_slot, failed_count, error_message, processed_at
         FROM transformer_progress FINAL
@@ -532,4 +771,4 @@ class TransformerService:
         LIMIT {limit:UInt64}
         """
         
-        return self.clickhouse.execute(query, {"limit": limit})
+        return self.storage.execute(query, {"limit": limit})

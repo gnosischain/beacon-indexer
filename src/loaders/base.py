@@ -3,16 +3,15 @@ import json
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional
 from src.services.beacon_api import BeaconAPI
-from src.services.clickhouse import ClickHouse
 from src.utils.logger import logger
 
 class BaseLoader(ABC):
     """Base class for all loaders with payload hash support."""
     
-    def __init__(self, name: str, beacon_api: BeaconAPI, clickhouse: ClickHouse):
+    def __init__(self, name: str, beacon_api: BeaconAPI, storage):
         self.name = name
         self.beacon_api = beacon_api
-        self.clickhouse = clickhouse
+        self.storage = storage  # Generic storage backend (ClickHouse or Parquet)
         self.table_name = f"raw_{name}"
     
     @staticmethod
@@ -42,9 +41,9 @@ class BaseLoader(ABC):
         pass
     
     def store_data(self, rows: list):
-        """Store raw data in ClickHouse."""
+        """Store raw data in storage backend."""
         if rows:
-            self.clickhouse.insert_batch(self.table_name, rows)
+            self.storage.insert_batch(self.table_name, rows)
     
     async def load_single(self, identifier: Any) -> bool:
         """Load a single item."""

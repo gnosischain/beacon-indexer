@@ -7,8 +7,8 @@ from src.utils.logger import logger
 class GenesisLoader(BaseLoader):
     """Loader for genesis information. Keeps JSON payload (small data)."""
     
-    def __init__(self, beacon_api, clickhouse):
-        super().__init__("genesis", beacon_api, clickhouse)
+    def __init__(self, beacon_api, storage):
+        super().__init__("genesis", beacon_api, storage)
     
     async def fetch_data(self, _: Any = None) -> Optional[Dict[str, Any]]:
         """Fetch genesis data from beacon API."""
@@ -25,13 +25,13 @@ class GenesisLoader(BaseLoader):
         """Load genesis data and populate the genesis table."""
         try:
             # First check if we already have processed genesis data
-            existing_genesis = self.clickhouse.execute("SELECT COUNT(*) as count FROM genesis")
+            existing_genesis = self.storage.execute("SELECT COUNT(*) as count FROM genesis")
             if existing_genesis and existing_genesis[0]["count"] > 0:
                 logger.info("Genesis data already exists, skipping")
                 return True
             
             # Check if we have raw genesis data to process first
-            raw_genesis = self.clickhouse.execute("SELECT payload FROM raw_genesis ORDER BY retrieved_at DESC LIMIT 1")
+            raw_genesis = self.storage.execute("SELECT payload FROM raw_genesis ORDER BY retrieved_at DESC LIMIT 1")
             
             if raw_genesis:
                 # Process existing raw data (already parsed as dict from JSON column)
@@ -89,7 +89,7 @@ class GenesisLoader(BaseLoader):
                     "genesis_validators_root": genesis_data.get("genesis_validators_root", ""),
                     "genesis_fork_version": genesis_data.get("genesis_fork_version", "")
                 }
-                self.clickhouse.insert_batch("genesis", [genesis_row])
+                self.storage.insert_batch("genesis", [genesis_row])
                 
                 logger.info("Genesis data loaded successfully", 
                            genesis_time_unix=genesis_time_unix,

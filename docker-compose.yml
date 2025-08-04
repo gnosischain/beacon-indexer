@@ -4,13 +4,19 @@ services:
     image: beacon-indexer:latest
     container_name: migration
     environment:
+      - STORAGE_BACKEND=${STORAGE_BACKEND}
       - CLICKHOUSE_HOST=${CLICKHOUSE_HOST}
       - CLICKHOUSE_PORT=${CLICKHOUSE_PORT}
       - CLICKHOUSE_USER=${CLICKHOUSE_USER}
       - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
       - CLICKHOUSE_DATABASE=${CLICKHOUSE_DATABASE}
       - CLICKHOUSE_SECURE=${CLICKHOUSE_SECURE}
+      - PARQUET_OUTPUT_DIR=${PARQUET_OUTPUT_DIR}
+      - PARQUET_COMPRESSION=${PARQUET_COMPRESSION}
+      - PARQUET_ROWS_PER_FILE=${PARQUET_ROWS_PER_FILE}
       - LOG_LEVEL=${LOG_LEVEL}
+    volumes:
+      - ./parquet_data:/app/parquet_data
     command: ["python", "scripts/migrate.py"]
     profiles:
       - migration
@@ -21,12 +27,16 @@ services:
     container_name: backfill
     environment:
       - BEACON_NODE_URL=${BEACON_NODE_URL}
+      - STORAGE_BACKEND=${STORAGE_BACKEND}
       - CLICKHOUSE_HOST=${CLICKHOUSE_HOST}
       - CLICKHOUSE_PORT=${CLICKHOUSE_PORT}
       - CLICKHOUSE_USER=${CLICKHOUSE_USER}
       - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
       - CLICKHOUSE_DATABASE=${CLICKHOUSE_DATABASE}
       - CLICKHOUSE_SECURE=${CLICKHOUSE_SECURE}
+      - PARQUET_OUTPUT_DIR=${PARQUET_OUTPUT_DIR}
+      - PARQUET_COMPRESSION=${PARQUET_COMPRESSION}
+      - PARQUET_ROWS_PER_FILE=${PARQUET_ROWS_PER_FILE}
       - ENABLED_LOADERS=${ENABLED_LOADERS}
       - VALIDATOR_MODE=${VALIDATOR_MODE}
       - START_SLOT=${START_SLOT}
@@ -34,6 +44,8 @@ services:
       - BACKFILL_WORKERS=${BACKFILL_WORKERS}
       - CHUNK_SIZE=${CHUNK_SIZE}
       - LOG_LEVEL=${LOG_LEVEL}
+    volumes:
+      - ./parquet_data:/app/parquet_data
     command: ["python", "-m", "src.main", "load", "backfill"]
     profiles:
       - backfill
@@ -44,15 +56,21 @@ services:
     container_name: realtime
     environment:
       - BEACON_NODE_URL=${BEACON_NODE_URL}
+      - STORAGE_BACKEND=${STORAGE_BACKEND}
       - CLICKHOUSE_HOST=${CLICKHOUSE_HOST}
       - CLICKHOUSE_PORT=${CLICKHOUSE_PORT}
       - CLICKHOUSE_USER=${CLICKHOUSE_USER}
       - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
       - CLICKHOUSE_DATABASE=${CLICKHOUSE_DATABASE}
       - CLICKHOUSE_SECURE=${CLICKHOUSE_SECURE}
+      - PARQUET_OUTPUT_DIR=${PARQUET_OUTPUT_DIR}
+      - PARQUET_COMPRESSION=${PARQUET_COMPRESSION}
+      - PARQUET_ROWS_PER_FILE=${PARQUET_ROWS_PER_FILE}
       - ENABLED_LOADERS=${ENABLED_LOADERS}
       - VALIDATOR_MODE=${VALIDATOR_MODE}
       - LOG_LEVEL=${LOG_LEVEL}
+    volumes:
+      - ./parquet_data:/app/parquet_data
     command: ["python", "-m", "src.main", "load", "realtime"]
     restart: unless-stopped
     profiles:
@@ -63,14 +81,20 @@ services:
     image: beacon-indexer:latest
     container_name: transform
     environment:
+      - STORAGE_BACKEND=${STORAGE_BACKEND}
       - CLICKHOUSE_HOST=${CLICKHOUSE_HOST}
       - CLICKHOUSE_PORT=${CLICKHOUSE_PORT}
       - CLICKHOUSE_USER=${CLICKHOUSE_USER}
       - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
       - CLICKHOUSE_DATABASE=${CLICKHOUSE_DATABASE}
       - CLICKHOUSE_SECURE=${CLICKHOUSE_SECURE}
+      - PARQUET_OUTPUT_DIR=${PARQUET_OUTPUT_DIR}
+      - PARQUET_COMPRESSION=${PARQUET_COMPRESSION}
+      - PARQUET_ROWS_PER_FILE=${PARQUET_ROWS_PER_FILE}
       - ENABLED_LOADERS=${ENABLED_LOADERS}
       - LOG_LEVEL=${LOG_LEVEL}
+    volumes:
+      - ./parquet_data:/app/parquet_data
     command: ["python", "-m", "src.main", "transform", "batch"]
     profiles:
       - transform
@@ -80,14 +104,20 @@ services:
     image: beacon-indexer:latest
     container_name: transform-continuous
     environment:
+      - STORAGE_BACKEND=${STORAGE_BACKEND}
       - CLICKHOUSE_HOST=${CLICKHOUSE_HOST}
       - CLICKHOUSE_PORT=${CLICKHOUSE_PORT}
       - CLICKHOUSE_USER=${CLICKHOUSE_USER}
       - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
       - CLICKHOUSE_DATABASE=${CLICKHOUSE_DATABASE}
       - CLICKHOUSE_SECURE=${CLICKHOUSE_SECURE}
+      - PARQUET_OUTPUT_DIR=${PARQUET_OUTPUT_DIR}
+      - PARQUET_COMPRESSION=${PARQUET_COMPRESSION}
+      - PARQUET_ROWS_PER_FILE=${PARQUET_ROWS_PER_FILE}
       - ENABLED_LOADERS=${ENABLED_LOADERS}
       - LOG_LEVEL=${LOG_LEVEL}
+    volumes:
+      - ./parquet_data:/app/parquet_data
     command: ["python", "-m", "src.main", "transform", "run", "--continuous"]
     restart: unless-stopped
     profiles:

@@ -8,8 +8,8 @@ from src.utils.logger import logger
 class ValidatorsLoader(BaseLoader):
     """Loader for validator data with payload hash for fork protection."""
     
-    def __init__(self, beacon_api, clickhouse):
-        super().__init__("validators", beacon_api, clickhouse)
+    def __init__(self, beacon_api, storage):
+        super().__init__("validators", beacon_api, storage)
         self.mode = config.VALIDATOR_MODE
         # Cache timing parameters at instance level
         self._cached_genesis_time = None
@@ -65,11 +65,11 @@ class ValidatorsLoader(BaseLoader):
             # Get timing parameters from time_helpers
             time_helpers_query = """
             SELECT genesis_time_unix, seconds_per_slot 
-            FROM time_helpers FINAL 
+            FROM time_helpers 
             ORDER BY genesis_time_unix DESC 
             LIMIT 1
             """
-            time_helpers_result = self.clickhouse.execute(time_helpers_query)
+            time_helpers_result = self.storage.execute(time_helpers_query)
             if time_helpers_result and len(time_helpers_result) > 0:
                 self._cached_genesis_time = time_helpers_result[0].get("genesis_time_unix")
                 self._cached_seconds_per_slot = time_helpers_result[0].get("seconds_per_slot")
