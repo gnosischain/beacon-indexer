@@ -333,26 +333,36 @@ class TransformerService:
         config = self.loader_configs[loader_name]
         raw_table = config["raw_table"]
         
+        # FINAL WORKING VERSION: Use SETTINGS join_use_nulls = 1
         query = """
-        SELECT chunk_id, start_slot, end_slot, loader_name
-        FROM load_state_chunks FINAL
-        WHERE loader_name = {loader_name:String}
-          AND status = 'completed'
-          AND chunk_id NOT IN (
-              SELECT CONCAT(raw_table_name, '_', toString(start_slot), '_', toString(end_slot))
-              FROM transformer_progress FINAL
-              WHERE raw_table_name = {raw_table:String}
-                AND status = 'completed'
-          )
-        ORDER BY start_slot
+        SELECT 
+            lsc.chunk_id, 
+            lsc.start_slot, 
+            lsc.end_slot, 
+            lsc.loader_name
+        FROM load_state_chunks lsc FINAL
+        LEFT JOIN (
+            SELECT DISTINCT raw_table_name, start_slot, end_slot, status
+            FROM transformer_progress FINAL
+            WHERE status = 'completed'
+            AND raw_table_name = {raw_table:String}
+        ) tp ON (
+            tp.start_slot = lsc.start_slot
+            AND tp.end_slot = lsc.end_slot
+        )
+        WHERE lsc.loader_name = {loader_name:String}
+        AND lsc.status = 'completed'
+        AND tp.start_slot IS NULL
+        ORDER BY lsc.start_slot
         LIMIT 20
+        SETTINGS join_use_nulls = 1
         """
         
         return self.storage.execute(query, {
             "loader_name": loader_name,
             "raw_table": raw_table
         })
-    
+
     async def _process_chunk(self, loader_name: str, chunk: Dict) -> bool:
         """Process a single chunk."""
         
