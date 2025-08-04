@@ -34,7 +34,6 @@ class BlocksParser(BaseParser):
             "proposer_index": int(message.get("proposer_index", 0)),
             "parent_root": message.get("parent_root", ""),
             "state_root": message.get("state_root", ""),
-            "body_root": message.get("body", {}).get("root", ""),
             "signature": block_data.get("signature", "")
         }
         

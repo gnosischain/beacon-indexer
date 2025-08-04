@@ -94,7 +94,6 @@ class ForkBaseParser(ABC):
             "proposer_index": self.safe_int(message.get("proposer_index")),
             "parent_root": self.safe_str(message.get("parent_root")),
             "state_root": self.safe_str(message.get("state_root")),
-            "body_root": self.safe_str(message.get("body", {}).get("root")),
             "signature": self.safe_str(data.get("signature")),
             
             # Enhanced fields with network-aware fork version
