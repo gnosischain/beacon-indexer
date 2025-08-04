@@ -333,7 +333,6 @@ class TransformerService:
         config = self.loader_configs[loader_name]
         raw_table = config["raw_table"]
         
-        # FINAL WORKING VERSION: Use SETTINGS join_use_nulls = 1
         query = """
         SELECT 
             lsc.chunk_id, 
