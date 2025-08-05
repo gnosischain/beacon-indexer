@@ -21,6 +21,11 @@ def connect_clickhouse(
     Connect to ClickHouse using clickhouse_connect and return a Client.
     Raises an exception if connection fails.
     """
+    logger.info("Connecting to ClickHouse", 
+               host=host, 
+               port=port, 
+               secure=secure, 
+               verify=verify)
     try:
         client = clickhouse_connect.get_client(
             host=host,
@@ -30,12 +35,13 @@ def connect_clickhouse(
             database=database,
             secure=secure,   # Enable TLS
             verify=verify,   # Verify certificate if True
-            # Optimized timeouts for better performance
-            send_receive_timeout=900,   # 15 minutes
-            connect_timeout=60          # 1 minute
+            # Increased timeouts for large validator payloads
+            send_receive_timeout=1800,  # 30 minutes
+            connect_timeout=300         # 5 minutes
         )
         # Quick test
         client.command("SELECT 1")
+        logger.info("ClickHouse connection established successfully")
         return client
     except Exception as e:
         logger.error("Error connecting to ClickHouse", error=str(e))
@@ -51,8 +57,10 @@ class ClickHouse:
     SMALL_BATCH_MB = 8
     MEDIUM_BATCH_MB = 32
     LARGE_BATCH_MB = 128
-    LARGE_ROW_THRESHOLD = 16 * 1024 * 1024
+    LARGE_ROW_THRESHOLD = 128 * 1024 * 1024  # 128 MB for large validator payloads
     POOL_SIZE = 10  # Pool of connections
+    MAX_ROWS_PER_CHUNK = 10000
+    MAX_BYTES_PER_CHUNK = 64 * 1024 * 1024  # 64 MB
     
     def __init__(self):
         # Main client for regular operations
@@ -358,11 +366,13 @@ class ClickHouse:
         # Convert all data to row format
         rows = [as_row_list(r) for r in data]
         
-        # Simple insert with basic settings
+        # Reduced memory settings for ClickHouse Cloud
         settings = {
-            'max_insert_block_size': 10000,
-            'max_memory_usage': '1000000000',  # 1GB
-            'input_format_parallel_parsing': 0
+            'max_insert_block_size': 1000,       # Much smaller blocks
+            'max_memory_usage': '200000000',     # 200MB instead of 1GB
+            'input_format_parallel_parsing': 0,
+            'max_bytes_before_external_sort': '100000000',      # 100MB
+            'max_bytes_before_external_group_by': '100000000'   # 100MB
         }
         
         client.insert(
@@ -424,20 +434,139 @@ class ClickHouse:
         column_order: Optional[List[str]] = None
     ):
         """
-        Smart insert with automatic performance optimization based on batch characteristics.
+        Robust insert with large data handling capability.
         """
         if not data:
             return
 
-        batch_size = len(data)
-        
-        # Determine optimal strategy based on batch size
-        if batch_size <= self.SMALL_BATCH_ROWS:
-            self._insert_small_batch(table, data, column_order)
-        elif batch_size <= self.MEDIUM_BATCH_ROWS:
-            self._insert_medium_batch(table, data, column_order)
+        # Decide column order
+        if column_order:
+            cols = list(column_order)
         else:
-            self._insert_large_batch(table, data, column_order)
+            cols = list(data[0].keys())
+            for r in data[1:]:
+                for k in r.keys():
+                    if k not in cols:
+                        cols.append(k)
+
+        def norm(v):
+            from datetime import datetime
+            if isinstance(v, datetime):
+                return v.replace(tzinfo=None)
+            if isinstance(v, bool):
+                return 1 if v else 0
+            if isinstance(v, (dict, list)):
+                return json.dumps(v, ensure_ascii=False)
+            return v
+
+        def as_row_list(r: Dict[str, Any]):
+            return [norm(r.get(c)) for c in cols]
+
+        def approx_size(x: Any) -> int:
+            if x is None:
+                return 1
+            if isinstance(x, (bytes, bytearray, memoryview)):
+                return len(x)
+            if isinstance(x, str):
+                return len(x.encode('utf-8', 'ignore'))
+            if isinstance(x, (int, float)):
+                return 8
+            s = str(x)
+            return len(s.encode('utf-8', 'ignore'))
+
+        # Check for very large single rows
+        for i, r in enumerate(data):
+            size_i = sum(approx_size(v) for v in as_row_list(r))
+            if size_i >= self.LARGE_ROW_THRESHOLD:
+                logger.warning("Very large single row detected", 
+                              table=table, 
+                              row_index=i, 
+                              size_mb=round(size_i/1024/1024, 2))
+                try:
+                    # Try column-oriented RowBinary first (different encode path)
+                    col_data = {c: [] for c in cols}
+                    for c in cols:
+                        v = norm(r.get(c))
+                        # Hint to driver: encode big Strings as bytes to skip extra work
+                        if isinstance(v, str) and len(v) >= self.LARGE_ROW_THRESHOLD:
+                            v = v.encode('utf-8', 'ignore')
+                        col_data[c].append(v)
+                    self.client.insert(
+                        table,
+                        [col_data[c] for c in cols],
+                        column_names=cols,
+                        column_oriented=True,
+                    )
+                    logger.info("Inserted large row via column-oriented RowBinary", table=table)
+                    return
+                except Exception as e1:
+                    logger.error("Column-oriented RowBinary failed for large row, falling back to JSONEachRow",
+                                table=table, error=str(e1))
+                    # Last-resort fallback: JSONEachRow with parallel parsing disabled
+                    try:
+                        jr = {}
+                        for c in cols:
+                            v = r.get(c)
+                            if isinstance(v, datetime):
+                                v = v.replace(tzinfo=None).strftime('%Y-%m-%d %H:%M:%S')
+                            elif isinstance(v, (dict, list)):
+                                v = v  # let json.dumps handle it
+                            elif isinstance(v, bytes):
+                                # Store bytes as base64 if your schema expects String
+                                import base64
+                                v = base64.b64encode(v).decode('ascii')
+                            jr[c] = v
+                        line = json.dumps(jr, ensure_ascii=False)
+                        self.client.command(
+                            f"INSERT INTO {table} FORMAT JSONEachRow",
+                            data=line + "\n",
+                            settings={
+                                # Key mitigations for server-side JSON parsing memory
+                                'input_format_parallel_parsing': 0,
+                                'min_chunk_bytes_for_parallel_parsing': 1048576,  # 1 MB
+                            }
+                        )
+                        logger.info("Inserted large row via JSONEachRow with parallel parsing OFF", table=table)
+                        return
+                    except Exception as e2:
+                        logger.error("JSONEachRow fallback also failed", table=table, error=str(e2))
+                        raise
+
+        # Normal path: chunked RowBinary, row-oriented
+        buf: List[List[Any]] = []
+        buf_bytes = 0
+
+        def flush():
+            nonlocal buf, buf_bytes
+            if not buf:
+                return
+            # Encode very long Strings as bytes to reduce client-side overhead
+            for r in range(len(buf)):
+                for c in range(len(cols)):
+                    v = buf[r][c]
+                    if isinstance(v, str) and len(v) >= self.LARGE_ROW_THRESHOLD:
+                        buf[r][c] = v.encode('utf-8', 'ignore')
+            self.client.insert(
+                table,
+                buf,
+                column_names=cols,
+                column_oriented=False,
+            )
+            logger.info("Chunk inserted", table=table, rows=len(buf), size_mb=round(buf_bytes/1024/1024, 2))
+            buf = []
+            buf_bytes = 0
+
+        for r in data:
+            lst = as_row_list(r)
+            rb = sum(approx_size(v) for v in lst)
+            if buf and (len(buf) >= self.MAX_ROWS_PER_CHUNK or buf_bytes + rb > self.MAX_BYTES_PER_CHUNK):
+                flush()
+            buf.append(lst)
+            buf_bytes += rb
+            if buf_bytes > self.MAX_BYTES_PER_CHUNK:
+                flush()
+
+        flush()
 
     def _insert_small_batch(self, table: str, data: List[Dict[str, Any]], column_order: Optional[List[str]]):
         """Optimized insert for small batches (< 1K rows)."""
