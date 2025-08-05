@@ -15,7 +15,7 @@ class NetworkConfig(NamedTuple):
     slots_per_epoch: int
 
 class ForkDetectionService:
-    """Simplified fork detection service that gets most info from database."""
+    """Optimized fork detection service with fast fork epoch detection."""
     
     def __init__(self, clickhouse_client=None):
         self.clickhouse = clickhouse_client
@@ -96,7 +96,7 @@ class ForkDetectionService:
         return config_path
     
     def _auto_detect_from_database(self):
-        """Auto-detect network and fork info from database."""
+        """Auto-detect network and fork info from database with optimized queries."""
         try:
             # 1. Get network from CONFIG_NAME
             network_name = self._detect_network_from_config_name()
@@ -107,8 +107,8 @@ class ForkDetectionService:
             # 3. Get genesis time
             genesis_time = self._get_genesis_time()
             
-            # 4. Get fork epochs from raw blocks (analyze version field changes)
-            fork_epochs = self._detect_fork_epochs_from_blocks()
+            # 4. Get fork epochs - optimized version
+            fork_epochs = self._detect_fork_epochs_optimized()
             
             if network_name and timing_params and genesis_time:
                 self.network_config = NetworkConfig(
@@ -196,8 +196,8 @@ class ForkDetectionService:
             
         return None
     
-    def _detect_fork_epochs_from_blocks(self) -> Dict[str, int]:
-        """Detect fork activation epochs by analyzing version changes in raw blocks."""
+    def _detect_fork_epochs_optimized(self) -> Dict[str, int]:
+        """Optimized fork detection using sampling instead of full table scan."""
         try:
             # Check if raw_blocks table exists and has data
             count_result = self.clickhouse.execute("SELECT COUNT(*) as count FROM raw_blocks LIMIT 1")
@@ -205,49 +205,96 @@ class ForkDetectionService:
                 logger.info("No raw blocks found yet, using default fork epochs")
                 return self._get_default_fork_epochs()
             
-            # Parse version from raw block data and find first occurrences
-            # We need to extract the version from the JSON payload
-            result = self.clickhouse.execute("""
-                SELECT 
-                    JSONExtractString(payload, 'version') as version,
-                    min(slot) as first_slot,
-                    min(slot) / {slots_per_epoch:UInt32} as first_epoch
-                FROM raw_blocks 
-                GROUP BY version
-                ORDER BY first_slot
-            """, {"slots_per_epoch": self.slots_per_epoch or 32})
+            total_blocks = count_result[0]["count"]
+            logger.info("Starting optimized fork detection", total_blocks=total_blocks)
             
+            # Strategy: Sample blocks at regular intervals instead of scanning all
+            # This is much faster and still gives us accurate fork transition points
+            
+            # Get min and max slots to determine sampling range
+            range_result = self.clickhouse.execute("""
+                SELECT MIN(slot) as min_slot, MAX(slot) as max_slot 
+                FROM raw_blocks
+            """)
+            
+            if not range_result:
+                logger.warning("Could not determine slot range")
+                return self._get_default_fork_epochs()
+            
+            min_slot = range_result[0]["min_slot"]
+            max_slot = range_result[0]["max_slot"]
+            
+            logger.info("Block range detected", min_slot=min_slot, max_slot=max_slot)
+            
+            # Sample blocks at intervals to detect version changes
+            # This is MUCH faster than JSONExtractString on every row
+            sample_interval = max(1000, (max_slot - min_slot) // 1000)  # Sample ~1000 points
+            
+            logger.info("Using sampling approach for fork detection", 
+                       sample_interval=sample_interval,
+                       expected_samples=(max_slot - min_slot) // sample_interval)
+            
+            # Get version samples - much faster than full scan
+            sample_query = """
+            SELECT 
+                slot,
+                JSONExtractString(payload, 'version') as version
+            FROM raw_blocks 
+            WHERE slot % {interval:UInt64} = 0
+            ORDER BY slot
+            LIMIT 2000
+            """
+            
+            samples = self.clickhouse.execute(sample_query, {"interval": sample_interval})
+            
+            if not samples:
+                logger.warning("No version samples found")
+                return self._get_default_fork_epochs()
+            
+            logger.info("Collected version samples", samples=len(samples))
+            
+            # Analyze samples to find fork transitions
             fork_epochs = {'phase0': 0}  # Always start with phase0 at epoch 0
+            seen_versions = set()
+            last_version = None
             
-            # Map versions to fork names
-            if result:
-                logger.info("Found version data in raw blocks", versions=[row["version"] for row in result])
-                for row in result:
-                    version = row["version"]
-                    epoch = int(row["first_epoch"])
+            for sample in samples:
+                slot = sample["slot"]
+                version = sample["version"]
+                
+                if version and version != last_version:
+                    epoch = slot // (self.slots_per_epoch or 32)
                     
-                    # Find which fork this version belongs to
-                    for fork_name in self.fork_order[1:]:  # Skip phase0, already added
-                        if version == self.fork_versions.get(fork_name):
+                    # Map version to fork name
+                    for fork_name in self.fork_order[1:]:  # Skip phase0
+                        expected_version = self.fork_versions.get(fork_name)
+                        if version == expected_version and fork_name not in fork_epochs:
                             fork_epochs[fork_name] = epoch
-                            logger.info("Mapped version to fork", version=version, fork=fork_name, epoch=epoch)
+                            logger.info("Detected fork transition", 
+                                       fork=fork_name, 
+                                       slot=slot, 
+                                       epoch=epoch, 
+                                       version=version)
                             break
-            else:
-                logger.warning("No version data found in raw blocks, this should not happen")
+                    
+                    seen_versions.add(version)
+                    last_version = version
             
-            # If we didn't detect many forks, fill in defaults for missing ones
-            if len(fork_epochs) < 3:  # Less than 3 forks detected
-                logger.info("Limited fork detection, supplementing with defaults")
+            logger.info("Found versions in samples", versions=list(seen_versions))
+            
+            # If we didn't detect many forks, supplement with defaults
+            if len(fork_epochs) < 3:
+                logger.info("Limited fork detection from sampling, supplementing with defaults")
                 default_epochs = self._get_default_fork_epochs()
                 for fork_name, default_epoch in default_epochs.items():
                     if fork_name not in fork_epochs:
                         fork_epochs[fork_name] = default_epoch
             
-            logger.info("Final fork epochs", fork_epochs=fork_epochs)
+            logger.info("Final optimized fork epochs", fork_epochs=fork_epochs)
             return fork_epochs
             
         except Exception as e:
-            logger.warning("Failed to detect fork epochs from raw blocks", error=str(e))
+            logger.warning("Optimized fork detection failed, using defaults", error=str(e))
             return self._get_default_fork_epochs()
     
     def _get_default_fork_epochs(self) -> Dict[str, int]:

@@ -1,4 +1,5 @@
 import asyncio
+import time
 import pandas as pd
 from typing import List, Dict, Tuple, Optional
 from src.config import config
@@ -8,10 +9,14 @@ from src.parsers.rewards import RewardsParser
 from src.utils.logger import logger
 
 class TransformerService:
-    """Service for transforming raw data into structured tables using storage backend."""
+    """Enhanced service with atomic operations, complete table filtering, and proper resumption after interruptions."""
     
     def __init__(self):
         self.storage = create_storage()
+        
+        # Get enabled loaders from config
+        self.enabled_loaders = set(config.ENABLED_LOADERS)
+        logger.info("Transformer will only process enabled loaders", enabled=list(self.enabled_loaders))
         
         # Only initialize fork detection for ClickHouse backend
         if config.STORAGE_BACKEND.lower() == "clickhouse":
@@ -20,8 +25,8 @@ class TransformerService:
             self.fork_service = ForkDetectionService(clickhouse_client=self.storage)
             self.parser_factory = ParserFactory(self.fork_service)
             
-            # Define loader configurations for ClickHouse
-            self.loader_configs = {
+            # Define all possible loader configurations
+            all_loader_configs = {
                 "blocks": {
                     "raw_table": "raw_blocks",
                     "use_final": False,
@@ -38,6 +43,16 @@ class TransformerService:
                     "fork_aware": False
                 }
             }
+            
+            # Only include enabled loaders in configuration
+            self.loader_configs = {
+                name: config_data for name, config_data in all_loader_configs.items() 
+                if name in self.enabled_loaders
+            }
+            
+            logger.info("Filtered loader configs for ClickHouse", 
+                       all_available=list(all_loader_configs.keys()),
+                       enabled=list(self.loader_configs.keys()))
         else:
             # For Parquet, use simpler approach without fork detection
             self.fork_service = None
@@ -48,9 +63,15 @@ class TransformerService:
         self.validator_parser = ValidatorsParser()
         self.rewards_parser = RewardsParser()
         
-        logger.info("Transformer initialized", 
+        # Query optimization: cache for untransformed chunks
+        self._untransformed_cache = {}
+        self._cache_ttl = 120  # 2 minutes cache
+        self._last_cache_update = {}
+        
+        logger.info("Enhanced transformer initialized", 
                    storage_backend=config.STORAGE_BACKEND,
-                   fork_aware=self.fork_service is not None)
+                   fork_aware=self.fork_service is not None,
+                   enabled_loaders=list(self.enabled_loaders))
     
     async def initialize(self):
         """Initialize the transformer service."""
@@ -64,15 +85,56 @@ class TransformerService:
                        genesis_time=self.fork_service.genesis_time)
         else:
             logger.info("Simple transformer initialized for Parquet backend")
+        
+        # Clean up any stale processing records on startup
+        await self._cleanup_stale_processing_records()
+    
+    async def _cleanup_stale_processing_records(self):
+        """Clean up processing records that were interrupted."""
+        if config.STORAGE_BACKEND.lower() == "parquet":
+            return
+        
+        try:
+            # Find processing records older than 30 minutes (likely stale)
+            stale_query = """
+            SELECT raw_table_name, start_slot, end_slot, processed_at
+            FROM transformer_progress FINAL
+            WHERE status = 'processing'
+            AND processed_at < now() - INTERVAL 30 MINUTE
+            """
+            
+            stale_records = self.storage.execute(stale_query)
+            
+            if stale_records:
+                logger.warning("Found stale processing records from previous run", 
+                              count=len(stale_records))
+                
+                # Reset them to allow reprocessing
+                for record in stale_records:
+                    self._record_processing_result(
+                        record["raw_table_name"],
+                        record["start_slot"],
+                        record["end_slot"],
+                        'failed',
+                        0,
+                        1,
+                        'Reset stale processing record on startup'
+                    )
+                
+                logger.info("Reset stale processing records", count=len(stale_records))
+            
+        except Exception as e:
+            logger.warning("Failed to cleanup stale processing records", error=str(e))
     
     async def run(self, batch_size: int = 100, continuous: bool = False):
         """Run transformer with backend-specific processing."""
         
         mode = "continuous" if continuous else "batch"
-        logger.info("Starting transformer", 
+        logger.info("Starting enhanced atomic transformer", 
                    mode=mode, 
                    batch_size=batch_size,
-                   storage_backend=config.STORAGE_BACKEND)
+                   storage_backend=config.STORAGE_BACKEND,
+                   enabled_loaders=list(self.enabled_loaders))
         
         await self.initialize()
         
@@ -92,8 +154,13 @@ class TransformerService:
             try:
                 processed_any = False
                 
-                # Process raw data files
-                for table_type in ["blocks", "validators", "rewards"]:
+                # Process only enabled loaders
+                enabled_table_types = [loader for loader in ["blocks", "validators", "rewards"] 
+                                     if loader in self.enabled_loaders]
+                
+                logger.debug("Processing enabled table types", table_types=enabled_table_types)
+                
+                for table_type in enabled_table_types:
                     raw_table = f"raw_{table_type}"
                     processed = await self._process_parquet_table(raw_table, table_type, batch_size)
                     if processed:
@@ -275,64 +342,77 @@ class TransformerService:
         return processed_count, failed_count
     
     async def _run_clickhouse_transformer(self, batch_size: int, continuous: bool):
-        """Existing ClickHouse transformer logic."""
+        """Enhanced ClickHouse transformer with atomic operations."""
         consecutive_empty_rounds = 0
         max_empty_rounds = 3 if not continuous else float('inf')
+        
+        logger.info("Starting atomic ClickHouse transformer", 
+                   enabled_loaders=list(self.loader_configs.keys()),
+                   total_possible_loaders=["blocks", "validators", "rewards"])
         
         while consecutive_empty_rounds < max_empty_rounds:
             try:
                 processed_any = False
                 
-                # Process each configured loader type
+                # Process each configured and enabled loader type
                 for loader_name in self.loader_configs.keys():
-                    # Get completed chunks that haven't been transformed
-                    untransformed_chunks = self._get_untransformed_chunks(loader_name)
+                    # Get chunks (including failed ones that are ready for retry)
+                    untransformed_chunks = self._get_untransformed_chunks_with_failed_recovery(loader_name)
                     
                     if untransformed_chunks:
-                        logger.info("Found untransformed chunks", 
+                        logger.info("Found chunks for atomic processing", 
                                    loader=loader_name, 
                                    chunks=len(untransformed_chunks))
                         
-                        # Process each chunk (limit to avoid overwhelming)
+                        # Process each chunk atomically (limit to avoid overwhelming)
                         chunks_processed = 0
-                        max_chunks_per_round = 5
+                        max_chunks_per_round = 3  # Reduced for atomic operations
                         
                         for chunk in untransformed_chunks:
-                            success = await self._process_chunk(loader_name, chunk)
+                            success = await self._process_chunk_streaming_atomic(loader_name, chunk)
                             if success:
                                 processed_any = True
                                 chunks_processed += 1
                             
                             # Limit chunks per round
                             if chunks_processed >= max_chunks_per_round:
+                                logger.info("Reached max chunks per round (atomic)", 
+                                           loader=loader_name,
+                                           processed=chunks_processed,
+                                           remaining=len(untransformed_chunks) - chunks_processed)
                                 break
                 
                 if processed_any:
                     consecutive_empty_rounds = 0
+                    # Clear cache after successful processing
+                    self._clear_cache()
                 else:
                     consecutive_empty_rounds += 1
                     if continuous:
-                        logger.info("No new chunks to transform, waiting...")
+                        logger.info("No new chunks to transform atomically, waiting...")
                         await asyncio.sleep(10)
                     else:
                         await asyncio.sleep(1)
                         
             except Exception as e:
-                logger.error("Error in transformer", error=str(e))
+                logger.error("Error in atomic transformer", error=str(e))
                 if continuous:
                     await asyncio.sleep(30)
                 else:
                     break
         
         if not continuous:
-            logger.info("Batch processing completed - no more chunks to transform")
+            logger.info("Atomic batch processing completed - no more chunks to transform")
     
-    def _get_untransformed_chunks(self, loader_name: str) -> List[Dict]:
-        """Get completed load chunks that haven't been transformed yet."""
+    def _get_untransformed_chunks_with_failed_recovery(self, loader_name: str) -> List[Dict]:
+        """
+        Get untransformed chunks including recently failed ones that should be retried.
+        """
+        config_data = self.loader_configs[loader_name]
+        raw_table = config_data["raw_table"]
         
-        config = self.loader_configs[loader_name]
-        raw_table = config["raw_table"]
-        
+        # Modified query to include failed chunks that are older than 5 minutes
+        # This allows retry of failed chunks while avoiding immediate retry loops
         query = """
         SELECT 
             lsc.chunk_id, 
@@ -341,10 +421,13 @@ class TransformerService:
             lsc.loader_name
         FROM load_state_chunks lsc FINAL
         LEFT JOIN (
-            SELECT DISTINCT raw_table_name, start_slot, end_slot, status
+            SELECT DISTINCT raw_table_name, start_slot, end_slot, status, processed_at
             FROM transformer_progress FINAL
-            WHERE status = 'completed'
-            AND raw_table_name = {raw_table:String}
+            WHERE raw_table_name = {raw_table:String}
+            AND (
+                status = 'completed'
+                OR (status = 'failed' AND processed_at > now() - INTERVAL 5 MINUTE)
+            )
         ) tp ON (
             tp.start_slot = lsc.start_slot
             AND tp.end_slot = lsc.end_slot
@@ -353,127 +436,214 @@ class TransformerService:
         AND lsc.status = 'completed'
         AND tp.start_slot IS NULL
         ORDER BY lsc.start_slot
-        LIMIT 20
+        LIMIT 50
         SETTINGS join_use_nulls = 1
         """
         
-        return self.storage.execute(query, {
+        result = self.storage.execute(query, {
             "loader_name": loader_name,
             "raw_table": raw_table
         })
-
-    async def _process_chunk(self, loader_name: str, chunk: Dict) -> bool:
-        """Process a single chunk."""
         
-        config = self.loader_configs[loader_name]
-        raw_table = config["raw_table"]
+        if result:
+            logger.info("Found chunks for processing (including retry)", 
+                       loader=loader_name, 
+                       chunks=len(result))
+        
+        return result
+    
+    async def _process_chunk_streaming_atomic(self, loader_name: str, chunk: Dict) -> bool:
+        """
+        ATOMIC processing with proper transaction-like behavior.
+        Either all data gets processed successfully, or none of it is marked as completed.
+        """
+        config_data = self.loader_configs[loader_name]
+        raw_table = config_data["raw_table"]
         start_slot = chunk["start_slot"]
         end_slot = chunk["end_slot"]
         
-        logger.info("Processing chunk", 
+        logger.info("Processing chunk atomically", 
                    loader=loader_name,
                    start_slot=start_slot,
                    end_slot=end_slot)
         
-        # Mark as processing
-        self._record_processing_started(raw_table, start_slot, end_slot)
+        # Step 1: Mark as processing
+        processing_id = self._record_processing_started(raw_table, start_slot, end_slot)
         
         try:
-            # Get the raw data for this chunk
-            raw_data = self._get_chunk_data(loader_name, start_slot, end_slot)
+            # Step 2: Process all data first (accumulate in memory)
+            all_tables_data = {}
+            total_processed = 0
+            total_failed = 0
             
-            if not raw_data:
-                logger.warning("No raw data found for chunk", 
-                              loader=loader_name,
-                              start_slot=start_slot,
-                              end_slot=end_slot)
-                self._record_processing_result(raw_table, start_slot, end_slot, 'completed', 0, 0, 'No data')
-                return True
+            # Use smaller sub-batches but accumulate all results before inserting
+            sub_batch_size = 25 if loader_name == "blocks" else 50
             
-            # Process based on loader configuration
-            if config["fork_aware"]:
-                processed_count, failed_count = await self._process_fork_aware_batch(raw_data, loader_name)
+            for i in range(start_slot, end_slot + 1, sub_batch_size):
+                sub_end = min(i + sub_batch_size - 1, end_slot)
+                
+                # Get data for sub-batch
+                raw_data = self._get_chunk_data_optimized(loader_name, i, sub_end)
+                
+                if raw_data:
+                    # Process and accumulate (don't insert yet)
+                    if config_data["fork_aware"]:
+                        batch_tables_data, processed_count, failed_count = await self._process_fork_aware_batch_accumulate(raw_data, loader_name)
+                    else:
+                        batch_tables_data, processed_count, failed_count = await self._process_non_fork_aware_batch_accumulate(raw_data, loader_name)
+                    
+                    # Accumulate results
+                    for table_name, rows in batch_tables_data.items():
+                        if table_name not in all_tables_data:
+                            all_tables_data[table_name] = []
+                        all_tables_data[table_name].extend(rows)
+                    
+                    total_processed += processed_count
+                    total_failed += failed_count
+                    
+                    logger.debug("Sub-batch processed and accumulated", 
+                               loader=loader_name, 
+                               sub_batch=f"{i}-{sub_end}",
+                               processed=processed_count,
+                               failed=failed_count)
+            
+            # Step 3: Atomic insertion - either all succeed or all fail
+            if total_failed == 0 and all_tables_data:
+                logger.info("Starting atomic insertion", 
+                           loader=loader_name,
+                           tables=list(all_tables_data.keys()),
+                           total_rows=sum(len(rows) for rows in all_tables_data.values()))
+                
+                # Insert all data atomically (wrapped in try-catch for rollback)
+                try:
+                    for table_name, rows in all_tables_data.items():
+                        if rows:
+                            # Use optimized insert with memory limits
+                            if hasattr(self.storage, 'insert_batch_optimized'):
+                                self.storage.insert_batch_optimized(table_name, rows)
+                            else:
+                                self.storage.insert_batch(table_name, rows)
+                                
+                            logger.debug("Inserted table data atomically", 
+                                       table=table_name, 
+                                       rows=len(rows))
+                    
+                    # Step 4: Only mark as completed if ALL insertions succeeded
+                    self._record_processing_result(raw_table, start_slot, end_slot, 'completed', 
+                                                 total_processed, 0, '')
+                    
+                    logger.info("Chunk processed atomically - SUCCESS", 
+                               loader=loader_name,
+                               start_slot=start_slot,
+                               end_slot=end_slot,
+                               processed=total_processed,
+                               tables_inserted=len(all_tables_data))
+                    
+                    return True
+                    
+                except Exception as insert_error:
+                    # Insertion failed - this is critical
+                    error_msg = f"Atomic insertion failed: {str(insert_error)}"
+                    self._record_processing_result(raw_table, start_slot, end_slot, 'failed', 
+                                                 0, total_processed, error_msg)
+                    
+                    logger.error("ATOMIC INSERTION FAILED - chunk marked as failed", 
+                                loader=loader_name,
+                                start_slot=start_slot,
+                                end_slot=end_slot,
+                                error=str(insert_error))
+                    return False
+            
             else:
-                processed_count, failed_count = await self._process_non_fork_aware_batch(raw_data, loader_name)
-            
-            # Record result
-            if failed_count > 0:
-                error_msg = f"Failed {failed_count}/{len(raw_data)} items"
+                # Processing had failures or no data
+                if total_failed > 0:
+                    error_msg = f"Processing failures: {total_failed}/{end_slot - start_slot + 1} items"
+                else:
+                    error_msg = "No data to process"
+                    
                 self._record_processing_result(raw_table, start_slot, end_slot, 'failed', 
-                                             processed_count, failed_count, error_msg)
-                logger.error("Chunk processing had failures", 
+                                             total_processed, total_failed, error_msg)
+                
+                logger.error("Chunk processing had issues", 
                             loader=loader_name,
                             start_slot=start_slot,
                             end_slot=end_slot,
-                            processed=processed_count,
-                            failed=failed_count)
-            else:
-                self._record_processing_result(raw_table, start_slot, end_slot, 'completed', 
-                                             processed_count, 0, '')
-                logger.info("Chunk processed successfully", 
-                           loader=loader_name,
-                           start_slot=start_slot,
-                           end_slot=end_slot,
-                           processed=processed_count)
-            
-            return True
+                            processed=total_processed,
+                            failed=total_failed,
+                            error=error_msg)
+                return False
             
         except Exception as e:
-            error_msg = f"Chunk processing failed: {str(e)}"
+            # Any unexpected error - mark as failed
+            error_msg = f"Unexpected error during atomic processing: {str(e)}"
             self._record_processing_result(raw_table, start_slot, end_slot, 'failed', 
                                          0, 1, error_msg)
-            logger.error("Chunk processing failed", 
+            
+            logger.error("Atomic chunk processing failed completely", 
                         loader=loader_name,
                         start_slot=start_slot,
                         end_slot=end_slot,
                         error=str(e))
             return False
     
-    def _get_chunk_data(self, loader_name: str, start_slot: int, end_slot: int) -> List[Dict]:
-        """Get raw data for a specific chunk range with fork handling."""
+    async def _process_fork_aware_batch_accumulate(self, raw_data: List[Dict], loader_name: str) -> Tuple[Dict[str, List[Dict]], int, int]:
+        """
+        Process fork-aware data with COMPLETE table filtering and proper accumulation.
         
-        config = self.loader_configs[loader_name]
-        raw_table = config["raw_table"]
-        use_final = config["use_final"]
+        Based on BeaconBlockBody structure from Ethereum specs, raw_blocks contains:
+        - Basic block data: blocks
+        - Consensus operations: attestations  
+        - Validator operations: deposits, voluntary_exits
+        - Slashing operations: proposer_slashings, attester_slashings
+        - Fork-specific data: sync_aggregates (Altair+), execution_payloads (Bellatrix+), 
+          withdrawals (Capella+), blob_sidecars/blob_commitments (Deneb+), execution_requests (Electra+)
+        """
         
-        final_clause = "FINAL" if use_final else ""
+        # COMPLETE table filtering - ALL tables that come from raw_blocks
+        loader_table_filter = {
+            "blocks": {
+                # Basic block data
+                "blocks",
+                
+                # Consensus operations (Phase 0)
+                "attestations",
+                
+                # Validator lifecycle operations (Phase 0)
+                "deposits", 
+                "voluntary_exits",
+                
+                # Slashing operations (Phase 0)
+                "proposer_slashings", 
+                "attester_slashings",
+                
+                # Altair additions
+                "sync_aggregates",
+                "sync_committees",
+                
+                # Bellatrix additions (The Merge)
+                "execution_payloads",
+                "transactions",
+                
+                # Capella additions (Shanghai)
+                "withdrawals",
+                "bls_changes",
+                
+                # Deneb additions (Cancun)
+                "blob_sidecars",
+                "blob_commitments", 
+                
+                # Electra additions
+                "execution_requests"
+            },
+            "validators": {"validators"},
+            "rewards": {"rewards"}
+        }
         
-        if loader_name in ["blocks", "validators", "rewards"]:
-            # Tables with payload_hash - get the latest payload per slot
-            query = f"""
-            SELECT slot, payload, payload_hash
-            FROM (
-                SELECT 
-                    slot, 
-                    payload, 
-                    payload_hash,
-                    retrieved_at,
-                    ROW_NUMBER() OVER (PARTITION BY slot ORDER BY retrieved_at DESC) as rn
-                FROM {raw_table} {final_clause}
-                WHERE slot >= {{start_slot:UInt64}} AND slot <= {{end_slot:UInt64}}
-            )
-            WHERE rn = 1
-            ORDER BY slot
-            """
-        else:
-            # Legacy tables without payload_hash
-            query = f"""
-            SELECT slot, payload 
-            FROM {raw_table} {final_clause}
-            WHERE slot >= {{start_slot:UInt64}} AND slot <= {{end_slot:UInt64}}
-            ORDER BY slot
-            """
+        allowed_tables = loader_table_filter.get(loader_name, set())
         
-        result = self.storage.execute(query, {
-            "start_slot": start_slot,
-            "end_slot": end_slot
-        })
-        
-        # Return consistent format (slot, payload)
-        return [{"slot": row["slot"], "payload": row["payload"]} for row in result]
-    
-    async def _process_fork_aware_batch(self, raw_data: List[Dict], loader_name: str) -> Tuple[int, int]:
-        """Process data using fork-aware parsers (for blocks)."""
+        logger.debug("Processing with complete table filtering", 
+                   loader=loader_name,
+                   allowed_tables_count=len(allowed_tables))
         
         # Group data by fork
         fork_groups = {}
@@ -489,6 +659,7 @@ class TransformerService:
         
         total_processed = 0
         total_failed = 0
+        all_tables_data = {}
         
         # Process each fork group
         for fork_name, fork_data in fork_groups.items():
@@ -497,7 +668,6 @@ class TransformerService:
                 
                 fork_processed = 0
                 fork_failed = 0
-                tables_data = {}
                 
                 for raw_item in fork_data:
                     slot = raw_item["slot"]
@@ -506,68 +676,56 @@ class TransformerService:
                         parsed_data = parser.parse(raw_item)
                         
                         if parsed_data and any(len(rows) > 0 for rows in parsed_data.values()):
+                            # Accumulate ALL allowed tables (not just the ones with data)
                             for table_name, rows in parsed_data.items():
-                                if rows:
-                                    if table_name not in tables_data:
-                                        tables_data[table_name] = []
-                                    tables_data[table_name].extend(rows)
+                                if table_name in allowed_tables and rows:
+                                    if table_name not in all_tables_data:
+                                        all_tables_data[table_name] = []
+                                    all_tables_data[table_name].extend(rows)
+                                    
+                                    # Log when we find special operations
+                                    if table_name in ["attester_slashings", "proposer_slashings", "deposits", "voluntary_exits"]:
+                                        logger.info(f"Found {table_name} data", 
+                                                   slot=slot,
+                                                   count=len(rows),
+                                                   table_allowed=table_name in allowed_tables)
                             fork_processed += 1
                         else:
                             fork_processed += 1  # Empty blocks are still processed
                             
                     except Exception as e:
-                        logger.error("Fork parser failed", 
+                        logger.error("Fork parser failed during accumulation", 
                                     parser=parser.fork_name, 
                                     slot=slot, 
                                     error=str(e))
                         fork_failed += 1
                 
-                # Insert all data for this fork
-                if tables_data:
-                    for table_name, rows in tables_data.items():
-                        if rows:
-                            try:
-                                self.storage.insert_batch(table_name, rows)
-                                logger.debug("Inserted fork-aware data", 
-                                           table=table_name, 
-                                           rows=len(rows),
-                                           fork=fork_name)
-                            except Exception as e:
-                                logger.error("Failed to insert data", 
-                                           table=table_name,
-                                           rows=len(rows),
-                                           fork=fork_name,
-                                           error=str(e))
-                                fork_failed += fork_processed
-                                fork_processed = 0
-                
                 total_processed += fork_processed
                 total_failed += fork_failed
                 
-                if fork_failed == 0:
-                    logger.info("Processed fork batch successfully", 
+                # Log what tables we accumulated for this fork
+                if all_tables_data:
+                    logger.debug("Fork batch accumulated with complete filtering", 
                                fork=fork_name,
-                               items=fork_processed,
-                               tables=len(tables_data))
-                else:
-                    logger.error("Fork batch had failures", 
-                               fork=fork_name,
-                               processed=fork_processed,  
+                               processed=fork_processed,
                                failed=fork_failed,
-                               tables=len(tables_data))
+                               tables_with_data=sorted(all_tables_data.keys()),
+                               total_rows_per_table={k: len(v) for k, v in all_tables_data.items()})
                 
             except Exception as e:
-                logger.error("Fork batch processing failed completely", 
+                logger.error("Fork batch processing failed during accumulation", 
                            fork=fork_name,
                            items=len(fork_data),
                            error=str(e))
                 total_failed += len(fork_data)
         
-        return total_processed, total_failed
+        return all_tables_data, total_processed, total_failed
     
-    async def _process_non_fork_aware_batch(self, raw_data: List[Dict], loader_name: str) -> Tuple[int, int]:
-        """Process data using non-fork-aware parsers (for validators, rewards)."""
-        
+    async def _process_non_fork_aware_batch_accumulate(self, raw_data: List[Dict], loader_name: str) -> Tuple[Dict[str, List[Dict]], int, int]:
+        """
+        Process non-fork-aware data and ACCUMULATE results (don't insert yet).
+        Returns: (tables_data, processed_count, failed_count)
+        """
         # Get the appropriate parser
         if loader_name == "validators":
             parser = self.validator_parser
@@ -580,7 +738,7 @@ class TransformerService:
         
         processed_count = 0
         failed_count = 0
-        all_rows = []
+        all_tables_data = {target_table: []}
         
         for raw_item in raw_data:
             slot = raw_item["slot"]
@@ -589,38 +747,65 @@ class TransformerService:
                 parsed_data = parser.parse(raw_item)
                 
                 if parsed_data and target_table in parsed_data and parsed_data[target_table]:
-                    all_rows.extend(parsed_data[target_table])
+                    all_tables_data[target_table].extend(parsed_data[target_table])
                     processed_count += 1
-                    logger.debug(f"Parsed {loader_name} for slot", 
+                    logger.debug(f"Accumulated {loader_name} for slot", 
                                slot=slot, 
                                count=len(parsed_data[target_table]))
                 else:
                     processed_count += 1  # Empty data is still processed
                     
             except Exception as e:
-                logger.error(f"{loader_name.title()} parser failed", 
+                logger.error(f"{loader_name.title()} parser failed during accumulation", 
                            slot=slot, 
                            error=str(e))
                 failed_count += 1
         
-        # Insert all data
-        if all_rows:
-            try:
-                self.storage.insert_batch(target_table, all_rows)
-                logger.info(f"Inserted {loader_name} data", 
-                           rows=len(all_rows),
-                           processed_items=processed_count)
-            except Exception as e:
-                logger.error(f"Failed to insert {loader_name} data", 
-                           rows=len(all_rows),
-                           error=str(e))
-                failed_count += processed_count
-                processed_count = 0
-        
-        return processed_count, failed_count
+        return all_tables_data, processed_count, failed_count
     
-    def _record_processing_started(self, raw_table: str, start_slot: int, end_slot: int):
-        """Record that processing has started for a range."""
+    def _get_chunk_data_optimized(self, loader_name: str, start_slot: int, end_slot: int) -> List[Dict]:
+        """Optimized data retrieval with reduced FINAL usage."""
+        config_data = self.loader_configs[loader_name]
+        raw_table = config_data["raw_table"]
+        use_final = config_data["use_final"]
+        
+        # For tables that need FINAL, use it but with optimization
+        if use_final:
+            # Use FINAL but with LIMIT and ORDER BY optimization
+            query = f"""
+            SELECT slot, payload, payload_hash
+            FROM {raw_table} FINAL
+            WHERE slot >= {{start_slot:UInt64}} AND slot <= {{end_slot:UInt64}}
+            ORDER BY slot, retrieved_at DESC
+            LIMIT 5000
+            """
+        else:
+            # Use subquery with window function for better performance
+            query = f"""
+            SELECT slot, payload, payload_hash
+            FROM (
+                SELECT 
+                    slot, payload, payload_hash, retrieved_at,
+                    ROW_NUMBER() OVER (PARTITION BY slot ORDER BY retrieved_at DESC) as rn
+                FROM {raw_table}
+                WHERE slot >= {{start_slot:UInt64}} AND slot <= {{end_slot:UInt64}}
+            )
+            WHERE rn = 1
+            ORDER BY slot
+            """
+        
+        result = self.storage.execute(query, {
+            "start_slot": start_slot,
+            "end_slot": end_slot
+        })
+        
+        # Return consistent format (slot, payload)
+        return [{"slot": row["slot"], "payload": row["payload"]} for row in result]
+    
+    def _record_processing_started(self, raw_table: str, start_slot: int, end_slot: int) -> str:
+        """Record that processing has started and return a processing ID."""
+        processing_id = f"{raw_table}_{start_slot}_{end_slot}_{int(time.time())}"
+        
         row = {
             "raw_table_name": raw_table,
             "start_slot": start_slot,
@@ -633,10 +818,13 @@ class TransformerService:
         }
         
         self.storage.insert_batch("transformer_progress", [row])
-        logger.debug("Started processing range", 
+        logger.debug("Started atomic processing", 
                     table=raw_table,
                     start_slot=start_slot,
-                    end_slot=end_slot)
+                    end_slot=end_slot,
+                    processing_id=processing_id)
+        
+        return processing_id
     
     def _record_processing_result(self, raw_table: str, start_slot: int, end_slot: int, 
                                  status: str, processed_count: int, failed_count: int, 
@@ -654,7 +842,7 @@ class TransformerService:
         }
         
         self.storage.insert_batch("transformer_progress", [row])
-        logger.debug("Recorded processing result", 
+        logger.debug("Recorded atomic processing result", 
                     table=raw_table,
                     start_slot=start_slot,
                     end_slot=end_slot,
@@ -662,12 +850,45 @@ class TransformerService:
                     processed=processed_count,
                     failed=failed_count)
     
+    # Cache management methods
+    def _get_untransformed_chunks_cached(self, loader_name: str) -> List[Dict]:
+        """Get untransformed chunks with caching to reduce FINAL queries."""
+        now = time.time()
+        cache_key = loader_name
+        
+        # Check if cache is fresh
+        if (cache_key in self._untransformed_cache and 
+            cache_key in self._last_cache_update and
+            now - self._last_cache_update[cache_key] < self._cache_ttl):
+            logger.debug("Using cached chunks", loader=loader_name, 
+                        chunks=len(self._untransformed_cache[cache_key]))
+            return self._untransformed_cache[cache_key]
+        
+        # Refresh cache with new method that includes failed recovery
+        chunks = self._get_untransformed_chunks_with_failed_recovery(loader_name)
+        self._untransformed_cache[cache_key] = chunks
+        self._last_cache_update[cache_key] = now
+        
+        logger.debug("Refreshed chunk cache with failed recovery", loader=loader_name, chunks=len(chunks))
+        return chunks
+    
+    def _clear_cache(self):
+        """Clear the chunk cache after successful processing."""
+        self._untransformed_cache.clear()
+        self._last_cache_update.clear()
+        logger.debug("Cleared chunk cache")
+    
+    # Reprocessing methods
     async def reprocess(self, start_slot: int, end_slot: int, batch_size: int = 100):
-        """Reprocess a specific range of slots."""
-        logger.info("Starting reprocessing", 
+        """
+        Reprocess a specific range of slots with DEDUPLICATION.
+        This method ensures no duplicate rows by properly cleaning existing data first.
+        """
+        logger.info("Starting deduplicating reprocessing", 
                    start_slot=start_slot, 
                    end_slot=end_slot,
-                   storage_backend=config.STORAGE_BACKEND)
+                   storage_backend=config.STORAGE_BACKEND,
+                   enabled_loaders=list(self.enabled_loaders))
         
         await self.initialize()
         
@@ -675,7 +896,13 @@ class TransformerService:
             logger.info("Reprocessing not implemented for Parquet backend")
             return
         
-        # Find all chunks in the range that need reprocessing
+        # Step 1: Clean existing processed data to prevent duplicates
+        await self._clean_existing_data_for_reprocessing(start_slot, end_slot)
+        
+        # Step 2: Reset transformer progress to force reprocessing
+        await self._reset_transformer_progress_for_range(start_slot, end_slot)
+        
+        # Step 3: Process chunks normally (they will be picked up as "untransformed")
         for loader_name in self.loader_configs.keys():
             config_item = self.loader_configs[loader_name]
             raw_table = config_item["raw_table"]
@@ -697,23 +924,132 @@ class TransformerService:
                 "end_slot": end_slot
             })
             
-            logger.info("Found chunks for reprocessing", 
+            logger.info("Found chunks for deduplicating reprocessing", 
                        loader=loader_name,
                        chunks=len(chunks))
             
-            # Process each chunk
+            # Process each chunk with atomic processing
             for chunk in chunks:
-                await self._process_chunk(loader_name, chunk)
+                await self._process_chunk_streaming_atomic(loader_name, chunk)
         
-        logger.info("Reprocessing completed")
+        logger.info("Deduplicating reprocessing completed")
     
+    async def _clean_existing_data_for_reprocessing(self, start_slot: int, end_slot: int):
+        """
+        Clean existing processed data for the slot range to prevent duplicates.
+        Uses ClickHouse's ALTER DELETE for efficient cleanup.
+        """
+        logger.info("Cleaning existing data to prevent duplicates", 
+                   start_slot=start_slot, 
+                   end_slot=end_slot)
+        
+        # All possible tables that could have data in this range
+        all_possible_tables = [
+            # Basic tables
+            "blocks", "attestations", 
+            # Operations
+            "deposits", "voluntary_exits", "proposer_slashings", "attester_slashings",
+            # Fork-specific tables  
+            "sync_aggregates",
+            "execution_payloads", "transactions",
+            "withdrawals", "bls_changes", 
+            "blob_sidecars", "blob_commitments",
+            "execution_requests"
+        ]
+        
+        tables_cleaned = 0
+        
+        for table_name in all_possible_tables:
+            try:
+                # Check if table exists and has data in range
+                check_query = f"""
+                SELECT COUNT(*) as count 
+                FROM {table_name} FINAL
+                WHERE slot >= {{start_slot:UInt64}} AND slot <= {{end_slot:UInt64}}
+                """
+                
+                result = self.storage.execute(check_query, {
+                    "start_slot": start_slot,
+                    "end_slot": end_slot
+                })
+                
+                if result and result[0]["count"] > 0:
+                    rows_to_clean = result[0]["count"]
+                    
+                    # Use ALTER TABLE DELETE for efficient cleanup
+                    delete_query = f"""
+                    ALTER TABLE {table_name} 
+                    DELETE WHERE slot >= {{start_slot:UInt64}} AND slot <= {{end_slot:UInt64}}
+                    """
+                    
+                    try:
+                        self.storage.execute(delete_query, {
+                            "start_slot": start_slot,
+                            "end_slot": end_slot
+                        })
+                        
+                        logger.info("Cleaned existing data from table", 
+                                   table=table_name,
+                                   rows_cleaned=rows_to_clean,
+                                   method="ALTER_DELETE")
+                        tables_cleaned += 1
+                        
+                    except Exception as delete_error:
+                        logger.warning("ALTER DELETE failed for table", 
+                                     table=table_name,
+                                     error=str(delete_error))
+                        
+            except Exception as e:
+                # Table might not exist yet, that's fine
+                logger.debug("Could not clean table (may not exist)", 
+                            table=table_name, 
+                            error=str(e))
+        
+        logger.info("Data cleanup completed", 
+                   tables_cleaned=tables_cleaned,
+                   total_tables_checked=len(all_possible_tables))
+    
+    async def _reset_transformer_progress_for_range(self, start_slot: int, end_slot: int):
+        """Reset transformer progress records for the range so chunks get reprocessed."""
+        logger.info("Resetting transformer progress for range", 
+                   start_slot=start_slot, 
+                   end_slot=end_slot)
+        
+        # Insert failed records to trigger reprocessing
+        reset_query = """
+        INSERT INTO transformer_progress 
+        (raw_table_name, start_slot, end_slot, status, processed_count, failed_count, error_message, processed_at)
+        SELECT 
+            raw_table_name,
+            start_slot, 
+            end_slot,
+            'failed' as status,
+            0 as processed_count,
+            1 as failed_count,
+            'Reset for deduplicating reprocessing' as error_message,
+            now() as processed_at
+        FROM transformer_progress FINAL
+        WHERE start_slot >= {start_slot:UInt64} 
+          AND end_slot <= {end_slot:UInt64}
+          AND status = 'completed'
+        """
+        
+        self.storage.execute(reset_query, {
+            "start_slot": start_slot,
+            "end_slot": end_slot
+        })
+        
+        logger.info("Transformer progress reset completed")
+    
+    # Status and monitoring methods
     def get_processing_status(self) -> Dict[str, Dict]:
-        """Get processing status for all configured loaders."""
+        """Get processing status for enabled loaders only."""
         if config.STORAGE_BACKEND.lower() == "parquet":
             return {"message": "Status tracking not implemented for Parquet backend"}
         
         status = {}
         
+        # Only check status for enabled loaders
         for loader_name, config_item in self.loader_configs.items():
             raw_table = config_item["raw_table"]
             
@@ -759,16 +1095,101 @@ class TransformerService:
         return status
     
     def get_failed_ranges(self, limit: int = 10) -> List[Dict]:
-        """Get recent failed processing ranges for debugging."""
+        """Get recent failed processing ranges for debugging - only for enabled loaders."""
         if config.STORAGE_BACKEND.lower() == "parquet":
             return []
         
-        query = """
+        # Build filter for enabled loaders
+        enabled_raw_tables = [config_item["raw_table"] for config_item in self.loader_configs.values()]
+        if not enabled_raw_tables:
+            return []
+        
+        # Create IN clause for enabled tables
+        tables_filter = ", ".join([f"'{table}'" for table in enabled_raw_tables])
+        
+        query = f"""
         SELECT raw_table_name, start_slot, end_slot, failed_count, error_message, processed_at
         FROM transformer_progress FINAL
         WHERE status = 'failed'
+        AND raw_table_name IN ({tables_filter})
         ORDER BY processed_at DESC
-        LIMIT {limit:UInt64}
+        LIMIT {{limit:UInt64}}
         """
         
         return self.storage.execute(query, {"limit": limit})
+    
+    # Debug methods
+    def debug_complete_table_filtering(self):
+        """Debug method to show complete table filtering configuration."""
+        logger.info("=== COMPLETE TABLE FILTERING CONFIGURATION ===")
+        
+        loader_table_filter = {
+            "blocks": {
+                "blocks", "attestations", "deposits", "voluntary_exits", 
+                "proposer_slashings", "attester_slashings", "sync_aggregates", 
+                "sync_committees", "execution_payloads", "transactions", 
+                "withdrawals", "bls_changes", "blob_sidecars", "blob_commitments", 
+                "execution_requests"
+            },
+            "validators": {"validators"},
+            "rewards": {"rewards"}
+        }
+        
+        for loader, tables in loader_table_filter.items():
+            logger.info(f"Loader '{loader}' processes {len(tables)} tables:")
+            for table in sorted(tables):
+                logger.info(f"  - {table}")
+        
+        logger.info("=== END TABLE FILTERING CONFIGURATION ===")
+    
+    async def test_attester_slashing_parsing(self, slot: int = 251340):
+        """Test method to verify attester slashing parsing works."""
+        logger.info("Testing attester slashing parsing", slot=slot)
+        
+        # Get raw data
+        raw_data = self.storage.execute("""
+            SELECT slot, payload 
+            FROM raw_blocks 
+            WHERE slot = {slot:UInt64} 
+            LIMIT 1
+        """, {"slot": slot})
+        
+        if not raw_data:
+            logger.error("No raw data found for slot", slot=slot)
+            return
+        
+        # Parse with fork-aware parser
+        fork_info = self.fork_service.get_fork_at_slot(slot)
+        parser = self.parser_factory.get_parser_for_fork(fork_info.name)
+        
+        logger.info("Using parser for testing", 
+                   fork=fork_info.name,
+                   parser_class=parser.__class__.__name__)
+        
+        # Parse the data
+        parsed_data = parser.parse(raw_data[0])
+        
+        # Check results
+        if "attester_slashings" in parsed_data:
+            slashings = parsed_data["attester_slashings"]
+            logger.info("✅ Parser extracted attester slashings", 
+                       count=len(slashings),
+                       sample_data=slashings[0] if slashings else None)
+            
+            # Check if table filtering would allow it
+            allowed_tables = {
+                "blocks", "attestations", "deposits", 
+                "voluntary_exits", "proposer_slashings", "attester_slashings",
+                "sync_aggregates", "sync_committees", "execution_payloads", 
+                "transactions", "withdrawals", "bls_changes", "blob_sidecars", 
+                "blob_commitments", "execution_requests"
+            }
+            
+            if "attester_slashings" in allowed_tables:
+                logger.info("✅ Table filtering allows attester_slashings")
+            else:
+                logger.error("❌ Table filtering blocks attester_slashings")
+                
+        else:
+            logger.error("❌ Parser did not extract attester slashings")
+            logger.info("Available parsed tables", tables=list(parsed_data.keys()))

@@ -20,13 +20,3 @@ CREATE TABLE IF NOT EXISTS sync_aggregates (
 ) ENGINE = ReplacingMergeTree(insert_version)
 ORDER BY slot
 PARTITION BY toStartOfMonth(slot_timestamp);
-
--- Sync committees table
-CREATE TABLE IF NOT EXISTS sync_committees (
-    period UInt64,
-    pubkeys Array(String),
-    aggregate_pubkey String,
-    insert_version UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9))
-) ENGINE = ReplacingMergeTree(insert_version)
-ORDER BY period
-PARTITION BY intDiv(period, 100);

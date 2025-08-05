@@ -1,8 +1,9 @@
 from typing import Dict, List, Any, Optional
 from .fork_base import ForkBaseParser
+from src.utils.logger import logger
 
 class Phase0Parser(ForkBaseParser):
-    """Enhanced Phase 0 parser with all missing fields and network-aware fork versions."""
+    """Enhanced Phase 0 parser with FIXED attester slashing parsing."""
     
     def __init__(self):
         super().__init__("phase0")
@@ -18,55 +19,8 @@ class Phase0Parser(ForkBaseParser):
             "attester_slashings"
         ]
     
-    def parse_block(self, slot: int, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Enhanced block parsing with all missing fields."""
-        message = data.get("message", {})
-        body = message.get("body", {})
-        eth1_data = body.get("eth1_data", {})
-        
-        return {
-            "slot": slot,
-            "proposer_index": self.safe_int(message.get("proposer_index")),
-            "parent_root": self.safe_str(message.get("parent_root")),
-            "state_root": self.safe_str(message.get("state_root")),
-            "signature": self.safe_str(data.get("signature")),
-            
-            # Enhanced fields from ERA parser with network-aware fork version:
-            "version": self._get_fork_version(slot),
-            "randao_reveal": self.safe_str(body.get("randao_reveal")),
-            "graffiti": self.safe_str(body.get("graffiti")),
-            "eth1_deposit_root": self.safe_str(eth1_data.get("deposit_root")),
-            "eth1_deposit_count": self.safe_int(eth1_data.get("deposit_count")),
-            "eth1_block_hash": self.safe_str(eth1_data.get("block_hash"))
-        }
-    
-    def parse_attestations(self, slot: int, data: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Enhanced attestation parsing with missing fields."""
-        message = data.get("message", {})
-        body = message.get("body", {})
-        attestations = body.get("attestations", [])
-        
-        attestation_rows = []
-        for i, att in enumerate(attestations):
-            att_data = att.get("data", {})
-            attestation_rows.append({
-                "slot": slot,
-                "attestation_index": i,  # Index within the block
-                "committee_index": self.safe_int(att_data.get("index")),
-                "beacon_block_root": self.safe_str(att_data.get("beacon_block_root")),
-                "source_epoch": self.safe_int(att_data.get("source", {}).get("epoch")),
-                "source_root": self.safe_str(att_data.get("source", {}).get("root")),
-                "target_epoch": self.safe_int(att_data.get("target", {}).get("epoch")),
-                "target_root": self.safe_str(att_data.get("target", {}).get("root")),
-                "aggregation_bits": self.safe_str(att.get("aggregation_bits")),
-                "signature": self.safe_str(att.get("signature")),
-                "attestation_slot": self.safe_int(att_data.get("slot", slot))  # The slot being attested
-            })
-        
-        return attestation_rows
-    
     def parse_fork_specific(self, slot: int, data: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
-        """Parse Phase 0 operations (deposits, exits, slashings)."""
+        """Parse Phase 0 operations (deposits, exits, slashings) with FIXED attester slashing parsing."""
         result = {}
         
         message = data.get("message", {})
@@ -130,9 +84,13 @@ class Phase0Parser(ForkBaseParser):
                 })
             result["proposer_slashings"] = slash_rows
         
-        # Parse attester slashings
+        # FIXED Parse attester slashings - this was the problematic part
         attester_slashings = body.get("attester_slashings", [])
         if attester_slashings:
+            logger.info("Processing attester slashings", 
+                       slot=slot, 
+                       count=len(attester_slashings))
+            
             slash_rows = []
             for i, slashing in enumerate(attester_slashings):
                 att_1 = slashing.get("attestation_1", {})
@@ -140,9 +98,17 @@ class Phase0Parser(ForkBaseParser):
                 att_1_data = att_1.get("data", {})
                 att_2_data = att_2.get("data", {})
                 
-                # Parse attesting indices arrays
-                att_1_indices = att_1.get("attesting_indices", [])
-                att_2_indices = att_2.get("attesting_indices", [])
+                # FIXED: Proper handling of attesting_indices - this is the key fix
+                att_1_indices = self._parse_attesting_indices_fixed(att_1.get("attesting_indices", []))
+                att_2_indices = self._parse_attesting_indices_fixed(att_2.get("attesting_indices", []))
+                
+                logger.debug("Parsed attester slashing", 
+                           slot=slot,
+                           slashing_index=i,
+                           att_1_indices_count=len(att_1_indices),
+                           att_2_indices_count=len(att_2_indices),
+                           att_1_indices_sample=att_1_indices[:3] if att_1_indices else [],
+                           att_2_indices_sample=att_2_indices[:3] if att_2_indices else [])
                 
                 slash_rows.append({
                     "slot": slot,
@@ -155,7 +121,7 @@ class Phase0Parser(ForkBaseParser):
                     "att_1_target_epoch": self.safe_int(att_1_data.get("target", {}).get("epoch")),
                     "att_1_target_root": self.safe_str(att_1_data.get("target", {}).get("root")),
                     "att_1_signature": self.safe_str(att_1.get("signature")),
-                    "att_1_attesting_indices": [self.safe_int(idx) for idx in att_1_indices],
+                    "att_1_attesting_indices": att_1_indices,
                     "att_1_validator_count": len(att_1_indices),
                     "att_2_slot": self.safe_int(att_2_data.get("slot")),
                     "att_2_committee_index": self.safe_int(att_2_data.get("index")),
@@ -165,13 +131,108 @@ class Phase0Parser(ForkBaseParser):
                     "att_2_target_epoch": self.safe_int(att_2_data.get("target", {}).get("epoch")),
                     "att_2_target_root": self.safe_str(att_2_data.get("target", {}).get("root")),
                     "att_2_signature": self.safe_str(att_2.get("signature")),
-                    "att_2_attesting_indices": [self.safe_int(idx) for idx in att_2_indices],
+                    "att_2_attesting_indices": att_2_indices,
                     "att_2_validator_count": len(att_2_indices),
                     "total_slashed_validators": len(set(att_1_indices + att_2_indices))
                 })
+            
             result["attester_slashings"] = slash_rows
+            logger.info("Successfully parsed attester slashings", 
+                       slot=slot, 
+                       slashings_count=len(slash_rows))
         
         return result
+    
+    def _parse_attesting_indices_fixed(self, indices_data: Any) -> List[int]:
+        """
+        COMPLETELY FIXED method to properly parse attesting indices from various formats.
+        
+        The beacon API returns attesting_indices as an array of strings like ["4338"].
+        The bug was in trying to convert the entire array to string and then parsing.
+        """
+        if not indices_data:
+            return []
+        
+        try:
+            # Handle list format (most common case - this is what we actually receive)
+            if isinstance(indices_data, list):
+                result = []
+                for item in indices_data:
+                    if isinstance(item, str):
+                        # String number - convert directly to int
+                        if item.isdigit():
+                            result.append(int(item))
+                        else:
+                            logger.warning("Non-numeric string in attesting_indices", 
+                                         item=item, 
+                                         type=type(item))
+                    elif isinstance(item, int):
+                        # Already an integer
+                        result.append(item)
+                    else:
+                        logger.warning("Unexpected type in attesting_indices list", 
+                                     item=item,
+                                     type=type(item))
+                
+                logger.debug("Successfully parsed attesting_indices", 
+                           input_format="list",
+                           input_length=len(indices_data),
+                           output_length=len(result),
+                           sample_input=indices_data[:3] if len(indices_data) > 0 else [],
+                           sample_output=result[:3] if len(result) > 0 else [])
+                
+                return result
+            
+            # Handle string format (backup case)
+            elif isinstance(indices_data, str):
+                indices_data = indices_data.strip()
+                if not indices_data:
+                    return []
+                
+                # Handle comma-separated values
+                if ',' in indices_data:
+                    result = []
+                    for item in indices_data.split(','):
+                        item = item.strip()
+                        if item.isdigit():
+                            result.append(int(item))
+                    logger.debug("Parsed comma-separated attesting_indices", 
+                               input=indices_data, 
+                               output=result)
+                    return result
+                
+                # Single value
+                if indices_data.isdigit():
+                    result = [int(indices_data)]
+                    logger.debug("Parsed single string attesting_indices", 
+                               input=indices_data, 
+                               output=result)
+                    return result
+                else:
+                    logger.warning("Non-numeric string attesting_indices", 
+                                 data=indices_data)
+                    return []
+            
+            # Handle integer format (single value)
+            elif isinstance(indices_data, int):
+                result = [indices_data]
+                logger.debug("Parsed single int attesting_indices", 
+                           input=indices_data, 
+                           output=result)
+                return result
+            
+            else:
+                logger.error("Unexpected attesting_indices format", 
+                           data=repr(indices_data)[:100],
+                           type=type(indices_data))
+                return []
+                
+        except Exception as e:
+            logger.error("Critical error parsing attesting_indices", 
+                        data=repr(indices_data)[:100],
+                        error=str(e))
+            # Return empty list rather than crashing the entire parsing
+            return []
     
     def _get_fallback_fork_version(self) -> str:
         """Get fallback fork version for Phase 0 (mainnet)."""

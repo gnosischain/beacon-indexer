@@ -69,15 +69,12 @@ class ClickHouse:
         table: str,
         data: List[Dict[str, Any]],
         column_order: Optional[List[str]] = None,
-        max_rows_per_chunk: int = 10_000,
-        max_bytes_per_chunk: int = 64 * 1024 * 1024,  # 64 MB
-        large_row_threshold: int = 128 * 1024 * 1024  # 128 MB
+        max_rows_per_chunk: int = 5_000,  # Reduced from 10K
+        max_bytes_per_chunk: int = 32 * 1024 * 1024,  # Reduced to 32 MB
+        large_row_threshold: int = 64 * 1024 * 1024  # Reduced to 64 MB
     ):
         """
-        Robust insert with:
-        - RowBinary (client.insert) for normal rows
-        - Column-oriented encode for very large rows (different path in driver)
-        - JSONEachRow fallback with parallel parsing OFF for a single huge row
+        Memory-optimized insert with smaller chunks and better error handling.
         """
         if not data:
             return
@@ -98,7 +95,24 @@ class ClickHouse:
                 return v.replace(tzinfo=None)
             if isinstance(v, bool):
                 return 1 if v else 0
-            if isinstance(v, (dict, list)):
+            # CRITICAL FIX: Don't JSON stringify lists - keep them as Python lists for ClickHouse Array types
+            if isinstance(v, list):
+                # Keep arrays as Python lists, but ensure all elements are proper types
+                normalized_array = []
+                for item in v:
+                    if isinstance(item, str) and item.isdigit():
+                        normalized_array.append(int(item))
+                    elif isinstance(item, int):
+                        normalized_array.append(item)
+                    elif isinstance(item, str):
+                        # Non-numeric strings stay as strings (for string arrays)
+                        normalized_array.append(item)
+                    else:
+                        # Convert other types to string as fallback
+                        normalized_array.append(str(item))
+                return normalized_array
+            # Only stringify dictionaries, not lists
+            if isinstance(v, dict):
                 return json.dumps(v, ensure_ascii=False)
             return v
 
@@ -174,7 +188,7 @@ class ClickHouse:
                         logger.error("JSONEachRow fallback also failed", table=table, error=str(e2))
                         raise
 
-        # --- normal path: chunked RowBinary, row-oriented ---
+        # --- normal path: chunked RowBinary, row-oriented with memory optimization ---
         buf: List[List[Any]] = []
         buf_bytes = 0
 
@@ -182,21 +196,49 @@ class ClickHouse:
             nonlocal buf, buf_bytes
             if not buf:
                 return
-            # Encode very long Strings as bytes to reduce client-side overhead
-            for r in range(len(buf)):
-                for c in range(len(cols)):
-                    v = buf[r][c]
-                    if isinstance(v, str) and len(v) >= large_row_threshold:
-                        buf[r][c] = v.encode('utf-8', 'ignore')
-            self.client.insert(
-                table,
-                buf,
-                column_names=cols,
-                column_oriented=False,
-            )
-            logger.info("Chunk inserted", table=table, rows=len(buf), size_mb=round(buf_bytes/1024/1024, 2))
-            buf = []
-            buf_bytes = 0
+            
+            try:
+                # Apply memory-optimized settings for this insert
+                settings = {
+                    'max_insert_block_size': 32768,  # 32K rows max per block
+                    'max_memory_usage': '1500000000',  # 1.5GB limit per query
+                    'max_bytes_before_external_group_by': '500000000',  # 500MB before external
+                    'max_bytes_before_external_sort': '500000000',      # 500MB before external
+                    'input_format_parallel_parsing': 0,  # Disable parallel parsing
+                    'min_chunk_bytes_for_parallel_parsing': 1048576,  # 1MB minimum
+                }
+                
+                # Encode very long Strings as bytes to reduce client-side overhead
+                for r in range(len(buf)):
+                    for c in range(len(cols)):
+                        v = buf[r][c]
+                        if isinstance(v, str) and len(v) >= large_row_threshold:
+                            buf[r][c] = v.encode('utf-8', 'ignore')
+                
+                self.client.insert(
+                    table,
+                    buf,
+                    column_names=cols,
+                    column_oriented=False,
+                    settings=settings
+                )
+                logger.info("Memory-optimized chunk inserted", 
+                           table=table, 
+                           rows=len(buf), 
+                           size_mb=round(buf_bytes/1024/1024, 2))
+                buf = []
+                buf_bytes = 0
+                
+            except Exception as e:
+                logger.error("Memory-optimized insert failed", 
+                           table=table, 
+                           rows=len(buf), 
+                           size_mb=round(buf_bytes/1024/1024, 2),
+                           error=str(e))
+                # Clear buffer to prevent memory buildup
+                buf = []
+                buf_bytes = 0
+                raise
 
         for r in data:
             lst = as_row_list(r)
@@ -210,6 +252,28 @@ class ClickHouse:
 
         flush()
 
+    def insert_batch_optimized(self, table: str, data: List[Dict[str, Any]], **kwargs):
+        """Wrapper for memory-optimized inserts with smaller batch sizes."""
+        if not data:
+            return
+        
+        # Split large batches into smaller chunks to reduce memory pressure
+        max_batch_size = 1000
+        if len(data) > max_batch_size:
+            logger.info("Splitting large batch", 
+                       table=table, 
+                       total_rows=len(data), 
+                       batches=len(data) // max_batch_size + 1)
+            
+            for i in range(0, len(data), max_batch_size):
+                batch = data[i:i + max_batch_size]
+                self.insert_batch(table, batch, **kwargs)
+                logger.debug("Inserted batch chunk", 
+                           table=table, 
+                           chunk=f"{i//max_batch_size + 1}",
+                           rows=len(batch))
+        else:
+            self.insert_batch(table, data, **kwargs)
 
     async def init_cache(self):
         """Initialize cache for frequently accessed configuration."""

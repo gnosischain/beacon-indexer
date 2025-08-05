@@ -182,3 +182,4 @@ class ForkBaseParser(ABC):
             return str(value) if value is not None else default
         except (ValueError, TypeError):
             return default
+        
