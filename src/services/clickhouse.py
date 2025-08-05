@@ -124,7 +124,7 @@ class ClickHouse:
                         error=str(e))
     
     def claim_chunk(self, worker_id: str, loader_name: str) -> Optional[tuple]:
-        """Worker-specific chunk claiming with better distribution."""
+        """Worker-specific chunk claiming with balanced loader distribution."""
         try:
             # Extract worker number from worker_id (e.g., "worker_5" -> 5)
             try:
@@ -133,20 +133,20 @@ class ClickHouse:
                 logger.error("Invalid worker_id format", worker_id=worker_id)
                 return None
             
-            # Use chunk ordering (ROW_NUMBER) instead of start_slot for even distribution
+            # Use loader-specific chunk ordering for balanced distribution
             get_chunks_query = """
-            SELECT chunk_id, start_slot, end_slot, chunk_row_num
+            SELECT chunk_id, start_slot, end_slot, loader_row_num
             FROM (
                 SELECT 
                     chunk_id, 
                     start_slot, 
                     end_slot,
-                    ROW_NUMBER() OVER (ORDER BY start_slot) - 1 as chunk_row_num
+                    ROW_NUMBER() OVER (PARTITION BY loader_name ORDER BY start_slot) - 1 as loader_row_num
                 FROM load_state_chunks FINAL
                 WHERE loader_name = {loader_name:String} 
                   AND status = 'pending'
             )
-            WHERE chunk_row_num % {total_workers:UInt64} = {worker_num:UInt64}
+            WHERE loader_row_num % {total_workers:UInt64} = {worker_num:UInt64}
             ORDER BY start_slot 
             LIMIT 1
             """
