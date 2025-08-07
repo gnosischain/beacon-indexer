@@ -41,8 +41,8 @@ class LoaderService:
             await self.beacon_api.close()
     
     async def realtime(self):
-        """Run realtime loading."""
-        logger.info("Starting realtime loader")
+        """Run realtime loading with proper chunk management."""
+        logger.info("Starting realtime loader with chunk management")
         
         # First, ensure specs and genesis are loaded
         await self._ensure_foundation_data()
@@ -59,15 +59,29 @@ class LoaderService:
                     await asyncio.sleep(12)  # Wait one slot
                     continue
                 
-                # Process new slots
+                # Process new slots in chunk-sized batches
                 processed_any = False
-                for slot in range(last_slot + 1, head_slot + 1):
-                    await self._process_slot(slot)
-                    last_slot = slot
-                    processed_any = True
+                current_slot = last_slot + 1
+                
+                while current_slot <= head_slot:
+                    # Calculate chunk boundaries
+                    chunk_start = current_slot
+                    chunk_end = min(
+                        self._get_chunk_end(chunk_start),  # Align to chunk boundaries
+                        head_slot
+                    )
+                    
+                    success = await self._process_chunk_realtime(chunk_start, chunk_end)
+                    if success:
+                        last_slot = chunk_end
+                        processed_any = True
+                        current_slot = chunk_end + 1
+                    else:
+                        # If chunk fails, try next slot individually to avoid getting stuck
+                        current_slot += 1
                 
                 if processed_any:
-                    logger.info("Processed realtime slots", 
+                    logger.info("Processed realtime chunks", 
                                last_processed=last_slot,
                                head_slot=head_slot)
                 
@@ -77,6 +91,207 @@ class LoaderService:
             except Exception as e:
                 logger.error("Error in realtime loader", error=str(e))
                 await asyncio.sleep(12)
+    
+    def _get_chunk_end(self, start_slot: int) -> int:
+        """Calculate chunk end slot aligned to CHUNK_SIZE boundaries."""
+        # Align to chunk boundaries like backfill does
+        chunk_boundary = (start_slot // config.CHUNK_SIZE) * config.CHUNK_SIZE
+        return chunk_boundary + config.CHUNK_SIZE - 1
+    
+    async def _process_chunk_realtime(self, start_slot: int, end_slot: int) -> bool:
+        """Process a chunk of slots with proper chunk tracking."""
+        logger.debug("Processing realtime chunk", 
+                    start_slot=start_slot, 
+                    end_slot=end_slot,
+                    chunk_size=end_slot - start_slot + 1)
+        
+        # Only create chunks for ClickHouse backend
+        if config.STORAGE_BACKEND.lower() != "clickhouse":
+            # For Parquet, just process slots normally
+            for slot in range(start_slot, end_slot + 1):
+                await self._process_slot_simple(slot)
+            return True
+        
+        # For ClickHouse: Create/claim chunks, process data, mark complete
+        chunk_results = {}  # loader_name -> (success_count, total_count)
+        
+        for loader in self.loaders:
+            # Skip one-time loaders
+            if loader.name in ["genesis", "specs"]:
+                continue
+            
+            loader_name = loader.name
+            chunk_id = f"{loader_name}_{start_slot}_{end_slot}"
+            
+            try:
+                # Check if chunk already exists and is completed
+                if self._is_chunk_completed(chunk_id):
+                    logger.debug("Chunk already completed, skipping", 
+                               chunk_id=chunk_id)
+                    continue
+                
+                # Create/claim the chunk
+                await self._create_or_claim_realtime_chunk(
+                    chunk_id, start_slot, end_slot, loader_name
+                )
+                
+                # Process the chunk data
+                if loader_name == "validators" and hasattr(loader, 'get_target_slots_in_range'):
+                    # For validators, only process target slots based on mode
+                    target_slots = loader.get_target_slots_in_range(start_slot, end_slot + 1)  # +1 because range is exclusive
+                    success_count = 0
+                    total_count = len(target_slots)
+                    
+                    for slot in target_slots:
+                        if await loader.load_single(slot):
+                            success_count += 1
+                    
+                    chunk_results[loader_name] = (success_count, total_count)
+                else:
+                    # For blocks, rewards: process all slots in range
+                    slots_to_process = list(range(start_slot, end_slot + 1))
+                    success_count = await loader.load_batch(slots_to_process)
+                    total_count = len(slots_to_process)
+                    
+                    chunk_results[loader_name] = (success_count, total_count)
+                
+                # Mark chunk as completed if successful
+                if chunk_results[loader_name][0] > 0:
+                    self._mark_chunk_completed(chunk_id, start_slot, end_slot, loader_name)
+                    logger.debug("Marked chunk as completed", 
+                               chunk_id=chunk_id,
+                               success_count=chunk_results[loader_name][0],
+                               total_count=chunk_results[loader_name][1])
+                else:
+                    self._mark_chunk_failed(chunk_id, start_slot, end_slot, loader_name, "No data processed")
+                    
+            except Exception as e:
+                logger.error("Failed to process chunk", 
+                            loader=loader_name,
+                            chunk_id=chunk_id,
+                            start_slot=start_slot,
+                            end_slot=end_slot,
+                            error=str(e))
+                
+                self._mark_chunk_failed(chunk_id, start_slot, end_slot, loader_name, str(e))
+                chunk_results[loader_name] = (0, end_slot - start_slot + 1)
+        
+        # Return success if any loader processed data successfully
+        total_success = sum(result[0] for result in chunk_results.values())
+        total_processed = sum(result[1] for result in chunk_results.values())
+        
+        if total_success > 0:
+            logger.info("Realtime chunk completed", 
+                       start_slot=start_slot,
+                       end_slot=end_slot,
+                       success_count=total_success,
+                       total_count=total_processed,
+                       loaders=list(chunk_results.keys()))
+        
+        return total_success > 0
+    
+    async def _process_slot_simple(self, slot: int):
+        """Simple slot processing for non-ClickHouse backends."""
+        for loader in self.loaders:
+            try:
+                # Skip one-time loaders in slot processing
+                if loader.name in ["genesis", "specs"]:
+                    continue
+                
+                # Check if this loader should process this slot
+                if hasattr(loader, 'should_process_slot'):
+                    if not loader.should_process_slot(slot):
+                        continue
+                
+                await loader.load_single(slot)
+                        
+            except Exception as e:
+                logger.error("Loader failed", 
+                           loader=loader.name, 
+                           slot=slot, 
+                           error=str(e))
+    
+    def _is_chunk_completed(self, chunk_id: str) -> bool:
+        """Check if a chunk is already completed."""
+        try:
+            query = """
+            SELECT status 
+            FROM load_state_chunks FINAL 
+            WHERE chunk_id = {chunk_id:String}
+            """
+            
+            result = self.storage.execute(query, {"chunk_id": chunk_id})
+            return result and result[0]["status"] == "completed"
+            
+        except Exception as e:
+            logger.debug("Error checking chunk status", chunk_id=chunk_id, error=str(e))
+            return False
+    
+    async def _create_or_claim_realtime_chunk(self, chunk_id: str, start_slot: int, 
+                                            end_slot: int, loader_name: str):
+        """Create or claim a chunk for processing."""
+        chunk_data = {
+            "chunk_id": chunk_id,
+            "start_slot": start_slot,
+            "end_slot": end_slot,
+            "loader_name": loader_name,
+            "status": "claimed",
+            "worker_id": "realtime",
+            "created_at": datetime.now(),
+            "updated_at": datetime.now()
+        }
+        
+        try:
+            self.storage.insert_batch("load_state_chunks", [chunk_data])
+        except Exception as e:
+            # Chunk might already exist - that's okay for realtime
+            logger.debug("Could not create chunk (might already exist)", 
+                        chunk_id=chunk_id, 
+                        error=str(e))
+    
+    def _mark_chunk_completed(self, chunk_id: str, start_slot: int, end_slot: int, loader_name: str):
+        """Mark a chunk as completed."""
+        chunk_data = {
+            "chunk_id": chunk_id,
+            "start_slot": start_slot,
+            "end_slot": end_slot,
+            "loader_name": loader_name,
+            "status": "completed",
+            "worker_id": "realtime",
+            "created_at": datetime.now(),
+            "updated_at": datetime.now()
+        }
+        
+        try:
+            self.storage.insert_batch("load_state_chunks", [chunk_data])
+        except Exception as e:
+            logger.error("Failed to mark chunk completed", 
+                        chunk_id=chunk_id, 
+                        error=str(e))
+    
+    def _mark_chunk_failed(self, chunk_id: str, start_slot: int, end_slot: int, 
+                          loader_name: str, error_msg: str):
+        """Mark a chunk as failed."""
+        chunk_data = {
+            "chunk_id": chunk_id,
+            "start_slot": start_slot,
+            "end_slot": end_slot,
+            "loader_name": loader_name,
+            "status": "failed",
+            "worker_id": "realtime",
+            "created_at": datetime.now(),
+            "updated_at": datetime.now()
+        }
+        
+        try:
+            self.storage.insert_batch("load_state_chunks", [chunk_data])
+            logger.warning("Marked chunk as failed", 
+                          chunk_id=chunk_id, 
+                          error=error_msg)
+        except Exception as e:
+            logger.error("Failed to mark chunk as failed", 
+                        chunk_id=chunk_id, 
+                        error=str(e))
     
     def _get_last_raw_slot(self) -> int:
         """Get the highest slot we have in raw data across all tables."""
