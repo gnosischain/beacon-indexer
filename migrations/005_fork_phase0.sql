@@ -1,6 +1,6 @@
--- Phase 0 (Genesis) fork tables 
+-- Phase 0 (Genesis) fork tables - CLEAN SCHEMA
 
--- Blocks table with all Phase 0 fields
+-- Blocks table with only block-specific fields 
 CREATE TABLE IF NOT EXISTS blocks (
     slot UInt64,
     proposer_index UInt64,
@@ -10,9 +10,18 @@ CREATE TABLE IF NOT EXISTS blocks (
     version String DEFAULT '',
     randao_reveal String DEFAULT '',
     graffiti String DEFAULT '',
+    
+    -- ETH1 data (only in blocks table)
     eth1_deposit_root String DEFAULT '',
     eth1_deposit_count UInt64 DEFAULT 0,
     eth1_block_hash String DEFAULT '',
+    
+    -- Counts/references only 
+    sync_aggregate_participation UInt64 DEFAULT 0,    -- Altair+
+    withdrawals_count UInt32 DEFAULT 0,               -- Capella+
+    blob_kzg_commitments_count UInt32 DEFAULT 0,      -- Deneb+
+    execution_requests_count UInt32 DEFAULT 0,        -- Electra+
+    
     slot_timestamp DateTime64(0, 'UTC') MATERIALIZED addSeconds(
         (SELECT toDateTime(genesis_time_unix, 'UTC') FROM time_helpers LIMIT 1),
         slot * (SELECT seconds_per_slot FROM time_helpers LIMIT 1)
@@ -75,7 +84,7 @@ CREATE TABLE IF NOT EXISTS voluntary_exits (
     ),
     insert_version UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9))
 ) ENGINE = ReplacingMergeTree(insert_version)
-ORDER BY (slot, validator_index, epoch)
+ORDER BY (slot, validator_index)
 PARTITION BY toStartOfMonth(slot_timestamp);
 
 -- Proposer slashings table
@@ -160,7 +169,7 @@ CREATE TABLE IF NOT EXISTS validators (
 ORDER BY (slot, validator_index)
 PARTITION BY toStartOfMonth(slot_timestamp);
 
-
+-- Rewards table
 CREATE TABLE IF NOT EXISTS rewards (
     slot UInt64,
     proposer_index UInt64,
@@ -175,5 +184,5 @@ CREATE TABLE IF NOT EXISTS rewards (
     ),
     insert_version UInt64 MATERIALIZED toUnixTimestamp64Nano(now64(9))
 ) ENGINE = ReplacingMergeTree(insert_version)
-ORDER BY (slot)
+ORDER BY (slot, proposer_index)
 PARTITION BY toStartOfMonth(slot_timestamp);

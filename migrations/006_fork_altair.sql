@@ -1,10 +1,5 @@
 -- Altair fork schema additions (Epoch 74240 on mainnet)
 
--- Add sync committee support to blocks table
-ALTER TABLE blocks 
-ADD COLUMN IF NOT EXISTS sync_aggregate_participation UInt64 DEFAULT 0,
-ADD COLUMN IF NOT EXISTS sync_aggregate_signature String DEFAULT '';
-
 -- Sync aggregates table
 CREATE TABLE IF NOT EXISTS sync_aggregates (
     slot UInt64,

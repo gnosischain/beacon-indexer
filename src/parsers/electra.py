@@ -3,7 +3,7 @@ from typing import Dict, List, Any, Optional
 from .deneb import DenebParser
 
 class ElectraParser(DenebParser):
-    """Enhanced Electra parser with execution requests as JSON payload and network-aware fork versions."""
+    """Electra parser with clean schema - execution requests in separate table."""
     
     def __init__(self):
         super().__init__()
@@ -13,30 +13,8 @@ class ElectraParser(DenebParser):
         """Electra adds execution requests table."""
         return super().get_supported_tables() + ["execution_requests"]
     
-    def parse_block(self, slot: int, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Extend Deneb block parsing with execution requests count."""
-        block_data = super().parse_block(slot, data)
-        
-        if block_data:
-            message = data.get("message", {})
-            body = message.get("body", {})
-            
-            # Parse execution requests
-            execution_requests = body.get("execution_requests", {})
-            if execution_requests:
-                deposits = execution_requests.get("deposits", [])
-                withdrawals = execution_requests.get("withdrawals", [])
-                consolidations = execution_requests.get("consolidations", [])
-                
-                total_requests = len(deposits) + len(withdrawals) + len(consolidations)
-                block_data["execution_requests_count"] = total_requests
-            else:
-                block_data["execution_requests_count"] = 0
-        
-        return block_data
-    
     def parse_fork_specific(self, slot: int, data: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
-        """Parse Electra execution requests as JSON payload - only when there are actual requests."""
+        """Parse Electra execution requests - stored separately, not in blocks."""
         result = super().parse_fork_specific(slot, data)
         
         message = data.get("message", {})

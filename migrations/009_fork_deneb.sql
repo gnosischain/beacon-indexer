@@ -1,10 +1,5 @@
 -- Deneb fork schema additions (Cancun - Epoch 269568 on mainnet)
 
--- Add blob fields to blocks table
-ALTER TABLE blocks 
-ADD COLUMN IF NOT EXISTS blob_kzg_commitments_count UInt32 DEFAULT 0,
-ADD COLUMN IF NOT EXISTS blob_kzg_commitments_root String DEFAULT '';
-
 -- Blob commitments table matching ERA parser structure
 CREATE TABLE IF NOT EXISTS blob_commitments (
     slot UInt64,

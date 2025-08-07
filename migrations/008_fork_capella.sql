@@ -1,9 +1,5 @@
 -- Capella fork schema additions (Shanghai - Epoch 194048 on mainnet)
 
--- Add withdrawal fields to blocks table
-ALTER TABLE blocks 
-ADD COLUMN IF NOT EXISTS withdrawals_root String DEFAULT '',
-ADD COLUMN IF NOT EXISTS withdrawals_count UInt32 DEFAULT 0;
 
 -- Withdrawals table matching ERA parser structure
 CREATE TABLE IF NOT EXISTS withdrawals (

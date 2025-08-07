@@ -2,7 +2,7 @@ from typing import Dict, List, Any, Optional
 from .phase0 import Phase0Parser
 
 class AltairParser(Phase0Parser):
-    """Enhanced Altair parser with sync committee support and network-aware fork versions."""
+    """Altair parser with clean schema - sync data in sync_aggregates table."""
     
     def __init__(self):
         super().__init__()
@@ -12,28 +12,8 @@ class AltairParser(Phase0Parser):
         """Altair adds sync aggregates to Phase 0 tables."""
         return super().get_supported_tables() + ["sync_aggregates"]
     
-    def parse_block(self, slot: int, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Extend Phase 0 block parsing with sync aggregate data."""
-        block_data = super().parse_block(slot, data)
-        
-        if block_data:
-            # Add sync aggregate fields
-            message = data.get("message", {})
-            body = message.get("body", {})
-            sync_aggregate = body.get("sync_aggregate", {})
-            
-            if sync_aggregate:
-                # Calculate participation from sync committee bits
-                sync_committee_bits = sync_aggregate.get("sync_committee_bits", "")
-                participation = self._calculate_sync_participation(sync_committee_bits)
-                
-                block_data["sync_aggregate_participation"] = participation
-                block_data["sync_aggregate_signature"] = sync_aggregate.get("sync_committee_signature", "")
-        
-        return block_data
-    
     def parse_fork_specific(self, slot: int, data: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
-        """Parse Altair-specific sync aggregate data with participation count."""
+        """Parse Altair-specific sync aggregate data."""
         result = super().parse_fork_specific(slot, data)
         
         message = data.get("message", {})
@@ -50,7 +30,7 @@ class AltairParser(Phase0Parser):
                 "sync_committee_bits": sync_committee_bits,
                 "sync_committee_signature": sync_committee_signature,
                 "participation_count": participation_count,
-                "participating_validators": participation_count  # ERA parser field
+                "participating_validators": participation_count  # Same value
             }
             
             result["sync_aggregates"] = [sync_aggregate_data]
