@@ -94,9 +94,16 @@ class LoaderService:
     
     def _get_chunk_end(self, start_slot: int) -> int:
         """Calculate chunk end slot aligned to CHUNK_SIZE boundaries."""
-        # Align to chunk boundaries like backfill does
-        chunk_boundary = (start_slot // config.CHUNK_SIZE) * config.CHUNK_SIZE
-        return chunk_boundary + config.CHUNK_SIZE - 1
+        # Fix: Use proper chunk size alignment
+        chunk_start = (start_slot // config.CHUNK_SIZE) * config.CHUNK_SIZE
+        chunk_end = chunk_start + config.CHUNK_SIZE - 1
+        
+        # If start_slot is already at chunk boundary, use it
+        if start_slot == chunk_start:
+            return chunk_end
+        else:
+            # Otherwise, go to next chunk boundary
+            return chunk_start + config.CHUNK_SIZE + config.CHUNK_SIZE - 1
     
     async def _process_chunk_realtime(self, start_slot: int, end_slot: int) -> bool:
         """Process a chunk of slots with proper chunk tracking."""
@@ -121,60 +128,91 @@ class LoaderService:
                 continue
             
             loader_name = loader.name
-            chunk_id = f"{loader_name}_{start_slot}_{end_slot}"
             
             try:
-                # Check if chunk already exists and is completed
-                if self._is_chunk_completed(chunk_id):
-                    logger.debug("Chunk already completed, skipping", 
-                               chunk_id=chunk_id)
-                    continue
-                
-                # Create/claim the chunk
-                await self._create_or_claim_realtime_chunk(
-                    chunk_id, start_slot, end_slot, loader_name
-                )
-                
-                # Process the chunk data
                 if loader_name == "validators" and hasattr(loader, 'get_target_slots_in_range'):
-                    # For validators, only process target slots based on mode
-                    target_slots = loader.get_target_slots_in_range(start_slot, end_slot + 1)  # +1 because range is exclusive
+                    # For validators in daily mode: create individual chunks per target slot
+                    target_slots = loader.get_target_slots_in_range(start_slot, end_slot + 1)
+                    
+                    if not target_slots:
+                        # No target slots in this range - skip validator processing
+                        logger.debug("No validator target slots in range, skipping", 
+                                start_slot=start_slot, end_slot=end_slot)
+                        chunk_results[loader_name] = (0, 0)
+                        continue
+                    
+                    # Process each target slot as its own chunk
                     success_count = 0
-                    total_count = len(target_slots)
-                    
-                    for slot in target_slots:
-                        if await loader.load_single(slot):
+                    for target_slot in target_slots:
+                        chunk_id = f"{loader_name}_{target_slot}_{target_slot}"
+                        
+                        # Check if chunk already exists
+                        if self._is_chunk_completed(chunk_id):
+                            logger.debug("Validator chunk already completed", chunk_id=chunk_id)
+                            continue
+                        
+                        # Create/claim single-slot chunk
+                        await self._create_or_claim_realtime_chunk(
+                            chunk_id, target_slot, target_slot, loader_name
+                        )
+                        
+                        # Process the single slot
+                        if await loader.load_single(target_slot):
                             success_count += 1
+                            self._mark_chunk_completed(chunk_id, target_slot, target_slot, loader_name)
+                            logger.debug("Validator chunk completed", 
+                                    chunk_id=chunk_id, slot=target_slot)
+                        else:
+                            self._mark_chunk_failed(chunk_id, target_slot, target_slot, loader_name, "Failed to load slot")
                     
-                    chunk_results[loader_name] = (success_count, total_count)
+                    chunk_results[loader_name] = (success_count, len(target_slots))
+                    
                 else:
-                    # For blocks, rewards: process all slots in range
+                    # For blocks, rewards: process as range chunks (100 slots)
+                    chunk_id = f"{loader_name}_{start_slot}_{end_slot}"
+                    
+                    # Check if chunk already exists and is completed
+                    if self._is_chunk_completed(chunk_id):
+                        logger.debug("Chunk already completed, skipping", chunk_id=chunk_id)
+                        continue
+                    
+                    # Create/claim the chunk
+                    await self._create_or_claim_realtime_chunk(
+                        chunk_id, start_slot, end_slot, loader_name
+                    )
+                    
+                    # Process all slots in range
                     slots_to_process = list(range(start_slot, end_slot + 1))
                     success_count = await loader.load_batch(slots_to_process)
                     total_count = len(slots_to_process)
                     
                     chunk_results[loader_name] = (success_count, total_count)
-                
-                # Mark chunk as completed if successful
-                if chunk_results[loader_name][0] > 0:
-                    self._mark_chunk_completed(chunk_id, start_slot, end_slot, loader_name)
-                    logger.debug("Marked chunk as completed", 
-                               chunk_id=chunk_id,
-                               success_count=chunk_results[loader_name][0],
-                               total_count=chunk_results[loader_name][1])
-                else:
-                    self._mark_chunk_failed(chunk_id, start_slot, end_slot, loader_name, "No data processed")
                     
+                    # Mark chunk as completed if successful
+                    if success_count > 0:
+                        self._mark_chunk_completed(chunk_id, start_slot, end_slot, loader_name)
+                        logger.debug("Range chunk completed", 
+                                chunk_id=chunk_id,
+                                success_count=success_count,
+                                total_count=total_count)
+                    else:
+                        self._mark_chunk_failed(chunk_id, start_slot, end_slot, loader_name, "No data processed")
+                        
             except Exception as e:
-                logger.error("Failed to process chunk", 
+                logger.error("Failed to process loader in chunk", 
                             loader=loader_name,
-                            chunk_id=chunk_id,
                             start_slot=start_slot,
                             end_slot=end_slot,
                             error=str(e))
                 
-                self._mark_chunk_failed(chunk_id, start_slot, end_slot, loader_name, str(e))
-                chunk_results[loader_name] = (0, end_slot - start_slot + 1)
+                # Mark appropriate chunks as failed
+                if loader_name == "validators":
+                    # Don't create failed chunks for validators - they're handled individually above
+                    chunk_results[loader_name] = (0, 0)
+                else:
+                    chunk_id = f"{loader_name}_{start_slot}_{end_slot}"
+                    self._mark_chunk_failed(chunk_id, start_slot, end_slot, loader_name, str(e))
+                    chunk_results[loader_name] = (0, end_slot - start_slot + 1)
         
         # Return success if any loader processed data successfully
         total_success = sum(result[0] for result in chunk_results.values())
@@ -182,11 +220,11 @@ class LoaderService:
         
         if total_success > 0:
             logger.info("Realtime chunk completed", 
-                       start_slot=start_slot,
-                       end_slot=end_slot,
-                       success_count=total_success,
-                       total_count=total_processed,
-                       loaders=list(chunk_results.keys()))
+                    start_slot=start_slot,
+                    end_slot=end_slot,
+                    success_count=total_success,
+                    total_count=total_processed,
+                    loaders=list(chunk_results.keys()))
         
         return total_success > 0
     

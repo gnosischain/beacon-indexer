@@ -34,7 +34,7 @@ class Config:
     START_SLOT = int(os.getenv("START_SLOT", "0"))
     END_SLOT = int(os.getenv("END_SLOT", "0")) if os.getenv("END_SLOT") else None
     BACKFILL_WORKERS = int(os.getenv("BACKFILL_WORKERS", "4"))
-    CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1000"))
+    CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "100"))
     
     # Logging
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
