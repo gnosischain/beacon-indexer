@@ -832,3 +832,21 @@ class ClickHouse:
         
         # Use normal smart batching for other tables
         self.insert_batch(table, data)
+
+    def close_all_connections(self):
+        """Close all connections to free memory."""
+        try:
+            # Close main client
+            if hasattr(self.client, 'close'):
+                self.client.close()
+            
+            # Close pool connections
+            if hasattr(self, '_connection_pool'):
+                while self._connection_pool:
+                    conn = self._connection_pool.pop()
+                    if hasattr(conn, 'close'):
+                        conn.close()
+            
+            logger.debug("All ClickHouse connections closed")
+        except Exception as e:
+            logger.warning("Error closing connections", error=str(e))

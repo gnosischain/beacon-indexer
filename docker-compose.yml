@@ -68,6 +68,8 @@ services:
       - PARQUET_ROWS_PER_FILE=${PARQUET_ROWS_PER_FILE}
       - ENABLED_LOADERS=${ENABLED_LOADERS}
       - VALIDATOR_MODE=${VALIDATOR_MODE}
+      - CHUNK_SIZE=${CHUNK_SIZE}
+      - REALTIME_SLOT_DELAY=${REALTIME_SLOT_DELAY}
       - LOG_LEVEL=${LOG_LEVEL}
     volumes:
       - ./parquet_data:/app/parquet_data
@@ -122,3 +124,26 @@ services:
     restart: unless-stopped
     profiles:
       - transform-continuous
+
+  maintenance:
+    image: beacon-indexer:latest
+    container_name: maintenance
+    environment:
+      - STORAGE_BACKEND=${STORAGE_BACKEND}
+      - BEACON_NODE_URL=${BEACON_NODE_URL}
+      - CLICKHOUSE_HOST=${CLICKHOUSE_HOST}
+      - CLICKHOUSE_PORT=${CLICKHOUSE_PORT}
+      - CLICKHOUSE_USER=${CLICKHOUSE_USER}
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
+      - CLICKHOUSE_DATABASE=${CLICKHOUSE_DATABASE}
+      - CLICKHOUSE_SECURE=${CLICKHOUSE_SECURE}
+      - ENABLED_LOADERS=${ENABLED_LOADERS}
+      - VALIDATOR_MODE=${VALIDATOR_MODE}
+      - BACKFILL_WORKERS=${BACKFILL_WORKERS}
+      - CHUNK_SIZE=${CHUNK_SIZE}
+      - REALTIME_SLOT_DELAY=${REALTIME_SLOT_DELAY}
+      - LOG_LEVEL=${LOG_LEVEL}
+    volumes:
+      - ./parquet_data:/app/parquet_data
+    profiles:
+      - maintenance

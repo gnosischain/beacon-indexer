@@ -35,6 +35,9 @@ class Config:
     END_SLOT = int(os.getenv("END_SLOT", "0")) if os.getenv("END_SLOT") else None
     BACKFILL_WORKERS = int(os.getenv("BACKFILL_WORKERS", "4"))
     CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "100"))
+
+    # Realtime Configuration
+    REALTIME_SLOT_DELAY = int(os.getenv("REALTIME_SLOT_DELAY", "0"))
     
     # Logging
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")

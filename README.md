@@ -144,6 +144,301 @@ FROM blocks
 GROUP BY version as fork;
 ```
 
+
+## Maintenance System Usage Guide
+
+The maintenance system provides powerful tools to fix failed chunks, check data integrity, and maintain your beacon chain indexer.
+
+### Quick Start
+
+#### 1. Check System Status
+```bash
+# Get overall system health
+make maintenance-status
+
+# Or directly:
+docker compose run --rm backfill python scripts/maintenance.py summary
+```
+
+#### 2. Find and Fix Issues
+```bash
+# Check for issues in a specific range
+make maintenance-check
+# Enter start slot: 9000000
+# Enter end slot: 9100000
+
+# Fix failed chunks
+make maintenance-fix  
+# Enter start slot: 9000000
+# Enter end slot: 9100000
+# Enter loaders: blocks,validators (or press enter for all)
+# Force reprocess: N
+```
+
+#### 3. Quick Maintenance
+```bash
+# Show recommendations
+make maintenance-quick-check
+
+# Fix recent failures (last week)
+make maintenance-fix-recent
+```
+
+### Detailed Commands
+
+#### Analysis Commands
+
+```bash
+# Show failed chunks with details
+make maintenance-failed
+
+# Analyze data gaps in raw tables
+make maintenance-gaps
+
+# Check transformation status
+docker compose run --rm backfill python scripts/maintenance.py status
+```
+
+#### Maintenance Commands
+
+```bash
+# 1. Integrity Check
+python -m src.main maintain check --start-slot 9000000 --end-slot 9100000 --detailed
+
+# 2. Fix Failed Chunks (normal mode - only failed chunks)
+python -m src.main maintain fix --start-slot 9000000 --end-slot 9100000
+
+# 3. Fix Specific Loaders
+python -m src.main maintain fix --start-slot 9000000 --end-slot 9100000 --loaders blocks,validators
+
+# 4. Force Mode (reprocess even successful chunks)
+python -m src.main maintain fix --start-slot 9000000 --end-slot 9100000 --force
+
+# 5. Dry Run (preview what would be fixed)
+python -m src.main maintain fix --start-slot 9000000 --end-slot 9100000 --dry-run
+
+# 6. Reset Chunk Status
+python -m src.main maintain reset --start-slot 9000000 --end-slot 9100000 --status failed
+```
+
+#### Docker Usage
+
+```bash
+# Using maintenance profile
+docker compose --profile maintenance run --rm maintenance python -m src.main maintain check --start-slot 9000000 --end-slot 9100000
+
+# Using backfill service
+docker compose run --rm backfill python -m src.main maintain fix --start-slot 9000000 --end-slot 9100000
+```
+
+### Common Scenarios
+
+#### Scenario 1: Failed Chunks After Network Issues
+
+**Problem**: Some chunks failed during loading due to network connectivity issues.
+
+**Solution**:
+```bash
+# 1. Check what failed
+make maintenance-failed
+
+# 2. Fix failed chunks in affected range
+python -m src.main maintain fix --start-slot 9050000 --end-slot 9060000
+
+# 3. Verify fix
+python -m src.main maintain check --start-slot 9050000 --end-slot 9060000
+```
+
+#### Scenario 2: Missing Data (Gaps)
+
+**Problem**: Some slots are missing from raw data tables.
+
+**Solution**:
+```bash
+# 1. Analyze gaps
+make maintenance-gaps
+
+# 2. Force reprocess the range with gaps
+python -m src.main maintain fix --start-slot 9040000 --end-slot 9050000 --force
+
+# 3. Check if gaps are filled
+make maintenance-gaps
+```
+
+#### Scenario 3: Stuck Workers
+
+**Problem**: Workers got stuck and chunks are in 'claimed' status for hours.
+
+**Solution**:
+```bash
+# 1. Check for stuck chunks
+docker compose run --rm backfill python scripts/maintenance.py recommendations
+
+# 2. Reset stuck chunks to pending
+python -m src.main maintain reset --start-slot 0 --end-slot 999999999 --status claimed
+
+# 3. Restart backfill workers
+make backfill
+```
+
+#### Scenario 4: Transformation Issues
+
+**Problem**: Raw data loaded but transformation failed.
+
+**Solution**:
+```bash
+# 1. Check transformation status
+docker compose run --rm backfill python scripts/maintenance.py status
+
+# 2. Fix failed ranges (this will re-run transformation)
+python -m src.main maintain fix --start-slot 9000000 --end-slot 9100000
+
+# 3. Or manually run transformer
+python -m src.main transform batch
+```
+
+#### Scenario 5: Complete Range Reprocessing
+
+**Problem**: Need to completely reprocess a range due to data corruption.
+
+**Solution**:
+```bash
+# 1. Dry run to see what will happen
+python -m src.main maintain fix --start-slot 9000000 --end-slot 9010000 --force --dry-run
+
+# 2. Force reprocess everything in range
+python -m src.main maintain fix --start-slot 9000000 --end-slot 9010000 --force
+
+# This will:
+# - Delete all raw and transformed data in range
+# - Reset chunks to pending
+# - Reload from beacon API
+# - Re-transform the data
+```
+
+### Command Reference
+
+#### `maintain check`
+Checks data integrity without making changes.
+
+**Options**:
+- `--start-slot`: Start of slot range
+- `--end-slot`: End of slot range  
+- `--detailed`: Show detailed gap analysis
+
+**Example**:
+```bash
+python -m src.main maintain check --start-slot 9000000 --end-slot 9100000 --detailed
+```
+
+#### `maintain fix`
+Fixes failed chunks by cleaning up data and reprocessing.
+
+**Options**:
+- `--start-slot`: Start of slot range
+- `--end-slot`: End of slot range
+- `--loaders`: Comma-separated list of loaders (blocks,validators,rewards)
+- `--force`: Reprocess even if chunks are not failed
+- `--dry-run`: Show what would be fixed without doing it
+
+**Example**:
+```bash
+python -m src.main maintain fix --start-slot 9000000 --end-slot 9100000 --loaders blocks --force
+```
+
+#### `maintain reset`
+Resets chunk status from one state to pending.
+
+**Options**:
+- `--start-slot`: Start of slot range
+- `--end-slot`: End of slot range
+- `--loaders`: Comma-separated list of loaders
+- `--status`: Current status to reset (failed, claimed, completed)
+
+**Example**:
+```bash
+python -m src.main maintain reset --start-slot 9000000 --end-slot 9100000 --status claimed
+```
+
+### Maintenance Scripts
+
+#### `scripts/maintenance.py`
+Utility script for analysis and monitoring.
+
+**Commands**:
+- `failed`: Show failed chunks
+- `gaps`: Analyze data gaps
+- `status`: Show transformation status
+- `summary`: System overview
+- `recommendations`: Maintenance recommendations
+
+**Examples**:
+```bash
+python scripts/maintenance.py summary
+python scripts/maintenance.py recommendations
+python scripts/maintenance.py failed
+```
+
+### Safety Features
+
+#### 1. Dry Run Mode
+Always test with `--dry-run` first to see what would happen:
+```bash
+python -m src.main maintain fix --start-slot 9000000 --end-slot 9100000 --dry-run
+```
+
+#### 2. Scope Limiting
+- Only operates on specified slot ranges
+- Can be limited to specific loaders
+- Respects ENABLED_LOADERS configuration
+
+#### 3. Data Integrity
+- Uses database transactions where possible
+- Logs all operations for audit trail
+- Verifies data before and after operations
+
+### Monitoring Integration
+
+#### Continuous Monitoring
+Set up regular checks:
+```bash
+# Daily health check
+0 6 * * * cd /path/to/beacon-indexer && make maintenance-quick-check
+
+# Weekly comprehensive check  
+0 2 * * 0 cd /path/to/beacon-indexer && docker compose run --rm backfill python -m src.main maintain check --start-slot 8000000 --end-slot 999999999 > weekly_check.log
+```
+
+#### Alerting
+Monitor the output of maintenance scripts and alert on:
+- High number of failed chunks
+- Large data gaps
+- Untransformed data accumulating
+
+### Troubleshooting
+
+#### Issue: "Maintenance command only works with ClickHouse backend"
+**Solution**: Maintenance commands require ClickHouse. Set `STORAGE_BACKEND=clickhouse` in your `.env`.
+
+#### Issue: Permission errors during data cleanup
+**Solution**: Ensure the container has proper permissions and the database user has DELETE privileges.
+
+#### Issue: Out of memory during large fixes
+**Solution**: Process smaller ranges or reduce CHUNK_SIZE in configuration.
+
+#### Issue: Fix command hangs
+**Solution**: Check beacon node connectivity and increase timeouts if needed.
+
+## Best Practices
+
+1. **Always check before fixing**: Use `maintain check` first
+2. **Start small**: Test with small slot ranges first
+3. **Use dry run**: Always dry run first for large operations
+4. **Monitor during maintenance**: Watch logs during fix operations
+5. **Backup critical data**: Consider backing up important ranges before major fixes
+6. **Schedule maintenance**: Run during low-activity periods
+7. **Document issues**: Keep track of what ranges needed fixing and why
+
 ## License
 
 This project is licensed under the [MIT License](LICENSE)
