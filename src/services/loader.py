@@ -45,25 +45,19 @@ class LoaderService:
         logger.info("Starting realtime loader with chunk management",
                 slot_delay=config.REALTIME_SLOT_DELAY)
         
-        # First, ensure specs and genesis are loaded
         await self._ensure_foundation_data()
-        
-        # Get the last slot we have in raw data
         last_slot = self._get_last_raw_slot()
         
         while True:
             try:
-                # Get current head slot
                 head_slot = await self.beacon_api.get_head_slot()
                 if head_slot is None:
                     logger.warning("Could not get head slot, retrying...")
-                    await asyncio.sleep(12)  # Wait one slot
+                    await asyncio.sleep(12)
                     continue
                 
-                # Apply slot delay if configured
                 target_slot = head_slot - config.REALTIME_SLOT_DELAY
                 
-                # Don't process if we're caught up to target
                 if last_slot >= target_slot:
                     logger.debug("Caught up to target slot", 
                             last_slot=last_slot,
@@ -73,16 +67,17 @@ class LoaderService:
                     await asyncio.sleep(6)
                     continue
                 
-                # Process new slots in chunk-sized batches
                 processed_any = False
-                current_slot = last_slot + 1
+                
+                # Start at next chunk boundary after last_slot
+                next_chunk_start = ((last_slot // config.CHUNK_SIZE) + 1) * config.CHUNK_SIZE
+                current_slot = next_chunk_start
                 
                 while current_slot <= target_slot:
-                    # Calculate chunk boundaries
                     chunk_start = current_slot
                     chunk_end = min(
-                        self._get_chunk_end(chunk_start),  # Align to chunk boundaries
-                        target_slot  # Changed from head_slot
+                        current_slot + config.CHUNK_SIZE - 1,
+                        target_slot
                     )
                     
                     success = await self._process_chunk_realtime(chunk_start, chunk_end)
@@ -91,8 +86,8 @@ class LoaderService:
                         processed_any = True
                         current_slot = chunk_end + 1
                     else:
-                        # If chunk fails, try next slot individually to avoid getting stuck
-                        current_slot += 1
+                        # Skip to next chunk boundary on failure
+                        current_slot = ((chunk_start // config.CHUNK_SIZE) + 1) * config.CHUNK_SIZE
                 
                 if processed_any:
                     logger.info("Processed realtime chunks", 
@@ -101,25 +96,11 @@ class LoaderService:
                             target_slot=target_slot,
                             behind_head=head_slot - last_slot)
                 
-                # Wait before next check
-                await asyncio.sleep(6)  
+                await asyncio.sleep(6)
                 
             except Exception as e:
                 logger.error("Error in realtime loader", error=str(e))
                 await asyncio.sleep(12)
-    
-    def _get_chunk_end(self, start_slot: int) -> int:
-        """Calculate chunk end slot aligned to CHUNK_SIZE boundaries."""
-        # Fix: Use proper chunk size alignment
-        chunk_start = (start_slot // config.CHUNK_SIZE) * config.CHUNK_SIZE
-        chunk_end = chunk_start + config.CHUNK_SIZE - 1
-        
-        # If start_slot is already at chunk boundary, use it
-        if start_slot == chunk_start:
-            return chunk_end
-        else:
-            # Otherwise, go to next chunk boundary
-            return chunk_start + config.CHUNK_SIZE + config.CHUNK_SIZE - 1
     
     async def _process_chunk_realtime(self, start_slot: int, end_slot: int) -> bool:
         """Process a chunk of slots with proper chunk tracking."""
