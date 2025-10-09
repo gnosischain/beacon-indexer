@@ -8,14 +8,16 @@ from src.parsers.rewards import RewardsParser
 from src.utils.logger import logger
 
 class TransformerService:
-    """Simple, fast transformer with parallel writes."""
+    """Simple, fast transformer with parallel writes and memory-aware batching."""
     
     # Class constants - all hardcoded values defined here
-    MAX_CONCURRENT_WRITES = 8      # Write 8 batches simultaneously 
+    MAX_CONCURRENT_WRITES = 4      # Reduced concurrent writes for memory safety
     VALIDATOR_WRITE_CHUNK = 5000   # Write 5K validators per chunk
+    TRANSACTION_WRITE_CHUNK = 100  # Very small chunks for transactions (memory intensive)
+    ATTESTATION_WRITE_CHUNK = 500  # Small chunks for attestations
     CHUNKS_PER_FETCH = 50          # Chunks to fetch per round
     VALIDATORS_BATCH_SIZE = 20000  # Validator batch processing size
-    CHUNKS_PER_BATCH = 20          # Process chunks in parallel batches
+    CHUNKS_PER_BATCH = 10          # Process chunks in parallel batches (reduced for memory)
     
     def __init__(self):
         self.storage = create_storage()
@@ -54,6 +56,8 @@ class TransformerService:
                    enabled_loaders=list(self.enabled_loaders),
                    max_concurrent_writes=self.MAX_CONCURRENT_WRITES,
                    validator_write_chunk=self.VALIDATOR_WRITE_CHUNK,
+                   transaction_chunk=self.TRANSACTION_WRITE_CHUNK,
+                   attestation_chunk=self.ATTESTATION_WRITE_CHUNK,
                    chunks_per_fetch=self.CHUNKS_PER_FETCH)
     
     async def initialize(self):
@@ -132,43 +136,47 @@ class TransformerService:
                                    loader=loader_name, 
                                    chunks=len(chunks))
                         
-                        # Process chunks in parallel
-                        chunk_tasks = []
-                        for i, chunk in enumerate(chunks[:self.CHUNKS_PER_BATCH]):  # Use class constant
-                            task = asyncio.create_task(
-                                self._process_chunk_simple(loader_name, chunk)
-                            )
-                            chunk_tasks.append(task)
+                        # Process chunks in parallel batches
+                        for batch_start in range(0, len(chunks), self.CHUNKS_PER_BATCH):
+                            batch_end = min(batch_start + self.CHUNKS_PER_BATCH, len(chunks))
+                            batch_chunks = chunks[batch_start:batch_end]
                             
-                            # Log progress every 5 chunks
-                            if (i + 1) % 5 == 0:
-                                logger.info("Started chunk batch", 
-                                           loader=loader_name,
-                                           started=i + 1,
-                                           total=min(len(chunks), self.CHUNKS_PER_BATCH))
-                        
-                        # Wait for all chunks to complete with progress updates
-                        logger.info("Processing chunks in parallel", 
-                                   loader=loader_name,
-                                   total_chunks=len(chunk_tasks))
-                        
-                        results = await asyncio.gather(*chunk_tasks, return_exceptions=True)
-                        successful = sum(1 for r in results if r is True)
-                        failed = len(results) - successful
-                        
-                        # Log failures for debugging
-                        if failed > 0:
-                            failed_errors = [str(r) for r in results if r is not True]
-                            logger.error("Chunk processing failures", 
+                            logger.info("Processing chunk batch", 
                                        loader=loader_name,
+                                       batch_num=batch_start // self.CHUNKS_PER_BATCH + 1,
+                                       batch_size=len(batch_chunks),
+                                       total_chunks=len(chunks))
+                            
+                            # Process chunks in parallel
+                            chunk_tasks = []
+                            for chunk in batch_chunks:
+                                task = asyncio.create_task(
+                                    self._process_chunk_simple(loader_name, chunk)
+                                )
+                                chunk_tasks.append(task)
+                            
+                            # Wait for all chunks to complete
+                            logger.info("Processing chunks in parallel", 
+                                       loader=loader_name,
+                                       total_chunks=len(chunk_tasks))
+                            
+                            results = await asyncio.gather(*chunk_tasks, return_exceptions=True)
+                            successful = sum(1 for r in results if r is True)
+                            failed = len(results) - successful
+                            
+                            # Log failures for debugging
+                            if failed > 0:
+                                failed_errors = [str(r) for r in results if r is not True]
+                                logger.error("Chunk processing failures", 
+                                           loader=loader_name,
+                                           failed=failed,
+                                           errors=failed_errors[:3])  # Show first 3 errors
+                            
+                            logger.info("Chunks completed", 
+                                       loader=loader_name,
+                                       successful=successful,
                                        failed=failed,
-                                       errors=failed_errors[:3])  # Show first 3 errors
-                        
-                        logger.info("Chunks completed", 
-                                   loader=loader_name,
-                                   successful=successful,
-                                   failed=failed,
-                                   total=len(chunk_tasks))
+                                       total=len(chunk_tasks))
                 
                 if processed_any:
                     consecutive_empty_rounds = 0
@@ -226,7 +234,7 @@ class TransformerService:
         })
 
     async def _process_chunk_simple(self, loader_name: str, chunk: Dict) -> bool:
-        """Process chunk - simple approach."""
+        """Process chunk - simple approach with memory management."""
         config_data = self.loader_configs[loader_name]
         raw_table = config_data["raw_table"]
         start_slot = chunk["start_slot"]
@@ -259,14 +267,14 @@ class TransformerService:
                                              processed_count, failed_count, f'{failed_count} parse failures')
                 return False
             
-            # Write ALL data in parallel chunks
+            # Write ALL data in parallel chunks with memory management
             if all_tables_data:
                 try:
                     await self._write_data_parallel(all_tables_data)
                 except Exception as write_error:
                     error_msg = f"Write error: {str(write_error)}"
                     self._record_processing_result(raw_table, start_slot, end_slot, 'failed', 
-                                                 processed_count, 1, error_msg)
+                                                 processed_count, 1, error_msg[:500])  # Limit error message length
                     
                     logger.error("Write failed for chunk", 
                                 loader=loader_name,
@@ -288,7 +296,7 @@ class TransformerService:
             
         except Exception as e:
             error_msg = f"Processing error: {str(e)}"
-            self._record_processing_result(raw_table, start_slot, end_slot, 'failed', 0, 1, error_msg)
+            self._record_processing_result(raw_table, start_slot, end_slot, 'failed', 0, 1, error_msg[:500])
             
             logger.error("Chunk processing failed", 
                         loader=loader_name,
@@ -332,23 +340,42 @@ class TransformerService:
         return [{"slot": row["slot"], "payload": row["payload"]} for row in result]
     
     async def _write_data_parallel(self, all_tables_data: Dict[str, List[Dict]]):
-        """Write data in parallel chunks - THIS IS THE KEY OPTIMIZATION."""
+        """Write data in parallel chunks - MEMORY-AWARE VERSION."""
         write_tasks = []
         
         for table_name, rows in all_tables_data.items():
             if not rows:
                 continue
             
-            if table_name == "validators" and len(rows) > self.VALIDATOR_WRITE_CHUNK:
-                # Split validators into parallel write chunks
-                for i in range(0, len(rows), self.VALIDATOR_WRITE_CHUNK):
-                    chunk = rows[i:i + self.VALIDATOR_WRITE_CHUNK]
+            # Determine chunk size based on table type
+            if table_name == "transactions":
+                chunk_size = self.TRANSACTION_WRITE_CHUNK  # 100 rows
+            elif table_name == "attestations":
+                chunk_size = self.ATTESTATION_WRITE_CHUNK  # 500 rows
+            elif table_name == "validators":
+                chunk_size = self.VALIDATOR_WRITE_CHUNK    # 5000 rows
+            else:
+                # Other tables can use default size
+                chunk_size = 10000
+            
+            # Split data into appropriate chunks
+            if len(rows) > chunk_size:
+                for i in range(0, len(rows), chunk_size):
+                    chunk = rows[i:i + chunk_size]
                     task = asyncio.create_task(
                         self._write_chunk_with_semaphore(table_name, chunk)
                     )
                     write_tasks.append(task)
+                    
+                    # Log progress for large tables
+                    if (i // chunk_size) % 10 == 0 and len(rows) > chunk_size * 20:
+                        logger.debug("Creating write tasks", 
+                                   table=table_name,
+                                   chunks_created=(i // chunk_size) + 1,
+                                   total_rows=len(rows),
+                                   chunk_size=chunk_size)
             else:
-                # Write smaller tables normally
+                # Write small data as single chunk
                 task = asyncio.create_task(
                     self._write_chunk_with_semaphore(table_name, rows)
                 )
@@ -510,11 +537,21 @@ class TransformerService:
             "status": status,
             "processed_count": processed_count,
             "failed_count": failed_count,
-            "error_message": error_message,
+            "error_message": error_message[:500] if error_message else "",  # Limit error message length
             "processed_at": self.storage.execute("SELECT now() as now")[0]["now"]
         }
         
         self.storage.insert_batch("transformer_progress", [row])
+    
+    async def reprocess(self, start_slot: int, end_slot: int, batch_size: int = 100):
+        """Reprocess a specific slot range."""
+        logger.info("Reprocessing slot range", 
+                   start_slot=start_slot,
+                   end_slot=end_slot,
+                   batch_size=batch_size)
+        
+        # Not implemented yet
+        logger.warning("Reprocess not implemented yet")
 
     def get_processing_status(self) -> Dict[str, Dict]:
         """Get processing status."""
@@ -559,3 +596,24 @@ class TransformerService:
                 }
         
         return status
+    
+    def get_failed_ranges(self, limit: int = 10) -> List[Dict]:
+        """Get recent failed transformation ranges."""
+        if config.STORAGE_BACKEND.lower() == "parquet":
+            return []
+        
+        query = """
+        SELECT 
+            raw_table_name,
+            start_slot,
+            end_slot,
+            failed_count,
+            error_message,
+            processed_at
+        FROM transformer_progress FINAL
+        WHERE status = 'failed'
+        ORDER BY processed_at DESC
+        LIMIT {limit:UInt64}
+        """
+        
+        return self.storage.execute(query, {"limit": limit})
