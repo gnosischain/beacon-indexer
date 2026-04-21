@@ -3,6 +3,7 @@ Prometheus metrics and lightweight health endpoints for beacon-indexer.
 """
 import json
 import logging
+import re
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Dict
@@ -118,6 +119,25 @@ _health_state: Dict[str, Any] = {
 }
 _health_lock = threading.Lock()
 _metrics_server = None
+
+
+def normalize_api_endpoint(endpoint: str) -> str:
+    """Collapse dynamic Beacon API path labels to bounded-cardinality routes."""
+    path = endpoint.split("?", 1)[0]
+
+    replacements = (
+        (r"^/eth/v2/beacon/blocks/[^/]+$", "/eth/v2/beacon/blocks/{block_id}"),
+        (r"^/eth/v1/beacon/rewards/blocks/[^/]+$", "/eth/v1/beacon/rewards/blocks/{block_id}"),
+        (r"^/eth/v1/debug/beacon/data_column_sidecars/[^/]+$", "/eth/v1/debug/beacon/data_column_sidecars/{slot}"),
+        (r"^/eth/v1/beacon/blobs/[^/]+$", "/eth/v1/beacon/blobs/{block_id}"),
+        (r"^/eth/v1/beacon/states/[^/]+/validators$", "/eth/v1/beacon/states/{state_id}/validators"),
+    )
+
+    for pattern, label in replacements:
+        if re.match(pattern, path):
+            return label
+
+    return path
 
 
 def update_health(**kwargs):

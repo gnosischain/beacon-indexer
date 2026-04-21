@@ -47,7 +47,7 @@ class BeaconAPI:
             await self.start()
         
         url = f"{self.base_url}{endpoint}"
-        endpoint_name = endpoint.split("?")[0]
+        endpoint_name = obs.normalize_api_endpoint(endpoint)
         
         for attempt in range(self.max_retries):
             start_time = time.monotonic()
