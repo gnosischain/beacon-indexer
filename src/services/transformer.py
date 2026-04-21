@@ -5,6 +5,8 @@ from src.config import config
 from src.services.storage_factory import create_storage
 from src.parsers.validators import ValidatorsParser
 from src.parsers.rewards import RewardsParser
+from src.parsers.data_column_sidecars import DataColumnSidecarsParser
+from src import observability as obs
 from src.utils.logger import logger
 
 class TransformerService:
@@ -32,7 +34,12 @@ class TransformerService:
             self.loader_configs = {
                 "blocks": {"raw_table": "raw_blocks", "use_final": False, "fork_aware": True},
                 "validators": {"raw_table": "raw_validators", "use_final": True, "fork_aware": False},
-                "rewards": {"raw_table": "raw_rewards", "use_final": True, "fork_aware": False}
+                "rewards": {"raw_table": "raw_rewards", "use_final": True, "fork_aware": False},
+                "data_column_sidecars": {
+                    "raw_table": "raw_data_column_sidecars",
+                    "use_final": True,
+                    "fork_aware": False
+                }
             }
             
             # Only include enabled loaders
@@ -47,6 +54,7 @@ class TransformerService:
         
         self.validator_parser = ValidatorsParser()
         self.rewards_parser = RewardsParser()
+        self.data_column_sidecars_parser = DataColumnSidecarsParser()
         
         # Write semaphore for parallel writes
         self._write_semaphore = asyncio.Semaphore(self.MAX_CONCURRENT_WRITES)
@@ -404,6 +412,10 @@ class TransformerService:
             try:
                 # Use concurrent insert method that gets its own connection
                 await self.storage.insert_batch_concurrent(table_name, data)
+                obs.rows_written_total.labels(table=table_name).inc(len(data))
+                if data and "slot" in data[0]:
+                    max_slot = max(row.get("slot", 0) for row in data)
+                    obs.highest_transformed_slot.labels(table=table_name).set(max_slot)
                 
                 logger.debug("Write chunk completed", 
                             table=table_name, 
@@ -425,7 +437,8 @@ class TransformerService:
                 "blob_sidecars", "blob_commitments", "execution_requests"
             },
             "validators": {"validators"},
-            "rewards": {"rewards"}
+            "rewards": {"rewards"},
+            "data_column_sidecars": {"data_column_sidecars"}
         }
         
         allowed_tables = loader_table_filter.get(loader_name, set())
@@ -468,6 +481,10 @@ class TransformerService:
                                     parser=parser.fork_name, 
                                     slot=raw_item.get("slot"), 
                                     error=str(e))
+                        obs.transform_failures_total.labels(
+                            loader=loader_name,
+                            fork=parser.fork_name
+                        ).inc()
                         total_failed += 1
                 
             except Exception as e:
@@ -475,6 +492,7 @@ class TransformerService:
                            fork=fork_name,
                            items=len(fork_data),
                            error=str(e))
+                obs.transform_failures_total.labels(loader=loader_name, fork=fork_name).inc(len(fork_data))
                 total_failed += len(fork_data)
         
         return all_tables_data, total_processed, total_failed
@@ -487,6 +505,9 @@ class TransformerService:
         elif loader_name == "rewards":
             parser = self.rewards_parser
             target_table = "rewards"
+        elif loader_name == "data_column_sidecars":
+            parser = self.data_column_sidecars_parser
+            target_table = "data_column_sidecars"
         else:
             raise ValueError(f"Unknown non-fork-aware loader: {loader_name}")
         
@@ -507,6 +528,7 @@ class TransformerService:
                 logger.error(f"{loader_name.title()} parser failed", 
                            slot=raw_item.get("slot"), 
                            error=str(e))
+                obs.transform_failures_total.labels(loader=loader_name, fork="none").inc()
                 failed_count += 1
         
         return all_tables_data, processed_count, failed_count
@@ -542,6 +564,11 @@ class TransformerService:
         }
         
         self.storage.insert_batch("transformer_progress", [row])
+        if status == "failed":
+            obs.transform_failures_total.labels(
+                loader=raw_table.replace("raw_", ""),
+                fork="unknown"
+            ).inc(max(failed_count, 1))
     
     async def reprocess(self, start_slot: int, end_slot: int, batch_size: int = 100):
         """Reprocess a specific slot range."""

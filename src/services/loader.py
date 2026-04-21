@@ -7,6 +7,7 @@ from src.services.beacon_api import BeaconAPI
 from src.services.storage_factory import create_storage
 from src.loaders import get_enabled_loaders
 from src.config import config
+from src import observability as obs
 from src.utils.logger import logger
 
 class LoaderService:
@@ -58,6 +59,7 @@ class LoaderService:
                     logger.warning("Could not get head slot, retrying...")
                     await asyncio.sleep(12)
                     continue
+                obs.chain_head_slot.set(head_slot)
                 
                 target_slot = head_slot - config.REALTIME_SLOT_DELAY
                 
@@ -107,6 +109,7 @@ class LoaderService:
                             head_slot=head_slot,
                             target_slot=target_slot,
                             behind_head=head_slot - last_slot)
+                    obs.chain_lag_slots.labels(stage="raw", name="all").set(head_slot - last_slot)
                 
                 await asyncio.sleep(6)
                 
@@ -311,6 +314,8 @@ class LoaderService:
         
         try:
             self.storage.insert_batch("load_state_chunks", [chunk_data])
+            obs.chunks_total.labels(loader=loader_name, status="completed").inc()
+            obs.highest_raw_slot.labels(loader=loader_name).set(end_slot)
         except Exception as e:
             logger.error("Failed to mark chunk completed", 
                         chunk_id=chunk_id, 
@@ -332,6 +337,7 @@ class LoaderService:
         
         try:
             self.storage.insert_batch("load_state_chunks", [chunk_data])
+            obs.chunks_total.labels(loader=loader_name, status="failed").inc()
             logger.warning("Marked chunk as failed", 
                           chunk_id=chunk_id, 
                           error=error_msg)
@@ -343,27 +349,23 @@ class LoaderService:
     def _get_last_raw_slot(self) -> int:
         """Get the highest slot we have in raw data across all tables."""
         try:
-            # Check both raw_blocks and raw_validators for the highest slot
-            blocks_query = "SELECT max(slot) as max_slot FROM raw_blocks"
-            validators_query = "SELECT max(slot) as max_slot FROM raw_validators FINAL"
-            
-            blocks_result = self.storage.execute(blocks_query)
-            validators_result = self.storage.execute(validators_query)
-            
-            max_blocks_slot = 0
-            max_validators_slot = 0
-            
-            if blocks_result and blocks_result[0]["max_slot"] is not None:
-                max_blocks_slot = blocks_result[0]["max_slot"]
-            
-            if validators_result and validators_result[0]["max_slot"] is not None:
-                max_validators_slot = validators_result[0]["max_slot"]
-            
-            last_slot = max(max_blocks_slot, max_validators_slot)
+            max_slots = {}
+            for loader_name in ("blocks", "validators", "rewards", "data_column_sidecars"):
+                raw_table = f"raw_{loader_name}"
+                use_final = " FINAL" if loader_name in {"validators", "rewards", "data_column_sidecars"} else ""
+                try:
+                    result = self.storage.execute(f"SELECT max(slot) as max_slot FROM {raw_table}{use_final}")
+                except Exception as e:
+                    logger.debug("Could not read raw max slot", loader=loader_name, error=str(e))
+                    continue
+                max_slot = result[0]["max_slot"] if result and result[0]["max_slot"] is not None else 0
+                max_slots[loader_name] = max_slot
+                obs.highest_raw_slot.labels(loader=loader_name).set(max_slot)
+
+            last_slot = max(max_slots.values()) if max_slots else 0
             logger.info("Starting realtime from last raw slot", 
                        last_slot=last_slot,
-                       max_blocks=max_blocks_slot,
-                       max_validators=max_validators_slot)
+                       max_slots=max_slots)
             
             return last_slot
             
@@ -490,7 +492,7 @@ class LoaderService:
         # Pre-load existing completed chunks for all loaders to avoid repeated FINAL queries
         existing_chunks_cache = {}
         for loader_name in enabled_loaders:
-            if loader_name in ["blocks", "validators", "rewards"]:
+            if loader_name in ["blocks", "validators", "rewards", "data_column_sidecars"]:
                 try:
                     logger.info("Pre-loading existing chunks", loader=loader_name)
                     
@@ -529,7 +531,7 @@ class LoaderService:
         for loader_name in enabled_loaders:
             logger.info("Generating chunks for loader", loader=loader_name)
             
-            if loader_name in ["blocks", "rewards"]:  # Both are slot-based
+            if loader_name in ["blocks", "rewards", "data_column_sidecars"]:  # Slot-based loaders
                 existing_chunks = existing_chunks_cache.get(loader_name, set())
                 
                 # FIX: Generate chunks with consistent boundaries
@@ -754,7 +756,7 @@ class LoaderService:
         # Pre-load existing completed chunks for all loaders to avoid repeated FINAL queries
         existing_chunks_cache = {}
         for loader_name in enabled_loaders:
-            if loader_name in ["blocks", "validators", "rewards"]:
+            if loader_name in ["blocks", "validators", "rewards", "data_column_sidecars"]:
                 try:
                     logger.info("Pre-loading existing chunks", loader=loader_name)
                     
@@ -793,7 +795,7 @@ class LoaderService:
         for loader_name in enabled_loaders:
             logger.info("Generating chunks for loader", loader=loader_name)
             
-            if loader_name in ["blocks", "rewards"]:  # Both are slot-based
+            if loader_name in ["blocks", "rewards", "data_column_sidecars"]:  # Slot-based loaders
                 existing_chunks = existing_chunks_cache.get(loader_name, set())
                 
                 # Blocks and Rewards: process all slots (FIXED: end_slot is now exclusive)

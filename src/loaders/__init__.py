@@ -3,13 +3,15 @@ from .validators import ValidatorsLoader
 from .specs import SpecsLoader
 from .genesis import GenesisLoader
 from .rewards import RewardsLoader
+from .data_column_sidecars import DataColumnSidecarsLoader
 
 LOADER_REGISTRY = {
     "blocks": BlocksLoader,
     "validators": ValidatorsLoader,
     "specs": SpecsLoader,
     "genesis": GenesisLoader,
-    "rewards": RewardsLoader
+    "rewards": RewardsLoader,
+    "data_column_sidecars": DataColumnSidecarsLoader
 }
 
 def get_enabled_loaders(enabled_names, beacon_api, clickhouse):

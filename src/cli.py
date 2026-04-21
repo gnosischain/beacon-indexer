@@ -5,6 +5,10 @@ from src.services.transformer import TransformerService
 from src.services.clickhouse import ClickHouse
 from src.services.fork import ForkDetectionService
 from src.services.maintenance import MaintenanceService 
+from src.services.storage_factory import create_storage
+from src.services.beacon_api import BeaconAPI
+from src.loaders.genesis import GenesisLoader
+from src.loaders.specs import SpecsLoader
 from src.utils.logger import setup_logger, logger
 from src.config import config
 
@@ -76,6 +80,9 @@ def create_parser():
     reset_parser.add_argument("--loaders", type=str, help="Comma-separated loader names (default: all)")
     reset_parser.add_argument("--status", type=str, choices=['failed', 'claimed', 'completed'], 
                              default='failed', help="Reset chunks with this status (default: failed)")
+
+    # Refresh specs
+    maintain_subparsers.add_parser("refresh-specs", help="Refresh chain specs from the beacon API")
     
     # Fork command
     fork_parser = subparsers.add_parser("fork", help="Fork-related operations")
@@ -94,6 +101,14 @@ def create_parser():
 async def main():
     """Main CLI entry point."""
     setup_logger()
+    if config.METRICS_ENABLED:
+        try:
+            from src.observability import start_metrics_server, update_health
+            start_metrics_server(config.METRICS_PORT)
+            update_health(status="ok", operation="cli_starting")
+        except Exception as e:
+            logger.warning("Failed to start metrics server", error=str(e))
+
     parser = create_parser()
     args = parser.parse_args()
     
@@ -197,6 +212,10 @@ async def handle_maintain_command(args):
     if config.STORAGE_BACKEND.lower() != "clickhouse":
         logger.error("Maintain command only works with ClickHouse backend")
         return
+
+    if args.maintain_command == "refresh-specs":
+        await refresh_specs_from_api()
+        return
     
     maintenance_service = MaintenanceService()
     
@@ -270,11 +289,34 @@ async def handle_maintain_command(args):
             print(f"✅ Reset {reset_count} chunks from '{args.status}' to 'pending'")
                 
         else:
-            print("Usage: maintain {fix|check|reset}")
+            print("Usage: maintain {fix|check|reset|refresh-specs}")
             
     finally:
         if hasattr(maintenance_service, 'loader_service') and maintenance_service.loader_service:
             await maintenance_service.loader_service.cleanup()
+
+
+async def refresh_specs_from_api():
+    """Refresh genesis/specs foundation data from the beacon API."""
+    beacon_api = BeaconAPI()
+    await beacon_api.start()
+    storage = create_storage()
+
+    try:
+        genesis_loader = GenesisLoader(beacon_api, storage)
+        specs_loader = SpecsLoader(beacon_api, storage)
+
+        genesis_ok = await genesis_loader.load_single(None)
+        if not genesis_ok:
+            raise RuntimeError("Failed to ensure genesis data")
+
+        specs_ok = await specs_loader.load_single(None)
+        if not specs_ok:
+            raise RuntimeError("Failed to refresh specs data")
+
+        print("✅ Specs refreshed from Beacon API")
+    finally:
+        await beacon_api.close()
 
 async def handle_fork_command(args):
     """Handle fork command with auto-detection."""

@@ -2,7 +2,7 @@ import hashlib
 import json
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional
-from src.services.beacon_api import BeaconAPI
+from src.services.beacon_api import BeaconAPI, BeaconAPIError
 from src.utils.logger import logger
 
 class BaseLoader(ABC):
@@ -57,6 +57,13 @@ class BaseLoader(ABC):
             self.store_data([row])
             return True
             
+        except BeaconAPIError as e:
+            logger.error("Beacon API error while loading data",
+                        loader=self.name,
+                        identifier=identifier,
+                        error=str(e))
+            return False
+
         except Exception as e:
             logger.error("Failed to load data", 
                         loader=self.name, 
@@ -68,6 +75,7 @@ class BaseLoader(ABC):
         """Load a batch of items."""
         rows = []
         success_count = 0
+        api_errors = 0
         
         for identifier in identifiers:
             try:
@@ -76,12 +84,20 @@ class BaseLoader(ABC):
                     row = self.prepare_row(identifier, data)
                     rows.append(row)
                 success_count += 1
-                
+            except BeaconAPIError as e:
+                api_errors += 1
+                logger.error("Beacon API error in batch",
+                           loader=self.name,
+                           identifier=identifier,
+                           error=str(e))
             except Exception as e:
                 logger.error("Failed to load single item in batch", 
                            loader=self.name, 
                            identifier=identifier, 
                            error=str(e))
+
+        if api_errors:
+            raise RuntimeError(f"{self.name} had {api_errors} Beacon API errors")
         
         if rows:
             self.store_data(rows)

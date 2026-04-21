@@ -38,6 +38,13 @@ class Config:
 
     # Realtime Configuration
     REALTIME_SLOT_DELAY = int(os.getenv("REALTIME_SLOT_DELAY", "0"))
+
+    # Fulu/Fusaka configuration for Gnosis mainnet
+    FULU_START_SLOT = int(os.getenv("FULU_START_SLOT", "27435008"))
+    
+    # Metrics
+    METRICS_ENABLED = os.getenv("METRICS_ENABLED", "true").lower() == "true"
+    METRICS_PORT = int(os.getenv("METRICS_PORT", "9090"))
     
     # Logging
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")

@@ -126,7 +126,9 @@ services:
       - transform-continuous
 
   maintenance:
-    image: beacon-indexer:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: maintenance
     environment:
       - STORAGE_BACKEND=${STORAGE_BACKEND}

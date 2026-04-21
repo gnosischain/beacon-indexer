@@ -30,10 +30,10 @@ class ParquetStorage:
         """Create necessary directory structure."""
         directories = [
             "genesis", "specs", "time_helpers",
-            "raw_blocks", "raw_validators", "raw_rewards", "raw_specs", "raw_genesis",
+            "raw_blocks", "raw_validators", "raw_rewards", "raw_data_column_sidecars", "raw_specs", "raw_genesis",
             "blocks", "attestations", "validators", "rewards",
             "execution_payloads", "transactions", "withdrawals", "bls_changes",
-            "blob_sidecars", "blob_commitments", "sync_aggregates", "sync_committees",
+            "blob_sidecars", "blob_commitments", "data_column_sidecars", "sync_aggregates", "sync_committees",
             "deposits", "voluntary_exits", "proposer_slashings", "attester_slashings",
             "execution_requests",
             "load_state_chunks", "transformer_progress"

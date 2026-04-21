@@ -1,7 +1,11 @@
 import os
 import yaml
 from typing import Dict, Optional, NamedTuple, List
+from src import observability as obs
 from src.utils.logger import logger
+
+GNOSIS_FULU_EPOCH = 1714688
+FAR_FUTURE_EPOCH = 18446744073709551615
 
 class ForkInfo(NamedTuple):
     name: str
@@ -41,7 +45,7 @@ class ForkDetectionService:
             
             self.network_mapping = config.get('network_mapping', {})
             self.all_fork_versions = config.get('fork_versions', {})
-            self.fork_order = config.get('fork_order', ['phase0', 'altair', 'bellatrix', 'capella', 'deneb', 'electra'])
+            self.fork_order = config.get('fork_order', ['phase0', 'altair', 'bellatrix', 'capella', 'deneb', 'electra', 'fulu'])
             
             logger.info("Minimal fork configuration loaded")
             
@@ -55,10 +59,11 @@ class ForkDetectionService:
         self.all_fork_versions = {
             "mainnet": {
                 "phase0": "0x00000000", "altair": "0x01000000", "bellatrix": "0x02000000",
-                "capella": "0x03000000", "deneb": "0x04000000", "electra": "0x05000000"
+                "capella": "0x03000000", "deneb": "0x04000000", "electra": "0x05000000",
+                "fulu": "0x06000000"
             }
         }
-        self.fork_order = ['phase0', 'altair', 'bellatrix', 'capella', 'deneb', 'electra']
+        self.fork_order = ['phase0', 'altair', 'bellatrix', 'capella', 'deneb', 'electra', 'fulu']
         logger.warning("Using fallback fork configuration")
     
     def _get_config_path(self) -> str:
@@ -83,10 +88,11 @@ class ForkDetectionService:
             'fork_versions': {
                 'mainnet': {
                     'phase0': '0x00000000', 'altair': '0x01000000', 'bellatrix': '0x02000000',
-                    'capella': '0x03000000', 'deneb': '0x04000000', 'electra': '0x05000000'
+                    'capella': '0x03000000', 'deneb': '0x04000000', 'electra': '0x05000000',
+                    'fulu': '0x06000000'
                 }
             },
-            'fork_order': ['phase0', 'altair', 'bellatrix', 'capella', 'deneb', 'electra']
+            'fork_order': ['phase0', 'altair', 'bellatrix', 'capella', 'deneb', 'electra', 'fulu']
         }
         
         config_path = 'forks_minimal.yaml'
@@ -107,9 +113,6 @@ class ForkDetectionService:
             # 3. Get genesis time
             genesis_time = self._get_genesis_time()
             
-            # 4. Get fork epochs - optimized version
-            fork_epochs = self._detect_fork_epochs_optimized()
-            
             if network_name and timing_params and genesis_time:
                 self.network_config = NetworkConfig(
                     name=network_name,
@@ -121,8 +124,14 @@ class ForkDetectionService:
                 # Set fork versions for this network
                 self.fork_versions = self.all_fork_versions.get(network_name, self.all_fork_versions.get('mainnet', {}))
                 
-                # Set fork epochs (from database analysis or defaults)
+                # Prefer specs, then fill any missing historical forks from static defaults.
+                fork_epochs = self._get_fork_epochs_from_specs(network_name)
+                default_epochs = self._get_default_fork_epochs(network_name)
+                for fork_name, fork_epoch in default_epochs.items():
+                    fork_epochs.setdefault(fork_name, fork_epoch)
+
                 self.fork_epochs = fork_epochs
+                self._publish_fork_metrics()
                 
                 logger.info("Auto-detected network configuration", 
                            network=network_name,
@@ -195,6 +204,51 @@ class ForkDetectionService:
             logger.error("Failed to get genesis time", error=str(e))
             
         return None
+
+    def _get_fork_epochs_from_specs(self, network_name: str) -> Dict[str, int]:
+        """Get configured fork epochs from specs table."""
+        try:
+            rows = self.clickhouse.execute("""
+                SELECT parameter_name, parameter_value
+                FROM specs FINAL
+                WHERE parameter_name LIKE '%_FORK_EPOCH'
+            """)
+        except Exception as e:
+            logger.warning("Failed to read fork epochs from specs", error=str(e))
+            rows = []
+
+        fork_epochs = {"phase0": 0}
+        for row in rows:
+            fork_name = row["parameter_name"].replace("_FORK_EPOCH", "").lower()
+            if fork_name not in self.fork_order:
+                continue
+
+            try:
+                epoch = int(row["parameter_value"])
+            except (TypeError, ValueError):
+                continue
+
+            if epoch == FAR_FUTURE_EPOCH:
+                continue
+            fork_epochs[fork_name] = epoch
+
+        if network_name == "gnosis":
+            # Gnosis Fusaka/Fulu activated at epoch 1714688. Keep this override
+            # until all historical specs rows in ClickHouse have been refreshed.
+            fork_epochs["fulu"] = GNOSIS_FULU_EPOCH
+
+        logger.info("Loaded fork epochs from specs", fork_epochs=fork_epochs)
+        return fork_epochs
+
+    def _publish_fork_metrics(self):
+        """Publish configured fork epochs as labels for dashboards and alerts."""
+        network_name = self.get_network_name()
+        for fork_name, fork_epoch in self.fork_epochs.items():
+            obs.active_fork_epoch.labels(
+                network=network_name,
+                fork=fork_name,
+                version=self.fork_versions.get(fork_name, "")
+            ).set(fork_epoch)
     
     def _detect_fork_epochs_optimized(self) -> Dict[str, int]:
         """Optimized fork detection using sampling instead of full table scan."""
@@ -264,18 +318,27 @@ class ForkDetectionService:
                 
                 if version and version != last_version:
                     epoch = slot // (self.slots_per_epoch or 32)
-                    
-                    # Map version to fork name
-                    for fork_name in self.fork_order[1:]:  # Skip phase0
-                        expected_version = self.fork_versions.get(fork_name)
-                        if version == expected_version and fork_name not in fork_epochs:
-                            fork_epochs[fork_name] = epoch
-                            logger.info("Detected fork transition", 
-                                       fork=fork_name, 
-                                       slot=slot, 
-                                       epoch=epoch, 
-                                       version=version)
-                            break
+
+                    version_normalized = version.lower()
+                    if version_normalized in self.fork_order and version_normalized not in fork_epochs:
+                        fork_epochs[version_normalized] = epoch
+                        logger.info("Detected fork transition by payload version",
+                                   fork=version_normalized,
+                                   slot=slot,
+                                   epoch=epoch,
+                                   version=version)
+                    else:
+                        # Map hex fork version to fork name when the payload uses versions.
+                        for fork_name in self.fork_order[1:]:  # Skip phase0
+                            expected_version = self.fork_versions.get(fork_name)
+                            if version == expected_version and fork_name not in fork_epochs:
+                                fork_epochs[fork_name] = epoch
+                                logger.info("Detected fork transition",
+                                           fork=fork_name,
+                                           slot=slot,
+                                           epoch=epoch,
+                                           version=version)
+                                break
                     
                     seen_versions.add(version)
                     last_version = version
@@ -297,14 +360,16 @@ class ForkDetectionService:
             logger.warning("Optimized fork detection failed, using defaults", error=str(e))
             return self._get_default_fork_epochs()
     
-    def _get_default_fork_epochs(self) -> Dict[str, int]:
+    def _get_default_fork_epochs(self, network_name: Optional[str] = None) -> Dict[str, int]:
         """Get default fork epochs based on network."""
-        network_name = getattr(self.network_config, 'name', 'mainnet') if self.network_config else 'mainnet'
+        if network_name is None:
+            network_name = getattr(self.network_config, 'name', 'mainnet') if self.network_config else 'mainnet'
         
         if network_name == 'gnosis':
             return {
                 'phase0': 0, 'altair': 512, 'bellatrix': 385536, 
-                'capella': 648704, 'deneb': 889856, 'electra': 1337856
+                'capella': 648704, 'deneb': 889856, 'electra': 1337856,
+                'fulu': GNOSIS_FULU_EPOCH
             }
         elif network_name == 'holesky':
             return {

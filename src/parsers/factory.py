@@ -8,6 +8,8 @@ from .bellatrix import BellatrixParser
 from .capella import CapellaParser
 from .deneb import DenebParser
 from .electra import ElectraParser
+from .fulu import FuluParser
+from src import observability as obs
 
 class ParserFactory:
     """Enhanced factory for creating fork-aware parsers with network-specific fork versions."""
@@ -25,7 +27,8 @@ class ParserFactory:
             "bellatrix": BellatrixParser(),
             "capella": CapellaParser(),
             "deneb": DenebParser(),
-            "electra": ElectraParser()
+            "electra": ElectraParser(),
+            "fulu": FuluParser()
         }
         
         # Inject fork service into all parsers for network-aware operations
@@ -51,9 +54,16 @@ class ParserFactory:
         if fork_name in self.parser_cache:
             return self.parser_cache[fork_name]
         
-        # Fallback to phase0 for unknown forks
-        logger.warning("Unknown fork, falling back to phase0", fork=fork_name)
-        return self.parser_cache["phase0"]
+        obs.unknown_fork_total.labels(fork=fork_name).inc()
+        fallback_name = "electra"
+        for configured_fork in reversed(self.fork_service.fork_order):
+            if configured_fork in self.parser_cache:
+                fallback_name = configured_fork
+                break
+        logger.warning("Unknown fork, falling back to latest compatible parser",
+                       fork=fork_name,
+                       fallback=fallback_name)
+        return self.parser_cache[fallback_name]
     
     def get_all_parsers(self) -> Dict[str, ForkBaseParser]:
         """Get all available parsers."""

@@ -41,6 +41,10 @@ class MaintenanceService:
             "rewards": {
                 "raw_table": "raw_rewards",
                 "transformed_tables": ["rewards"]
+            },
+            "data_column_sidecars": {
+                "raw_table": "raw_data_column_sidecars",
+                "transformed_tables": ["data_column_sidecars"]
             }
         }
         

@@ -15,6 +15,7 @@ fork_versions:
     capella: "0x03000000"
     deneb: "0x04000000"
     electra: "0x05000000"
+    fulu: "0x06000000"
   
   gnosis:
     phase0: "0x00000064"
@@ -23,6 +24,7 @@ fork_versions:
     capella: "0x03000064"
     deneb: "0x04000064"
     electra: "0x05000064"
+    fulu: "0x06000064"
 
 # Fork order (used for slot -> fork determination)
 fork_order:
@@ -32,3 +34,4 @@ fork_order:
   - capella
   - deneb
   - electra
+  - fulu

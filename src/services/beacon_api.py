@@ -1,8 +1,15 @@
 import aiohttp
 import asyncio
+import time
 from typing import Optional, Dict, Any
 from src.config import config
 from src.utils.logger import logger
+from src import observability as obs
+
+
+class BeaconAPIError(Exception):
+    """Raised when the beacon node returns an error that should fail the chunk."""
+    pass
 
 class BeaconAPI:
     """Beacon node API client with retry logic."""
@@ -40,10 +47,20 @@ class BeaconAPI:
             await self.start()
         
         url = f"{self.base_url}{endpoint}"
+        endpoint_name = endpoint.split("?")[0]
         
         for attempt in range(self.max_retries):
+            start_time = time.monotonic()
             try:
                 async with self.session.get(url) as response:
+                    obs.api_requests_total.labels(
+                        endpoint=endpoint_name,
+                        status=str(response.status)
+                    ).inc()
+                    obs.api_request_duration_seconds.labels(
+                        endpoint=endpoint_name
+                    ).observe(time.monotonic() - start_time)
+
                     if response.status == 404:
                         # Slot is empty (no block) - this is normal, not an error
                         return None
@@ -64,11 +81,19 @@ class BeaconAPI:
                             logger.error("API request failed after all retries", 
                                        url=url, 
                                        status=response.status)
-                            return None
+                            raise BeaconAPIError(f"{response.status}: {error_text[:300]}")
                     
-                    return await response.json()
+                    try:
+                        return await response.json()
+                    except Exception as e:
+                        logger.error("API response JSON decode failed", url=url, error=str(e))
+                        raise BeaconAPIError(f"Invalid JSON response from {endpoint_name}: {e}")
             
             except asyncio.TimeoutError:
+                obs.api_requests_total.labels(endpoint=endpoint_name, status="timeout").inc()
+                obs.api_request_duration_seconds.labels(
+                    endpoint=endpoint_name
+                ).observe(time.monotonic() - start_time)
                 logger.warning("API request timeout", 
                              url=url, 
                              attempt=attempt + 1,
@@ -78,9 +103,16 @@ class BeaconAPI:
                     continue
                 else:
                     logger.error("API request timeout after all retries", url=url)
-                    return None
+                    raise BeaconAPIError(f"Timeout requesting {endpoint_name}")
                     
+            except BeaconAPIError:
+                raise
+
             except Exception as e:
+                obs.api_requests_total.labels(endpoint=endpoint_name, status="error").inc()
+                obs.api_request_duration_seconds.labels(
+                    endpoint=endpoint_name
+                ).observe(time.monotonic() - start_time)
                 logger.warning("API request error", 
                              url=url, 
                              attempt=attempt + 1,
@@ -91,7 +123,7 @@ class BeaconAPI:
                     continue
                 else:
                     logger.error("API request error after all retries", url=url, error=str(e))
-                    return None
+                    raise BeaconAPIError(f"Error requesting {endpoint_name}: {e}")
         
         return None
     
@@ -127,3 +159,11 @@ class BeaconAPI:
     async def get_rewards(self, slot: str = "head") -> Optional[Dict[str, Any]]:
         """Get rewards by slot."""
         return await self.get(f"/eth/v1/beacon/rewards/blocks/{slot}")
+
+    async def get_data_column_sidecars(self, slot: int) -> Optional[Dict[str, Any]]:
+        """Get Fulu data column sidecars by slot."""
+        return await self.get(f"/eth/v1/debug/beacon/data_column_sidecars/{slot}")
+
+    async def get_blobs(self, slot: int) -> Optional[Dict[str, Any]]:
+        """Get blob data by slot."""
+        return await self.get(f"/eth/v1/beacon/blobs/{slot}")
