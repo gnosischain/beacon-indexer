@@ -2,6 +2,7 @@ import json
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 from .base import BaseLoader
+from src.services.beacon_api import BeaconAPIError
 from src.config import config
 from src.utils.logger import logger
 
@@ -201,7 +202,8 @@ class ValidatorsLoader(BaseLoader):
             # Process all slots
             rows = []
             success_count = 0
-            
+            api_errors = 0
+
             for slot in identifiers:
                 try:
                     data = await self.fetch_data(slot)
@@ -209,16 +211,26 @@ class ValidatorsLoader(BaseLoader):
                         row = self.prepare_row(slot, data)
                         rows.append(row)
                     success_count += 1
-                    
+
+                except BeaconAPIError as e:
+                    # A beacon-state error (e.g. a non-archive endpoint 404) must fail the
+                    # chunk loudly rather than be silently counted as a processed slot.
+                    api_errors += 1
+                    logger.error("Beacon API error in validator batch",
+                               loader=self.name, slot=slot, error=str(e))
                 except Exception as e:
-                    logger.error("Failed to load single slot in batch", 
-                               loader=self.name, 
-                               slot=slot, 
+                    logger.error("Failed to load single slot in batch",
+                               loader=self.name,
+                               slot=slot,
                                error=str(e))
-            
+
+            # Surface API errors so the caller marks the chunk failed (mirrors BaseLoader).
+            if api_errors:
+                raise RuntimeError(f"{self.name} had {api_errors} Beacon API errors")
+
             if rows:
                 self.store_data(rows)
-            
+
             return success_count
         else:
             # Filter slots based on daily mode
@@ -235,7 +247,8 @@ class ValidatorsLoader(BaseLoader):
                 
                 rows = []
                 success_count = 0
-                
+                api_errors = 0
+
                 for slot in target_slots:
                     try:
                         data = await self.fetch_data(slot)
@@ -243,16 +256,26 @@ class ValidatorsLoader(BaseLoader):
                             row = self.prepare_row(slot, data)
                             rows.append(row)
                         success_count += 1
-                        
+
+                    except BeaconAPIError as e:
+                        # A beacon-state error (e.g. a non-archive endpoint 404) must fail
+                        # the chunk loudly rather than be silently counted as processed.
+                        api_errors += 1
+                        logger.error("Beacon API error in validator batch",
+                                   loader=self.name, slot=slot, error=str(e))
                     except Exception as e:
-                        logger.error("Failed to load single slot in batch", 
-                                   loader=self.name, 
-                                   slot=slot, 
+                        logger.error("Failed to load single slot in batch",
+                                   loader=self.name,
+                                   slot=slot,
                                    error=str(e))
-                
+
+                # Surface API errors so the caller marks the chunk failed (mirrors BaseLoader).
+                if api_errors:
+                    raise RuntimeError(f"{self.name} had {api_errors} Beacon API errors")
+
                 if rows:
                     self.store_data(rows)
-                
+
                 return len(identifiers)  # Return total count, not just processed
             else:
                 logger.debug("No target slots found in batch", 

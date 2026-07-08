@@ -1,0 +1,4 @@
+# Test-only dependencies (not installed into the runtime image).
+#   pip install -r requirements-dev.txt
+pytest>=8.0
+pytest-asyncio>=0.23

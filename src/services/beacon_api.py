@@ -41,18 +41,40 @@ class BeaconAPI:
             await self.session.close()
             self.session = None
     
-    async def get(self, endpoint: str) -> Optional[Dict[str, Any]]:
-        """Make a GET request to the beacon API with retry logic."""
+    async def get(
+        self,
+        endpoint: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        allow_empty_404: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """Make a GET request to the beacon API with retry logic.
+
+        Args:
+            endpoint: API path, e.g. "/eth/v2/beacon/blocks/123".
+            params: Optional query parameters, merged with the configured API key.
+            allow_empty_404: When True (block-style endpoints) a 404 means "empty slot"
+                and returns None. When False (beacon-state endpoints, which always exist
+                for valid slots) a 404 is a real error and raises BeaconAPIError, so the
+                chunk fails loudly instead of being marked complete with zero rows.
+        """
         if not self.session:
             await self.start()
-        
+
         url = f"{self.base_url}{endpoint}"
         endpoint_name = obs.normalize_api_endpoint(endpoint)
-        
+
+        # Merge the configured API key into the query params. Keep it out of `url` so it
+        # never leaks into logs; aiohttp attaches it to the outgoing request only.
+        query: Dict[str, Any] = dict(params or {})
+        if config.BEACON_API_KEY:
+            query[config.BEACON_API_KEY_PARAM] = config.BEACON_API_KEY
+        request_params = query or None
+
         for attempt in range(self.max_retries):
             start_time = time.monotonic()
             try:
-                async with self.session.get(url) as response:
+                async with self.session.get(url, params=request_params) as response:
                     obs.api_requests_total.labels(
                         endpoint=endpoint_name,
                         status=str(response.status)
@@ -62,8 +84,17 @@ class BeaconAPI:
                     ).observe(time.monotonic() - start_time)
 
                     if response.status == 404:
-                        # Slot is empty (no block) - this is normal, not an error
-                        return None
+                        if allow_empty_404:
+                            # Slot is empty (no block) - this is normal, not an error
+                            return None
+                        # Beacon states always exist for valid slots; a 404 here means the
+                        # node cannot serve this historical state (e.g. a non-archive
+                        # endpoint). Fail loudly instead of silently returning zero rows.
+                        error_text = await response.text()
+                        logger.error("Beacon state not found (404)",
+                                     endpoint=endpoint_name,
+                                     error=error_text[:300])
+                        raise BeaconAPIError(f"404 state not found: {endpoint_name}")
                     
                     if response.status != 200:
                         error_text = await response.text()
@@ -143,12 +174,43 @@ class BeaconAPI:
                            validator_ids: Optional[list] = None) -> Optional[Dict[str, Any]]:
         """Get validators for a given state."""
         endpoint = f"/eth/v1/beacon/states/{state_id}/validators"
+        params = None
         if validator_ids:
             # Convert list to comma-separated string
-            ids_str = ",".join(map(str, validator_ids))
-            endpoint += f"?id={ids_str}"
-        return await self.get(endpoint)
+            params = {"id": ",".join(map(str, validator_ids))}
+        return await self.get(endpoint, params=params, allow_empty_404=False)
     
+    async def get_pending_consolidations(self, state_id: str = "head") -> Optional[Dict[str, Any]]:
+        """Get pending consolidations queue for a given state (Electra+).
+
+        Returns the PendingConsolidation[] list from the beacon state — post-validation,
+        pre-application queue. Entries here are guaranteed to apply (the spec's
+        process_consolidation_request drops invalid requests BEFORE they enter the queue).
+
+        The endpoint returns HTTP 400 for pre-Electra states; callers should fork-gate
+        via config.ELECTRA_START_SLOT to avoid noisy 400s on backfills of old slots.
+        """
+        return await self.get(f"/eth/v1/beacon/states/{state_id}/pending_consolidations", allow_empty_404=False)
+
+    async def get_pending_deposits(self, state_id: str = "head") -> Optional[Dict[str, Any]]:
+        """Get pending deposits queue for a given state (Electra+).
+
+        Returns the PendingDeposit[] list — the churn-bounded queue of deposits awaiting
+        activation. Each entry carries the exact `amount` that will be credited, which
+        removes the reported-vs-credited ambiguity that execution_requests has post-Pectra
+        (a single 2048-GNO request landing as ~1 GNO/day over weeks).
+        """
+        return await self.get(f"/eth/v1/beacon/states/{state_id}/pending_deposits", allow_empty_404=False)
+
+    async def get_pending_partial_withdrawals(self, state_id: str = "head") -> Optional[Dict[str, Any]]:
+        """Get pending partial withdrawals queue for a given state (Electra+).
+
+        Returns the PendingPartialWithdrawal[] list — scheduled partial withdrawals with
+        their `withdrawable_epoch` and `amount`. Needed to distinguish scheduled partial
+        withdrawals from full exits and from consolidation-driven sweeps.
+        """
+        return await self.get(f"/eth/v1/beacon/states/{state_id}/pending_partial_withdrawals", allow_empty_404=False)
+
     async def get_head_slot(self) -> Optional[int]:
         """Get the current head slot."""
         data = await self.get("/eth/v1/beacon/headers/head")
