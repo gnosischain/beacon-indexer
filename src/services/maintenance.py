@@ -29,13 +29,13 @@ class MaintenanceService:
                 "transformed_tables": [
                     "blocks", "attestations", "deposits", "voluntary_exits",
                     "proposer_slashings", "attester_slashings", "sync_aggregates",
-                    "execution_payloads", "transactions", "withdrawals", 
+                    "execution_payloads", "transactions", "withdrawals",
                     "bls_changes", "blob_sidecars", "blob_commitments",
                     "execution_requests"
                 ]
             },
             "validators": {
-                "raw_table": "raw_validators", 
+                "raw_table": "raw_validators",
                 "transformed_tables": ["validators"]
             },
             "rewards": {
@@ -45,7 +45,21 @@ class MaintenanceService:
             "data_column_sidecars": {
                 "raw_table": "raw_data_column_sidecars",
                 "transformed_tables": ["data_column_sidecars"]
-            }
+            },
+            # Electra+ beacon-state queue loaders. Each writes to a single structured
+            # table populated by ElectraParser (see src/parsers/electra.py).
+            "pending_consolidations": {
+                "raw_table": "raw_pending_consolidations",
+                "transformed_tables": ["pending_consolidations"]
+            },
+            "pending_deposits": {
+                "raw_table": "raw_pending_deposits",
+                "transformed_tables": ["pending_deposits"]
+            },
+            "pending_partial_withdrawals": {
+                "raw_table": "raw_pending_partial_withdrawals",
+                "transformed_tables": ["pending_partial_withdrawals"]
+            },
         }
         
     async def initialize(self):

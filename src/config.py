@@ -41,6 +41,14 @@ class Config:
 
     # Fulu/Fusaka configuration for Gnosis mainnet
     FULU_START_SLOT = int(os.getenv("FULU_START_SLOT", "27435008"))
+
+    # Electra activation slot — gates the pending_consolidations / pending_deposits /
+    # pending_partial_withdrawals loaders. Pre-Electra slots return HTTP 400 from those
+    # endpoints; the fork gate lets historical backfills run without error spam.
+    # Defaults to 0 (disabled; try the call on every slot). Deployments should set:
+    #   - Gnosis mainnet: the Gnosis Electra activation slot
+    #   - Ethereum mainnet: 11649024
+    ELECTRA_START_SLOT = int(os.getenv("ELECTRA_START_SLOT", "0"))
     
     # Metrics
     METRICS_ENABLED = os.getenv("METRICS_ENABLED", "true").lower() == "true"

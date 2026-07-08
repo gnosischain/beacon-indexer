@@ -39,7 +39,26 @@ class TransformerService:
                     "raw_table": "raw_data_column_sidecars",
                     "use_final": True,
                     "fork_aware": False
-                }
+                },
+                # Electra+ beacon-state queues (scraped by DailyStateQueryLoader subclasses).
+                # Fork-aware because only ElectraParser (and later forks via inheritance) knows
+                # how to unpack them. The _source_table key routes to the correct parse_*
+                # helper inside ElectraParser.parse().
+                "pending_consolidations": {
+                    "raw_table": "raw_pending_consolidations",
+                    "use_final": True,
+                    "fork_aware": True,
+                },
+                "pending_deposits": {
+                    "raw_table": "raw_pending_deposits",
+                    "use_final": True,
+                    "fork_aware": True,
+                },
+                "pending_partial_withdrawals": {
+                    "raw_table": "raw_pending_partial_withdrawals",
+                    "use_final": True,
+                    "fork_aware": True,
+                },
             }
             
             # Only include enabled loaders
@@ -431,17 +450,26 @@ class TransformerService:
         """Process fork-aware data."""
         loader_table_filter = {
             "blocks": {
-                "blocks", "attestations", "deposits", "voluntary_exits", 
-                "proposer_slashings", "attester_slashings", "sync_aggregates", 
-                "execution_payloads", "transactions", "withdrawals", "bls_changes", 
+                "blocks", "attestations", "deposits", "voluntary_exits",
+                "proposer_slashings", "attester_slashings", "sync_aggregates",
+                "execution_payloads", "transactions", "withdrawals", "bls_changes",
                 "blob_sidecars", "blob_commitments", "execution_requests"
             },
             "validators": {"validators"},
             "rewards": {"rewards"},
-            "data_column_sidecars": {"data_column_sidecars"}
+            "data_column_sidecars": {"data_column_sidecars"},
+            # Electra+ pending-queue loaders each write to a single structured table.
+            "pending_consolidations": {"pending_consolidations"},
+            "pending_deposits": {"pending_deposits"},
+            "pending_partial_withdrawals": {"pending_partial_withdrawals"},
         }
-        
+
         allowed_tables = loader_table_filter.get(loader_name, set())
+
+        # ElectraParser routes by `_source_table` so its `parse()` knows which helper to
+        # dispatch to (block-derived vs pending-queue raw rows). Inject the raw source
+        # table name on each item before calling the parser.
+        raw_table_for_loader = self.loader_configs.get(loader_name, {}).get("raw_table")
         
         # Group data by fork
         fork_groups = {}
@@ -465,6 +493,8 @@ class TransformerService:
                 
                 for raw_item in fork_data:
                     try:
+                        if raw_table_for_loader:
+                            raw_item["_source_table"] = raw_table_for_loader
                         parsed_data = parser.parse(raw_item)
                         
                         if parsed_data:

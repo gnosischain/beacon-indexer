@@ -131,6 +131,9 @@ def normalize_api_endpoint(endpoint: str) -> str:
         (r"^/eth/v1/debug/beacon/data_column_sidecars/[^/]+$", "/eth/v1/debug/beacon/data_column_sidecars/{slot}"),
         (r"^/eth/v1/beacon/blobs/[^/]+$", "/eth/v1/beacon/blobs/{block_id}"),
         (r"^/eth/v1/beacon/states/[^/]+/validators$", "/eth/v1/beacon/states/{state_id}/validators"),
+        (r"^/eth/v1/beacon/states/[^/]+/pending_consolidations$", "/eth/v1/beacon/states/{state_id}/pending_consolidations"),
+        (r"^/eth/v1/beacon/states/[^/]+/pending_deposits$", "/eth/v1/beacon/states/{state_id}/pending_deposits"),
+        (r"^/eth/v1/beacon/states/[^/]+/pending_partial_withdrawals$", "/eth/v1/beacon/states/{state_id}/pending_partial_withdrawals"),
     )
 
     for pattern, label in replacements:

@@ -1,5 +1,5 @@
 import asyncio
-import math 
+import math
 import multiprocessing as mp
 from datetime import datetime
 from typing import List
@@ -531,33 +531,42 @@ class LoaderService:
         for loader_name in enabled_loaders:
             logger.info("Generating chunks for loader", loader=loader_name)
             
-            if loader_name in ["blocks", "rewards", "data_column_sidecars"]:  # Slot-based loaders
+            if loader_name in ["blocks", "rewards", "data_column_sidecars", "pending_consolidations", "pending_deposits", "pending_partial_withdrawals"]:  # Slot-based loaders (per-slot fetching, range-chunked)
                 existing_chunks = existing_chunks_cache.get(loader_name, set())
-                
-                # FIX: Generate chunks with consistent boundaries
-                # For chunk size 100: 0-99, 100-199, 200-299, etc.
-                for chunk_start in range(start_slot, end_slot, config.CHUNK_SIZE):
+
+                # Generate chunks aligned to multiples of CHUNK_SIZE regardless of the
+                # caller's start_slot. For CHUNK_SIZE=100: [0-99], [100-199], [200-299], …
+                # Matches the existing blocks/rewards chunk layout so chunks cross-reference
+                # cleanly across loaders (e.g. blocks_24416600_24416699 and
+                # pending_consolidations_24416600_24416699 cover the same slot range).
+                # If start_slot is not aligned (e.g. 21405696), we floor it to the nearest
+                # CHUNK_SIZE boundary (21405600). Slots inside the first chunk but before
+                # the caller's start_slot are still fetched; the pending-queue fork gate
+                # silently no-ops pre-Electra slots and other slot-based loaders simply
+                # produce empty payloads.
+                aligned_start = (start_slot // config.CHUNK_SIZE) * config.CHUNK_SIZE
+                for chunk_start in range(aligned_start, end_slot, config.CHUNK_SIZE):
                     # Calculate chunk end - always aligned to chunk boundaries
                     chunk_end = chunk_start + config.CHUNK_SIZE - 1
-                    
+
                     # Handle the last chunk which might be partial
                     if chunk_end >= end_slot:
                         chunk_end = end_slot - 1  # end_slot is exclusive
-                    
+
                     # Skip if chunk would be empty
                     if chunk_start > chunk_end:
                         break
-                    
+
                     chunk_id = f"{loader_name}_{chunk_start}_{chunk_end}"
-                    
+
                     # Fast cache lookup instead of expensive database query
                     if (chunk_start, chunk_end) in existing_chunks:
-                        logger.debug("Range already completed, skipping", 
-                                loader=loader_name, 
-                                start_slot=chunk_start, 
+                        logger.debug("Range already completed, skipping",
+                                loader=loader_name,
+                                start_slot=chunk_start,
                                 end_slot=chunk_end)
                         continue
-                    
+
                     # New chunk - add to creation list
                     chunks_to_create.append({
                         "chunk_id": chunk_id,
@@ -569,7 +578,7 @@ class LoaderService:
                         "created_at": current_time,
                         "updated_at": current_time
                     })
-            
+
             elif loader_name == "validators":
                 existing_chunks = existing_chunks_cache.get(loader_name, set())
                 
@@ -795,11 +804,15 @@ class LoaderService:
         for loader_name in enabled_loaders:
             logger.info("Generating chunks for loader", loader=loader_name)
             
-            if loader_name in ["blocks", "rewards", "data_column_sidecars"]:  # Slot-based loaders
+            if loader_name in ["blocks", "rewards", "data_column_sidecars", "pending_consolidations", "pending_deposits", "pending_partial_withdrawals"]:  # Slot-based loaders (per-slot fetching, range-chunked)
                 existing_chunks = existing_chunks_cache.get(loader_name, set())
-                
-                # Blocks and Rewards: process all slots (FIXED: end_slot is now exclusive)
-                for i in range(start_slot, end_slot, config.CHUNK_SIZE):
+
+                # Align chunks to CHUNK_SIZE boundaries (same convention as the other
+                # chunk-generation path above). Floors start_slot to the nearest multiple
+                # so pending_* chunks produced for start_slot=21405696 still land on
+                # [21405600-21405699], [21405700-21405799], … instead of off-by-96.
+                aligned_start = (start_slot // config.CHUNK_SIZE) * config.CHUNK_SIZE
+                for i in range(aligned_start, end_slot, config.CHUNK_SIZE):
                     chunk_end = min(i + config.CHUNK_SIZE - 1, end_slot - 1)
                     chunk_id = f"{loader_name}_{i}_{chunk_end}"
                     
