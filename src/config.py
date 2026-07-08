@@ -7,7 +7,13 @@ load_dotenv()
 class Config:
     # Beacon Node
     BEACON_NODE_URL = os.getenv("BEACON_NODE_URL", "http://localhost:5052")
-    
+    # Optional API key for gated / archive beacon endpoints. When set, it is sent as a
+    # query parameter (name from BEACON_API_KEY_PARAM, default "apiKey") on every beacon
+    # API request. Leave empty for nodes needing no auth or that carry credentials in the
+    # URL path itself (e.g. gateway-style "https://host/<key>" URLs).
+    BEACON_API_KEY = os.getenv("BEACON_API_KEY", "")
+    BEACON_API_KEY_PARAM = os.getenv("BEACON_API_KEY_PARAM", "apiKey")
+
     # Storage Backend - either 'clickhouse' or 'parquet'
     STORAGE_BACKEND = os.getenv("STORAGE_BACKEND", "clickhouse")
     

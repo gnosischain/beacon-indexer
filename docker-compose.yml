@@ -27,6 +27,7 @@ services:
     container_name: backfill
     environment:
       - BEACON_NODE_URL=${BEACON_NODE_URL}
+      - BEACON_API_KEY=${BEACON_API_KEY}
       - STORAGE_BACKEND=${STORAGE_BACKEND}
       - CLICKHOUSE_HOST=${CLICKHOUSE_HOST}
       - CLICKHOUSE_PORT=${CLICKHOUSE_PORT}
@@ -56,6 +57,7 @@ services:
     container_name: realtime
     environment:
       - BEACON_NODE_URL=${BEACON_NODE_URL}
+      - BEACON_API_KEY=${BEACON_API_KEY}
       - STORAGE_BACKEND=${STORAGE_BACKEND}
       - CLICKHOUSE_HOST=${CLICKHOUSE_HOST}
       - CLICKHOUSE_PORT=${CLICKHOUSE_PORT}
@@ -126,13 +128,12 @@ services:
       - transform-continuous
 
   maintenance:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: beacon-indexer:latest
     container_name: maintenance
     environment:
       - STORAGE_BACKEND=${STORAGE_BACKEND}
       - BEACON_NODE_URL=${BEACON_NODE_URL}
+      - BEACON_API_KEY=${BEACON_API_KEY}
       - CLICKHOUSE_HOST=${CLICKHOUSE_HOST}
       - CLICKHOUSE_PORT=${CLICKHOUSE_PORT}
       - CLICKHOUSE_USER=${CLICKHOUSE_USER}

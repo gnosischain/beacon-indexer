@@ -10,6 +10,8 @@ The Beacon Chain Indexer is configured through environment variables, providing 
 |----------|-------------|---------|----------|
 | `STORAGE_BACKEND` | Storage backend choice | `clickhouse` | No |
 | `BEACON_NODE_URL` | Beacon node API endpoint | `http://localhost:5052` | Yes |
+| `BEACON_API_KEY` | API key for gated / archive beacon endpoints, sent as a query parameter | `` (none) | No |
+| `BEACON_API_KEY_PARAM` | Query-parameter name for `BEACON_API_KEY` | `apiKey` | No |
 | `LOG_LEVEL` | Logging level | `INFO` | No |
 
 ### ClickHouse Configuration
