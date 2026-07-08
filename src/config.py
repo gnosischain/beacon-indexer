@@ -55,7 +55,15 @@ class Config:
     #   - Gnosis mainnet: the Gnosis Electra activation slot
     #   - Ethereum mainnet: 11649024
     ELECTRA_START_SLOT = int(os.getenv("ELECTRA_START_SLOT", "0"))
-    
+
+    # Transform Configuration — parallelism/batch sizes for the continuous transformer.
+    # Defaults match the historical hardcoded values. Lower TRANSFORM_CHUNKS_PER_BATCH for
+    # large-payload loaders (e.g. validators): each validators chunk parses a full
+    # ~400k-entry state, so batching many in parallel OOMs the transform pod.
+    TRANSFORM_CHUNKS_PER_BATCH      = int(os.getenv("TRANSFORM_CHUNKS_PER_BATCH", "10"))
+    TRANSFORM_CHUNKS_PER_FETCH      = int(os.getenv("TRANSFORM_CHUNKS_PER_FETCH", "50"))
+    TRANSFORM_MAX_CONCURRENT_WRITES = int(os.getenv("TRANSFORM_MAX_CONCURRENT_WRITES", "4"))
+
     # Metrics
     METRICS_ENABLED = os.getenv("METRICS_ENABLED", "true").lower() == "true"
     METRICS_PORT = int(os.getenv("METRICS_PORT", "9090"))

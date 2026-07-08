@@ -24,7 +24,14 @@ class TransformerService:
     def __init__(self):
         self.storage = create_storage()
         self.enabled_loaders = set(config.ENABLED_LOADERS)
-        
+
+        # Override the class-constant defaults from config (env-tunable). Large-payload
+        # loaders like validators need a small CHUNKS_PER_BATCH so we don't parse many
+        # full beacon states in parallel and OOM the transform pod.
+        self.MAX_CONCURRENT_WRITES = config.TRANSFORM_MAX_CONCURRENT_WRITES
+        self.CHUNKS_PER_FETCH = config.TRANSFORM_CHUNKS_PER_FETCH
+        self.CHUNKS_PER_BATCH = config.TRANSFORM_CHUNKS_PER_BATCH
+
         if config.STORAGE_BACKEND.lower() == "clickhouse":
             from src.services.fork import ForkDetectionService
             from src.parsers.factory import ParserFactory
